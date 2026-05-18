@@ -76,9 +76,16 @@ pub use crate::helpers::{elicit, report_progress, ElicitResult, MCP_ELICIT_KEY, 
 
 // ---- Re-exports: constants --------------------------------------------------
 // Match top-level surface of apcore-mcp-python (REGISTRY_EVENTS, ERROR_CODES,
-// MODULE_ID_PATTERN) and apcore-mcp-typescript (REGISTRY_EVENTS, ErrorCodes,
-// MODULE_ID_PATTERN, APCORE_EVENTS).
+// MODULE_ID_PATTERN, APCORE_META_TOOL_PREFIX) and apcore-mcp-typescript
+// (REGISTRY_EVENTS, ErrorCodes, MODULE_ID_PATTERN, APCORE_EVENTS,
+// APCORE_META_TOOL_PREFIX).
 //
 // `apcore_events`: re-exported for cross-SDK parity with Python `apcore_mcp.APCORE_EVENTS`
 // and TypeScript `APCORE_EVENTS`. Has no internal callers in this crate; do not delete.
 pub use crate::constants::{apcore_events, ErrorCode, RegistryEvent, MODULE_ID_PATTERN};
+
+// `APCORE_META_TOOL_PREFIX`: the `"__apcore_"` namespace reserved for
+// apcore-mcp meta-tools. Re-exported under the cross-SDK canonical name
+// while the internal short name `META_TOOL_PREFIX` remains for backwards
+// compatibility with existing call sites inside this crate. [A-001]
+pub use crate::server::async_task_bridge::META_TOOL_PREFIX as APCORE_META_TOOL_PREFIX;

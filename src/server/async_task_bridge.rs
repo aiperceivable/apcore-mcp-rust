@@ -159,20 +159,19 @@ impl AsyncTaskBridge {
         metadata: &HashMap<String, Value>,
         annotations_extra: Option<&HashMap<String, Value>>,
     ) -> bool {
+        // Match Python's case-insensitive comparison so YAML-round-tripped
+        // hint values ("True", "TRUE", "TrUe") dispatch identically across
+        // SDKs. [A-003 cross-lang fix]
+        let is_truthy_async_string =
+            |v: &Value| v.as_str().is_some_and(|s| s.eq_ignore_ascii_case("true"));
         if let Some(v) = metadata.get("async") {
-            if v.as_bool() == Some(true) {
-                return true;
-            }
-            if v.as_str() == Some("true") {
+            if v.as_bool() == Some(true) || is_truthy_async_string(v) {
                 return true;
             }
         }
         if let Some(extra) = annotations_extra {
             if let Some(v) = extra.get("mcp_async") {
-                if v.as_bool() == Some(true) {
-                    return true;
-                }
-                if v.as_str() == Some("true") {
+                if v.as_bool() == Some(true) || is_truthy_async_string(v) {
                     return true;
                 }
             }
@@ -734,6 +733,21 @@ impl AsyncTaskBridge {
                     "__apcore_module_preview requires 'module_id'",
                 )
             })?;
+        // Reject reserved-prefix module ids the same way the submit branch
+        // does — the preview meta-tool must not introspect the bridge's own
+        // meta-tools (apcore PROTOCOL_SPEC §5.6 contract). Cross-SDK parity:
+        // Python and TypeScript apply the same guard. [A-D-001]
+        if Self::is_reserved_id(module_id) {
+            return Err(apcore::errors::ModuleError::new(
+                apcore::errors::ErrorCode::GeneralInvalidInput,
+                format!(
+                    "Reserved module id: '{}'. Names starting with '{}' \
+                     are reserved for apcore-mcp meta-tools and cannot be \
+                     previewed via this handler.",
+                    module_id, META_TOOL_PREFIX,
+                ),
+            ));
+        }
         // Preserve `arguments: null` verbatim — let the calling
         // business decide whether null is a valid input. Missing
         // ``arguments`` collapses to JSON null too (no caller intent

@@ -217,6 +217,21 @@ impl MCPServerFactory {
         self.rich_description
     }
 
+    /// Cross-SDK parity no-op for `MCPServerFactory::prepare()`.
+    ///
+    /// TypeScript's factory uses this to prime the apcore-toolkit Markdown
+    /// renderer (the toolkit's import has measurable startup cost in Node).
+    /// Rust links apcore-toolkit at build time and renders synchronously, so
+    /// no priming is required. Exposed as an `async fn` returning `false`
+    /// so cross-SDK application code can call
+    /// `MCPServerFactory::prepare().await` at startup without a
+    /// language-specific branch. See
+    /// `docs/features/mcp-server-factory.md` §"Py/Rust no-op for parity".
+    /// [A-002]
+    pub async fn prepare() -> bool {
+        false
+    }
+
     /// Create a new MCP server instance.
     ///
     /// # Arguments
