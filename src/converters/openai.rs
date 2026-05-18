@@ -687,7 +687,7 @@ impl Default for OpenAIConverter {
 /// markdown sections (`## Parameters`, `## Returns`, `## Behavior`,
 /// `## Tags`, `## Examples`) gracefully render whatever the entry
 /// actually carries.
-pub fn json_entry_to_scanned_module(module_id: &str, entry: &Value) -> ScannedModule {
+pub(crate) fn json_entry_to_scanned_module(module_id: &str, entry: &Value) -> ScannedModule {
     let description = entry
         .get("description")
         .and_then(|v| v.as_str())

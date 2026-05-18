@@ -69,9 +69,7 @@ pub use crate::adapters::SchemaConverter;
 pub use crate::config::{register_mcp_namespace, MCP_ENV_PREFIX, MCP_NAMESPACE};
 
 // ---- Re-exports: converters -------------------------------------------------
-pub use crate::converters::openai::{
-    json_entry_to_scanned_module, ConvertOptions, ConverterError, OpenAIConverter,
-};
+pub use crate::converters::openai::{ConvertOptions, ConverterError, OpenAIConverter};
 
 // ---- Re-exports: helpers ----------------------------------------------------
 pub use crate::helpers::{elicit, report_progress, ElicitResult, MCP_ELICIT_KEY, MCP_PROGRESS_KEY};
