@@ -5,6 +5,12 @@
 //! This crate provides the bridge layer that translates apcore module
 //! registries and executors into MCP-compatible tool servers.
 
+// [D2-001] Brand-consistent public types `APCoreMCP*` and `OpenAIToolsConfig`
+// preserve cross-language naming parity with the Python and TypeScript SDKs.
+// Suppress clippy::upper_case_acronyms to keep the same public surface across
+// the three SDKs.
+#![allow(clippy::upper_case_acronyms)]
+
 pub mod acl_builder;
 pub mod adapters;
 pub mod apcore_mcp;
