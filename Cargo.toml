@@ -41,11 +41,11 @@ regex = "1"
 strum = "0.26"
 strum_macros = "0.26"
 uuid = { version = "1", features = ["v4", "serde"] }
-chrono = { version = "0.4", features = ["serde"] }
 tokio-stream = "0.1"
 futures = "0.3"
 
 [dev-dependencies]
+chrono = { version = "0.4", features = ["serde"] }
 tower = { version = "0.5", features = ["util"] }
 tempfile = "3"
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
