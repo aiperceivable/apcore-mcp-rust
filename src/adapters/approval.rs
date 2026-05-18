@@ -80,10 +80,18 @@ impl ApprovalHandler for ElicitationApprovalHandler {
         // always receive an `ApprovalResult` for the elicitation surface; no `Err`
         // is returned from the elicitation logic itself. [D10-002]
 
-        // [D10-001] "No context available for elicitation" rejection branch —
-        // matches the Python/TS path where context.data[MCP_ELICIT_KEY] is absent.
-        if request.context.is_none() && self.elicit.is_none() {
-            tracing::debug!("no context and no elicitation callback available, rejecting approval");
+        // [D10-005] "No context available for elicitation" rejection branch —
+        // matches the Python/TS path where `request.context` is absent.
+        // Rust previously only fired this branch when BOTH context and
+        // elicit were missing, which made the callback fire even on
+        // context-less requests if a constructor-injected callback was
+        // present. The handler must NEVER invoke elicitation without a
+        // context attached to the request because the elicitation
+        // surface is security-gated and the calling identity is carried
+        // by `request.context`. Reject unconditionally whenever context
+        // is None.
+        if request.context.is_none() {
+            tracing::debug!("no context attached to approval request, rejecting");
             return Ok(rejected("No context available for elicitation"));
         }
 
@@ -170,12 +178,23 @@ mod tests {
     }
 
     /// Create a mock [`ApprovalRequest`] for testing.
+    ///
+    /// Attaches a default `Context` so the request reaches the
+    /// elicitation path. [D10-005] requires the handler to reject
+    /// unconditionally when `request.context.is_none()`.
     fn test_request() -> ApprovalRequest {
+        use apcore::{Context, Identity};
         let mut req = ApprovalRequest::default();
         req.module_id = "test.dangerous_tool".to_string();
         req.arguments = json!({"path": "/etc/passwd"});
         req.description = Some("Delete a system file".to_string());
         req.tags = vec!["destructive".to_string()];
+        req.context = Some(Context::new(Identity::new(
+            "u1".into(),
+            "user".into(),
+            vec![],
+            Default::default(),
+        )));
         req
     }
 
@@ -207,16 +226,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_request_approval_no_callback() {
-        // When no context AND no callback, the rejection says "No context available for elicitation"
-        // (aligned with D10-001 Python/TS behavior). When there IS a context but no callback
-        // it would fall through to "No elicitation callback available".
+        // [D10-005] `test_request()` attaches a context, so the
+        // "No context available" branch is skipped and we hit the
+        // missing-callback branch instead.
         let handler = ElicitationApprovalHandler::new(None);
         let result = handler.request_approval(&test_request()).await.unwrap();
         assert_eq!(result.status, "rejected");
-        // test_request() has context: None, so "No context available for elicitation" fires.
         assert_eq!(
             result.reason.as_deref(),
-            Some("No context available for elicitation")
+            Some("No elicitation callback available")
         );
     }
 
@@ -263,11 +281,19 @@ mod tests {
                 panic!("elicit callback panicked intentionally");
             })
         });
+        use apcore::{Context, Identity};
         let handler = ElicitationApprovalHandler::new(Some(panic_cb));
         let req = {
             let mut r = ApprovalRequest::default();
             r.module_id = "test_module".to_string();
             r.arguments = serde_json::json!({});
+            // [D10-005] Context required so we reach the elicit path.
+            r.context = Some(Context::new(Identity::new(
+                "u1".into(),
+                "user".into(),
+                vec![],
+                Default::default(),
+            )));
             r
         };
         let result = handler.request_approval(&req).await;
@@ -358,6 +384,53 @@ mod tests {
         );
     }
 
+    // -- Issue D10-005: unconditional rejection on missing context ------------
+
+    #[tokio::test]
+    async fn test_request_approval_no_context_with_callback_returns_rejected() {
+        // [D10-005] Python and TypeScript unconditionally reject when
+        // `request.context` is None — the elicit callback is NEVER
+        // invoked because the security-gated approval handler should not
+        // act without an identity/context attached to the request. Rust
+        // previously special-cased the branch and only rejected when
+        // both context and elicit were absent, so it would call the
+        // callback for `context == None` if a constructor-injected
+        // `elicit` was present. This is a cross-language behavioral
+        // divergence on a security-sensitive surface.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let callback_called = Arc::new(AtomicBool::new(false));
+        let flag = callback_called.clone();
+        let cb: ElicitCallback = Box::new(move |_msg, _schema| {
+            let flag = flag.clone();
+            Box::pin(async move {
+                flag.store(true, Ordering::SeqCst);
+                Some(ElicitResult {
+                    action: ElicitAction::Accept,
+                    content: None,
+                })
+            })
+        });
+        let handler = ElicitationApprovalHandler::new(Some(cb));
+        let request = {
+            let mut r = ApprovalRequest::default();
+            r.module_id = "test.tool".to_string();
+            r.arguments = json!({});
+            // context intentionally None
+            r
+        };
+        let result = handler.request_approval(&request).await.unwrap();
+        assert_eq!(result.status, "rejected");
+        assert_eq!(
+            result.reason.as_deref(),
+            Some("No context available for elicitation"),
+            "missing context must reject regardless of callback availability"
+        );
+        assert!(
+            !callback_called.load(Ordering::SeqCst),
+            "elicit callback must NOT be invoked when context is None"
+        );
+    }
+
     // -- Issue D11-020: Unknown action variant maps to rejected ---------------
 
     #[tokio::test]
@@ -415,11 +488,19 @@ mod tests {
             })
         });
 
+        use apcore::{Context, Identity};
         let handler = ElicitationApprovalHandler::new(Some(cb));
         let request = {
             let mut r = ApprovalRequest::default();
             r.module_id = "test.tool".to_string();
             r.arguments = json!({"key": "val"});
+            // [D10-005] Context required so we reach the elicit path.
+            r.context = Some(Context::new(Identity::new(
+                "u1".into(),
+                "user".into(),
+                vec![],
+                Default::default(),
+            )));
             r
         };
         handler.request_approval(&request).await.unwrap();
