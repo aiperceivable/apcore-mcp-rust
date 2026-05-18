@@ -145,6 +145,13 @@ pub enum FactoryError {
         "Reserved module id: '{0}' (the '__apcore_' prefix is owned by the async task bridge)"
     )]
     ReservedPrefix(String),
+    /// The MCP server name supplied to
+    /// [`MCPServerFactory::create_server`](super::factory::MCPServerFactory::create_server)
+    /// failed validation. The protocol spec requires the name to be a
+    /// non-empty string of at most 255 characters. The payload is the
+    /// length of the offending name (0 for empty). [D10-002]
+    #[error("Invalid server name: length {0} (must be non-empty and at most 255 characters)")]
+    InvalidName(usize),
     #[error("{0}")]
     Other(String),
 }

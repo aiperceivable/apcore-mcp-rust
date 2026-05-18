@@ -235,13 +235,29 @@ impl MCPServerFactory {
     /// Create a new MCP server instance.
     ///
     /// # Arguments
-    /// * `name` - Server name advertised in MCP init.
-    /// * `version` - Server version string (used in init options, not stored on server).
-    pub fn create_server(&self, name: &str, _version: &str) -> MCPServer {
-        MCPServer::new(MCPServerConfig {
+    /// * `name` - Server name advertised in MCP init. Must be a
+    ///   non-empty string of at most 255 characters per the protocol
+    ///   spec. [D10-002]
+    /// * `version` - Server version string (used in init options, not
+    ///   stored on server).
+    ///
+    /// # Errors
+    /// Returns [`FactoryError::InvalidName`] when `name` is empty or
+    /// longer than 255 characters. Python and TypeScript SDKs raise
+    /// the same error from their factory's equivalent entry point.
+    pub fn create_server(
+        &self,
+        name: &str,
+        _version: &str,
+    ) -> Result<MCPServer, crate::server::server::FactoryError> {
+        // [D10-002] Spec contract: non-empty, <= 255 chars.
+        if name.is_empty() || name.len() > 255 {
+            return Err(crate::server::server::FactoryError::InvalidName(name.len()));
+        }
+        Ok(MCPServer::new(MCPServerConfig {
             name: name.to_string(),
             ..Default::default()
-        })
+        }))
     }
 
     /// Build a single MCP tool definition from a module descriptor.
@@ -1217,7 +1233,7 @@ mod tests {
     #[test]
     fn test_list_tools_returns_all_tools() {
         let factory = make_factory();
-        let mut server = factory.create_server("test", "1.0.0");
+        let mut server = factory.create_server("test", "1.0.0").unwrap();
         let tools = vec![
             Tool {
                 name: "tool.a".to_string(),
@@ -1247,7 +1263,7 @@ mod tests {
     #[test]
     fn test_handlers_registered_flag() {
         let factory = make_factory();
-        let mut server = factory.create_server("test", "1.0.0");
+        let mut server = factory.create_server("test", "1.0.0").unwrap();
         assert!(!server.has_tool_handlers());
 
         let router = Arc::new(ExecutionRouter::stub());
@@ -1260,7 +1276,7 @@ mod tests {
     #[test]
     fn test_list_resources_returns_documented_modules() {
         let factory = make_factory();
-        let mut server = factory.create_server("test", "1.0.0");
+        let mut server = factory.create_server("test", "1.0.0").unwrap();
         let registry = make_registry_with_modules(vec![
             ("mod.a", "Module A docs", vec![]),
             ("mod.b", "Module B docs", vec![]),
@@ -1280,7 +1296,7 @@ mod tests {
     #[test]
     fn test_read_resource_returns_documentation() {
         let factory = make_factory();
-        let mut server = factory.create_server("test", "1.0.0");
+        let mut server = factory.create_server("test", "1.0.0").unwrap();
         let registry =
             make_registry_with_modules(vec![("mod.a", "Module A documentation text", vec![])]);
 
@@ -1296,7 +1312,7 @@ mod tests {
     #[test]
     fn test_read_resource_unknown_uri_errors() {
         let factory = make_factory();
-        let mut server = factory.create_server("test", "1.0.0");
+        let mut server = factory.create_server("test", "1.0.0").unwrap();
         let registry = make_registry_with_modules(vec![("mod.a", "Module A docs", vec![])]);
 
         factory.register_resource_handlers(&mut server, &registry);
@@ -1310,7 +1326,7 @@ mod tests {
     #[test]
     fn test_read_resource_wrong_scheme_errors() {
         let factory = make_factory();
-        let mut server = factory.create_server("test", "1.0.0");
+        let mut server = factory.create_server("test", "1.0.0").unwrap();
         let registry = make_registry_with_modules(vec![("mod.a", "Module A docs", vec![])]);
 
         factory.register_resource_handlers(&mut server, &registry);
@@ -1322,7 +1338,7 @@ mod tests {
     #[test]
     fn test_resource_handlers_registered_flag() {
         let factory = make_factory();
-        let mut server = factory.create_server("test", "1.0.0");
+        let mut server = factory.create_server("test", "1.0.0").unwrap();
         assert!(!server.has_resource_handlers());
 
         let registry = make_registry_with_modules(vec![("mod.a", "Module A docs", vec![])]);
@@ -1335,7 +1351,7 @@ mod tests {
     #[test]
     fn test_init_options_has_server_name() {
         let factory = make_factory();
-        let server = factory.create_server("my-server", "2.0.0");
+        let server = factory.create_server("my-server", "2.0.0").unwrap();
         let opts = factory.build_init_options(&server, "my-server", "2.0.0");
         assert_eq!(opts.server_name, "my-server");
     }
@@ -1343,7 +1359,7 @@ mod tests {
     #[test]
     fn test_init_options_has_server_version() {
         let factory = make_factory();
-        let server = factory.create_server("test", "1.2.3");
+        let server = factory.create_server("test", "1.2.3").unwrap();
         let opts = factory.build_init_options(&server, "test", "1.2.3");
         assert_eq!(opts.server_version, "1.2.3");
     }
@@ -1351,7 +1367,7 @@ mod tests {
     #[test]
     fn test_init_options_no_capabilities_when_no_handlers() {
         let factory = make_factory();
-        let server = factory.create_server("test", "1.0.0");
+        let server = factory.create_server("test", "1.0.0").unwrap();
         let opts = factory.build_init_options(&server, "test", "1.0.0");
         assert!(opts.capabilities.tools.is_none());
         assert!(opts.capabilities.resources.is_none());
@@ -1360,7 +1376,7 @@ mod tests {
     #[test]
     fn test_init_options_tools_capability_when_handlers_registered() {
         let factory = make_factory();
-        let mut server = factory.create_server("test", "1.0.0");
+        let mut server = factory.create_server("test", "1.0.0").unwrap();
         let router = Arc::new(ExecutionRouter::stub());
         factory.register_handlers(&mut server, vec![], router);
 
@@ -1372,7 +1388,7 @@ mod tests {
     #[test]
     fn test_init_options_resources_capability_when_handlers_registered() {
         let factory = make_factory();
-        let mut server = factory.create_server("test", "1.0.0");
+        let mut server = factory.create_server("test", "1.0.0").unwrap();
         let registry = make_registry_with_modules(vec![("mod.a", "Module A docs", vec![])]);
         factory.register_resource_handlers(&mut server, &registry);
 
@@ -1384,7 +1400,7 @@ mod tests {
     #[test]
     fn test_init_options_default_values() {
         let factory = make_factory();
-        let server = factory.create_server("apcore-mcp", "0.1.0");
+        let server = factory.create_server("apcore-mcp", "0.1.0").unwrap();
         let opts = factory.build_init_options(&server, "apcore-mcp", "0.1.0");
         assert_eq!(opts.server_name, "apcore-mcp");
         assert_eq!(opts.server_version, "0.1.0");
@@ -1397,21 +1413,21 @@ mod tests {
         let factory = MCPServerFactory::new();
         // If new() doesn't panic, components are initialized.
         // We verify by using the factory to create a server.
-        let server = factory.create_server("test", "1.0.0");
+        let server = factory.create_server("test", "1.0.0").unwrap();
         assert_eq!(server.name(), "test");
     }
 
     #[test]
     fn test_create_server_returns_server() {
         let factory = make_factory();
-        let server = factory.create_server("integration-test", "0.5.0");
+        let server = factory.create_server("integration-test", "0.5.0").unwrap();
         assert_eq!(server.name(), "integration-test");
     }
 
     #[test]
     fn test_full_lifecycle() {
         let factory = make_factory();
-        let mut server = factory.create_server("lifecycle-test", "1.0.0");
+        let mut server = factory.create_server("lifecycle-test", "1.0.0").unwrap();
 
         // Build tools from registry
         let registry = make_registry_with_modules(vec![
@@ -1456,7 +1472,7 @@ mod tests {
     #[test]
     fn test_end_to_end_resource_read() {
         let factory = make_factory();
-        let mut server = factory.create_server("test", "1.0.0");
+        let mut server = factory.create_server("test", "1.0.0").unwrap();
         let registry = make_registry_with_modules(vec![(
             "doc.module",
             "This is the documentation for doc.module",

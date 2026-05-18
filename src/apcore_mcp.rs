@@ -437,7 +437,9 @@ impl APCoreMCP {
             .unwrap_or_else(|| crate::VERSION.to_string());
 
         let factory = MCPServerFactory::new();
-        let mut server = factory.create_server(&self.config.name, &version);
+        let mut server = factory
+            .create_server(&self.config.name, &version)
+            .map_err(|e| APCoreMCPError::ServerError(e.to_string()))?;
 
         // Build filtered tool definitions
         let tags_refs: Option<Vec<&str>> = self
