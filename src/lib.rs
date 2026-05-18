@@ -21,10 +21,6 @@ pub mod constants;
 pub mod converters;
 pub mod explorer;
 pub mod helpers;
-/// Inspector sub-module — placeholder for future port from Python inspector/.
-/// Kept crate-private until F-039 (Schema Inspector) ships per PRD; promote to
-/// `pub mod` when the implementation lands.
-pub(crate) mod inspector;
 /// Markdown rendering for tool descriptions via apcore-toolkit's
 /// `format_module(style = Markdown)`. LLMs select tools primarily from
 /// the `description` string; richer Markdown packs more decision
