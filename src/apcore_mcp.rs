@@ -1484,23 +1484,6 @@ pub struct ServeConfig {
     pub output_format: Option<crate::server::router::OutputFormat>,
     /// Observability configuration.
     pub observability: Option<serde_json::Value>,
-    /// Enable async task bridge.
-    pub async_tasks: Option<bool>,
-    /// Maximum concurrent async tasks.
-    pub async_max_concurrent: Option<usize>,
-    /// Schema converter override.
-    pub schema_converter: Option<serde_json::Value>,
-    /// Annotation mapper override.
-    pub annotation_mapper: Option<serde_json::Value>,
-    /// Error mapper override.
-    pub error_mapper: Option<serde_json::Value>,
-    /// On-startup callback (called before server starts accepting requests).
-    /// TODO: use `Option<Box<dyn Fn() + Send + Sync>>` when lifecycle hooks are wired.
-    pub on_startup: Option<serde_json::Value>,
-    /// On-shutdown callback (called when server stops).
-    pub on_shutdown: Option<serde_json::Value>,
-    /// Metrics collector override.
-    pub metrics_collector: Option<serde_json::Value>,
 }
 
 impl Default for ServeConfig {
@@ -1522,14 +1505,6 @@ impl Default for ServeConfig {
             redact_output: None,
             output_format: None,
             observability: None,
-            async_tasks: None,
-            async_max_concurrent: None,
-            schema_converter: None,
-            annotation_mapper: None,
-            error_mapper: None,
-            on_startup: None,
-            on_shutdown: None,
-            metrics_collector: None,
         }
     }
 }
@@ -1566,22 +1541,6 @@ pub struct AsyncServeConfig {
     pub output_format: Option<crate::server::router::OutputFormat>,
     /// Observability configuration.
     pub observability: Option<serde_json::Value>,
-    /// Enable async task bridge.
-    pub async_tasks: Option<bool>,
-    /// Maximum concurrent async tasks.
-    pub async_max_concurrent: Option<usize>,
-    /// Schema converter override.
-    pub schema_converter: Option<serde_json::Value>,
-    /// Annotation mapper override.
-    pub annotation_mapper: Option<serde_json::Value>,
-    /// Error mapper override.
-    pub error_mapper: Option<serde_json::Value>,
-    /// On-startup callback.
-    pub on_startup: Option<serde_json::Value>,
-    /// On-shutdown callback.
-    pub on_shutdown: Option<serde_json::Value>,
-    /// Metrics collector override.
-    pub metrics_collector: Option<serde_json::Value>,
 }
 
 impl Default for AsyncServeConfig {
@@ -1600,14 +1559,6 @@ impl Default for AsyncServeConfig {
             redact_output: None,
             output_format: None,
             observability: None,
-            async_tasks: None,
-            async_max_concurrent: None,
-            schema_converter: None,
-            annotation_mapper: None,
-            error_mapper: None,
-            on_startup: None,
-            on_shutdown: None,
-            metrics_collector: None,
         }
     }
 }
@@ -2780,16 +2731,20 @@ mod tests {
     #[test]
     fn test_serve_config_default_has_all_fields() {
         // [D1-001] ServeConfig must have the key Python parity fields.
+        // The 8 stub fields removed in D9-002 (`async_tasks`,
+        // `async_max_concurrent`, `schema_converter`,
+        // `annotation_mapper`, `error_mapper`, `on_startup`,
+        // `on_shutdown`, `metrics_collector`) were never read by
+        // `serve()` and used placeholder `Option<serde_json::Value>`
+        // types that could not accept real callbacks. Lifecycle and
+        // observability callbacks are wired through `ServeOptions`.
         let cfg = ServeConfig::default();
         assert_eq!(cfg.name, "apcore-mcp");
         assert!(cfg.authenticator.is_none());
         assert!(cfg.require_auth.is_none());
         assert!(cfg.exempt_paths.is_none());
         assert!(cfg.redact_output.is_none());
-        assert!(cfg.async_tasks.is_none());
-        assert!(cfg.on_startup.is_none());
-        assert!(cfg.on_shutdown.is_none());
-        assert!(cfg.metrics_collector.is_none());
+        assert!(cfg.observability.is_none());
     }
 
     #[test]
@@ -2813,15 +2768,13 @@ mod tests {
     #[test]
     fn test_async_serve_config_default_has_all_fields() {
         // [D1-002] AsyncServeConfig must have the key Python parity fields.
+        // Stub fields removed in D9-002 — see `test_serve_config_default_has_all_fields`.
         let cfg = AsyncServeConfig::default();
         assert_eq!(cfg.name, "apcore-mcp");
         assert!(cfg.authenticator.is_none());
         assert!(cfg.require_auth.is_none());
         assert!(cfg.exempt_paths.is_none());
-        assert!(cfg.async_tasks.is_none());
-        assert!(cfg.async_max_concurrent.is_none());
-        assert!(cfg.on_startup.is_none());
-        assert!(cfg.on_shutdown.is_none());
+        assert!(cfg.observability.is_none());
     }
 
     #[test]
