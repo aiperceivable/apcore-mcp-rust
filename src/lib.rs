@@ -89,3 +89,23 @@ pub use crate::constants::{apcore_events, ErrorCode, RegistryEvent, MODULE_ID_PA
 // while the internal short name `META_TOOL_PREFIX` remains for backwards
 // compatibility with existing call sites inside this crate. [A-001]
 pub use crate::server::async_task_bridge::META_TOOL_PREFIX as APCORE_META_TOOL_PREFIX;
+
+// [D1-002] Cross-SDK parity: Python and TypeScript expose
+// `AsyncTaskBridge` and `META_TOOL_NAMES` at their package top level.
+// Re-export the same surface here so consumers of all three SDKs see a
+// uniform public API.
+pub use crate::server::async_task_bridge::{
+    AsyncTaskBridge, META_TOOL_CANCEL, META_TOOL_LIST, META_TOOL_PREVIEW, META_TOOL_STATUS,
+    META_TOOL_SUBMIT,
+};
+
+/// Names of all apcore-mcp meta-tools (the `__apcore_*` reserved
+/// namespace). Mirrors `META_TOOL_NAMES` in the Python and TypeScript
+/// SDKs.
+pub const META_TOOL_NAMES: [&str; 5] = [
+    META_TOOL_SUBMIT,
+    META_TOOL_STATUS,
+    META_TOOL_CANCEL,
+    META_TOOL_LIST,
+    META_TOOL_PREVIEW,
+];
