@@ -66,7 +66,7 @@ pub use crate::adapters::ModuleIDNormalizer;
 pub use crate::adapters::SchemaConverter;
 
 // ---- Re-exports: config bus -------------------------------------------------
-pub use crate::config::{register_mcp_namespace, MCP_ENV_PREFIX, MCP_NAMESPACE};
+pub use crate::config::{mcp_defaults, register_mcp_namespace, MCP_ENV_PREFIX, MCP_NAMESPACE};
 
 // ---- Re-exports: converters -------------------------------------------------
 pub use crate::converters::openai::{ConvertOptions, ConverterError, OpenAIConverter};

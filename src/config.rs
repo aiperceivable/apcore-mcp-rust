@@ -138,7 +138,11 @@ pub fn get_scalar_config() -> McpScalarConfig {
 }
 
 /// Returns the default configuration values for the MCP namespace.
-pub(crate) fn mcp_defaults() -> serde_json::Value {
+///
+/// Mirrors `apcore_mcp.MCP_DEFAULTS` in the Python SDK and
+/// `MCP_DEFAULTS` in the TypeScript SDK so all three language
+/// bindings expose the same top-level defaults surface.
+pub fn mcp_defaults() -> serde_json::Value {
     serde_json::json!({
         "transport": "stdio",
         "host": "127.0.0.1",
