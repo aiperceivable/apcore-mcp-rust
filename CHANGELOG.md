@@ -6,6 +6,38 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.16.0] - 2026-05-19
+
+Audit-driven consistency release from `/apcore-skills:audit --scope mcp`. Ten Rust-side fixes land here; cross-SDK parity with `apcore-mcp-python` and `apcore-mcp-typescript` 0.16.0.
+
+### Breaking Changes
+
+- **[D9-002] Removed eight stub fields from `ServeConfig` and `AsyncServeConfig`.** The fields `schema_converter`, `annotation_mapper`, `error_mapper`, `on_startup`, `on_shutdown`, `metrics_collector`, `async_tasks`, and `async_max_concurrent` existed only for "Python parity" but were never read by `serve()` / `async_serve()`. Two of them (`on_startup`, `on_shutdown`) used `Option<serde_json::Value>` placeholders that could not accept callbacks, so users who wired them up silently got no effect. Lifecycle / observability callbacks remain wired via `ServeOptions` / `AsyncServeOptions`, which are the canonical surface.
+- **[D10-002] `MCPServerFactory::create_server` now returns `Result<MCPServer, FactoryError>` and validates the server name.** Spec mandates non-empty, max 255 chars. Added `FactoryError::InvalidName(usize)` variant. Empty / oversized names now produce a typed error at the validation step instead of propagating into the MCP server constructor.
+
+### Fixed
+
+- **[D1-001] Exported `mcp_defaults` at crate root.** Previously `pub(crate) fn mcp_defaults` in `src/config.rs` was unreachable from external code, and the README cited an import path (`use apcore_mcp::mcp_defaults;`) that did not compile. Now exported alongside `MCP_NAMESPACE` / `MCP_ENV_PREFIX`. Closes cross-SDK parity gap with Python `MCP_DEFAULTS` and TypeScript `MCP_DEFAULTS`.
+- **[D1-002] Exported `AsyncTaskBridge` and `META_TOOL_NAMES` at crate root.** Previously only `META_TOOL_PREFIX` was re-exported (as `APCORE_META_TOOL_PREFIX`); the struct and the 5-tuple of meta-tool name constants were reachable only via `apcore_mcp::server::async_task_bridge::*`. Cross-SDK parity with Python `__init__.py` and TypeScript `index.ts`.
+- **[D10-005] `ElicitationApprovalHandler::request_approval` now unconditionally rejects when `request.context.is_none()`.** Previously Rust special-cased `is_none() && self.elicit.is_none()` and proceeded to invoke the constructor-injected callback when context was None but elicit was Some, contradicting Python and TypeScript which always reject on missing context. Security-gated `ApprovalHandler` surface — observable contract now matches peer SDKs.
+
+### Refactored
+
+- **[D9-006] Deleted `apcore_mcp::inspector` stub module.** TODO-only placeholder declared `pub(crate) mod inspector` from `lib.rs:21` with zero references in `src/`, `tests/`, or `examples/`. Will be re-created when F-039 implementation begins.
+- **[D9-008] Moved `chrono` from `[dependencies]` to `[dev-dependencies]`.** Zero references in `src/`; only `examples/run/{main,modules}.rs` used it.
+- **[D9-012] `json_entry_to_scanned_module` is now `pub(crate)` and removed from the crate root re-exports.** All non-test callers were inside `src/converters/openai.rs` itself; the symbol was accidentally surfaced in the public API.
+- **[D2-001] Added `#![allow(clippy::upper_case_acronyms)]` at crate root** to silence the lint on intentionally-acronymed public types (`APCoreMCP`, `APCoreMCPError`, `APCoreMCPConfig`, `APCoreMCPBuilder`, `OpenAIToolsConfig`). Preserves cross-language brand consistency with Python/TypeScript while making clippy explicit about the policy.
+
+### Tests
+
+- **[D5-003] Added `tests/explorer_test.rs`** — five integration tests covering explorer mount registration and route wiring. Closes the per-SDK coverage gap relative to Python's `tests/explorer/...`.
+- Total suite: **916 passed, 1 ignored**.
+
+### Known Issues
+
+- **[D9-011]** Audit flagged `OpenAIToolsConfig` as a potential empty parity shim; subsequent analysis showed the struct's four fields (`embed_annotations`, `strict`, `tags`, `prefix`) are actively read by `to_openai_tools`. Deferred pending audit re-evaluation.
+
+
 ## [0.15.0] - 2026-05-14
 
 Leverages **apcore 0.21.0 + apcore-toolkit 0.7.0**. Cross-SDK byte-
