@@ -123,7 +123,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
 
-    tracing::info!("Registered {} modules", registry.list(None, None).len());
+    tracing::info!(
+        "Registered {} modules",
+        registry.list(None, None, None).len()
+    );
 
     // 2. Create executor from registry.
     let executor = Arc::new(Executor::new(registry, Config::default()));

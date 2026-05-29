@@ -21,8 +21,8 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
-apcore = "0.21"
-apcore-toolkit = "0.7"
+apcore = "0.22"
+apcore-toolkit = "0.8"
 mcp-embedded-ui = "0.4"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }

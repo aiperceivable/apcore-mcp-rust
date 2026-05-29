@@ -6,9 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
-## [Unreleased]
+## [0.15.0] - 2026-05-29
 
 Audit-driven consistency work from `/apcore-skills:audit --scope mcp`. Ten Rust-side fixes land here; the docs/spec repo (`apcore-mcp/`) remains at 0.15.0 because no spec contracts changed, so SDK versions also stay at 0.15.0 pending an explicit release decision. The entries below describe changes already committed on `main`.
+
+### Changed
+
+- **Upgraded required runtime to apcore 0.22.0 and apcore-toolkit 0.8.0** (`Cargo.toml`: `apcore = "0.22"`, `apcore-toolkit = "0.8"`). Aligned the bridge with two apcore 0.22.0 breaking API changes: `Registry::get_definition()` now returns `Result<Option<ModuleDescriptor>, ModuleError>` (all bridge call sites updated to treat a lookup error as "no descriptor"), and `Registry::list()` gained a third `visibility` filter argument (the bridge passes `None` to retain default public-only listing). Additionally, `Executor::call_with_trace()` gained `version_hint` (4th) and `strategy` (5th) parameters — the executor adapter now forwards the resolved `version_hint` (closing the long-standing "TODO(apcore>=0.19): forward version_hint") and leaves `strategy` at the executor default. No public API change; full suite green (861 lib + integration tests passed; clippy clean).
 
 ### Breaking Changes
 
@@ -36,9 +40,6 @@ Audit-driven consistency work from `/apcore-skills:audit --scope mcp`. Ten Rust-
 ### Known Issues
 
 - **[D9-011]** Audit flagged `OpenAIToolsConfig` as a potential empty parity shim; subsequent analysis showed the struct's four fields (`embed_annotations`, `strict`, `tags`, `prefix`) are actively read by `to_openai_tools`. Deferred pending audit re-evaluation.
-
-
-## [0.15.0] - 2026-05-14
 
 Leverages **apcore 0.21.0 + apcore-toolkit 0.7.0**. Cross-SDK byte-
 equivalent with `apcore-mcp-python` and `apcore-mcp-typescript` 0.15.0.

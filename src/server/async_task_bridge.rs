@@ -194,7 +194,7 @@ impl AsyncTaskBridge {
     /// Check whether an async hint applies to a module registered in the
     /// given apcore registry.
     pub fn is_async_registered(registry: &Registry, module_id: &str) -> bool {
-        let Some(desc) = registry.get_definition(module_id) else {
+        let Ok(Some(desc)) = registry.get_definition(module_id) else {
             return false;
         };
         let extra = desc.annotations.as_ref().map(|a| &a.extra);

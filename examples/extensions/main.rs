@@ -43,7 +43,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     modules::register_all(&registry)?;
     println!(
         "Registered {} modules from extensions/",
-        registry.list(None, None).len()
+        registry.list(None, None, None).len()
     );
 
     // 2. Build an executor over the registry.

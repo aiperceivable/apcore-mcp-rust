@@ -149,7 +149,7 @@ impl OpenAIConverter {
         tags: Option<&[&str]>,
         prefix: Option<&str>,
     ) -> Result<Vec<Value>, ConverterError> {
-        let module_ids = registry.list(tags, prefix);
+        let module_ids = registry.list(tags, prefix, None);
         let mut tools = Vec::new();
         let mut seen_names: HashMap<String, String> = HashMap::new();
         // Sort for deterministic output
@@ -157,7 +157,7 @@ impl OpenAIConverter {
         sorted_ids.sort();
 
         for module_id in &sorted_ids {
-            let Some(descriptor) = registry.get_definition(module_id) else {
+            let Ok(Some(descriptor)) = registry.get_definition(module_id) else {
                 continue;
             };
             // Description sourcing: when `rich_description` is on we

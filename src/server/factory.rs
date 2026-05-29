@@ -382,7 +382,7 @@ impl MCPServerFactory {
         tags: Option<&[&str]>,
         prefix: Option<&str>,
     ) -> Result<Vec<Tool>, crate::server::server::FactoryError> {
-        let module_ids = registry.list(tags, prefix);
+        let module_ids = registry.list(tags, prefix, None);
         let mut tools = Vec::new();
 
         for module_id in module_ids {
@@ -396,9 +396,12 @@ impl MCPServerFactory {
                     module_id,
                 ));
             }
+            // apcore 0.22.0: get_definition() returns
+            // Result<Option<ModuleDescriptor>, ModuleError>; a missing
+            // descriptor or a lookup error both mean "skip this module".
             let descriptor = match registry.get_definition(&module_id) {
-                Some(d) => d,
-                None => {
+                Ok(Some(d)) => d,
+                Ok(None) | Err(_) => {
                     tracing::warn!("Skipped module {}: no definition found", module_id);
                     continue;
                 }
@@ -589,8 +592,8 @@ impl MCPServerFactory {
     pub fn register_resource_handlers(&self, server: &mut MCPServer, registry: &Registry) {
         // Build docs map: module_id -> documentation (preferred) or description (fallback)
         let mut docs_map: HashMap<String, String> = HashMap::new();
-        for module_id in registry.list(None, None) {
-            if let Some(descriptor) = registry.get_definition(&module_id) {
+        for module_id in registry.list(None, None, None) {
+            if let Ok(Some(descriptor)) = registry.get_definition(&module_id) {
                 let doc_text = descriptor
                     .documentation
                     .filter(|s| !s.is_empty())

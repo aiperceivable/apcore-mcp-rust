@@ -71,9 +71,12 @@ impl RegistryListener {
                         // descriptor stored at registration time carries
                         // version/tags/metadata/display/sunset_date/dependencies
                         // that the trait does not expose. [A-D-002]
+                        // apcore 0.22.0: get_definition() returns
+                        // Result<Option<ModuleDescriptor>, ModuleError>; a
+                        // missing descriptor or lookup error both skip the build.
                         let descriptor = match registry_for_cb.get_definition(module_id) {
-                            Some(d) => d,
-                            None => {
+                            Ok(Some(d)) => d,
+                            Ok(None) | Err(_) => {
                                 tracing::warn!(
                                     "RegistryListener: get_definition returned None for '{}'; \
                                      skipping tool build",

@@ -265,14 +265,15 @@ impl crate::server::router::Executor for ApcoreExecutorAdapter {
         module_id: &str,
         inputs: &Value,
         _context: Option<&Value>,
-        _version_hint: Option<&str>,
+        version_hint: Option<&str>,
     ) -> Option<Result<(Value, Value), ExecutorError>> {
-        // Delegates to apcore::Executor::call_with_trace. `version_hint` is
-        // accepted for API parity; apcore 0.18's call_with_trace does not yet
-        // accept it directly — TODO(apcore>=0.19): forward version_hint.
+        // Delegates to apcore::Executor::call_with_trace. As of apcore 0.22.0
+        // the trace variant accepts `version_hint` (4th arg) and a `strategy`
+        // override (5th arg); we forward the resolved version_hint and leave
+        // strategy at the executor default (`None`).
         let result = self
             .inner
-            .call_with_trace(module_id, inputs.clone(), None, None)
+            .call_with_trace(module_id, inputs.clone(), None, version_hint, None)
             .await;
         Some(match result {
             Ok((out, trace)) => {
@@ -290,9 +291,14 @@ impl crate::server::router::Executor for ApcoreExecutorAdapter {
     /// Look up the descriptor-default `version_hint` for the spec's
     /// 3-source cascade. [A-D-006]
     fn version_hint_default(&self, module_id: &str) -> Option<String> {
+        // apcore 0.22.0: get_definition() now returns
+        // Result<Option<ModuleDescriptor>, ModuleError>; treat a lookup error
+        // the same as "no descriptor" for this best-effort default resolution.
         self.inner
             .registry()
             .get_definition(module_id)
+            .ok()
+            .flatten()
             .and_then(|desc| desc.metadata.get("version_hint").cloned())
             .and_then(|v| v.as_str().map(|s| s.to_string()))
     }
@@ -405,7 +411,7 @@ impl APCoreMCP {
         let tags_slice: Option<&[&str]> = tags_refs.as_deref();
         let prefix = self.config.prefix.as_deref();
         self.reg()
-            .list(tags_slice, prefix)
+            .list(tags_slice, prefix, None)
             .into_iter()
             .map(|s| s.to_string())
             .collect()
@@ -455,10 +461,10 @@ impl APCoreMCP {
 
         // Build output schema map for output redaction.
         let output_schema_map: std::collections::HashMap<String, Value> = {
-            let module_ids = self.reg().list(tags_slice, prefix);
+            let module_ids = self.reg().list(tags_slice, prefix, None);
             let mut map = std::collections::HashMap::new();
             for module_id in module_ids {
-                if let Some(descriptor) = self.reg().get_definition(&module_id) {
+                if let Ok(Some(descriptor)) = self.reg().get_definition(&module_id) {
                     if !descriptor.output_schema.is_null() {
                         map.insert(module_id.to_string(), descriptor.output_schema.clone());
                     }
@@ -887,7 +893,7 @@ impl APCoreMCP {
     ///
     /// Returns a JSON object `{ "module_id": { "description": "...", "input_schema": {...}, "annotations": {...}, "tags": [...] }, ... }`.
     fn build_registry_json(&self) -> Value {
-        let mut module_ids = self.reg().list(None, None);
+        let mut module_ids = self.reg().list(None, None, None);
         // Explicit sort required after apcore-toolkit 0.7.0 enabled
         // serde_json/preserve_order: Map now preserves insertion order
         // instead of alphabetical (BTreeMap) ordering.
@@ -895,7 +901,7 @@ impl APCoreMCP {
         let mut map = serde_json::Map::new();
 
         for module_id in module_ids {
-            if let Some(descriptor) = self.reg().get_definition(&module_id) {
+            if let Ok(Some(descriptor)) = self.reg().get_definition(&module_id) {
                 let description = self.reg().describe(&module_id);
                 let annotations_json =
                     serde_json::to_value(&descriptor.annotations).unwrap_or(Value::Null);
@@ -2307,7 +2313,7 @@ mod tests {
         let mcp = make_test_apcore_mcp();
         let reg = mcp.registry();
         // Should return &Arc<Registry>
-        let _ = reg.list(None, None);
+        let _ = reg.list(None, None, None);
     }
 
     #[test]

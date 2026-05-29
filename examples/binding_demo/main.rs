@@ -187,7 +187,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!(
         "Registered {} modules from binding files",
-        registry.list(None, None).len()
+        registry.list(None, None, None).len()
     );
 
     // 3. Build executor + launch server with Explorer.
