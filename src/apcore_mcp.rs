@@ -1008,6 +1008,8 @@ pub struct APCoreMCPBuilder {
     metrics_collector: Option<Arc<dyn MetricsExporter>>,
     output_formatter: Option<OutputFormatter>,
     approval_handler: Option<Arc<dyn ApprovalHandler>>,
+    approval_store: Option<Arc<dyn crate::approval_store::ApprovalStore>>,
+    approval_notify_callback: Option<crate::adapters::approval::ApprovalNotifyCallback>,
     /// apcore `Middleware` instances to install via `executor.use_middleware()`
     /// after the backend Executor is resolved. Appended to any middleware
     /// declared under Config Bus key `mcp.middleware`.
@@ -1141,6 +1143,33 @@ impl APCoreMCPBuilder {
             Approval handlers must be configured at the executor level."
         );
         self.approval_handler = Some(handler);
+        self
+    }
+
+    /// Configure Phase B async approvals backed by the given store.
+    ///
+    /// At `build()` time a [`StorageBackedApprovalHandler`] is created from
+    /// this store and stored as the `approval_handler`. Combine with
+    /// [`approval_notify`] to attach an out-of-band notification callback.
+    ///
+    /// [`StorageBackedApprovalHandler`]: crate::adapters::approval::StorageBackedApprovalHandler
+    pub fn approval_store(mut self, store: Arc<dyn crate::approval_store::ApprovalStore>) -> Self {
+        self.approval_store = Some(store);
+        self
+    }
+
+    /// Attach a notification callback for Phase B approvals.
+    ///
+    /// The callback receives `(approval_id, module_id, arguments)` and can
+    /// send an out-of-band notification (e.g. Slack, email). Only takes effect
+    /// when [`approval_store`] is also set.
+    ///
+    /// [`approval_store`]: APCoreMCPBuilder::approval_store
+    pub fn approval_notify<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(String, String, serde_json::Value) + Send + Sync + 'static,
+    {
+        self.approval_notify_callback = Some(Arc::new(callback));
         self
     }
 
@@ -1428,13 +1457,23 @@ impl APCoreMCPBuilder {
             (None, None)
         };
 
-        // Warn at build time when approval_handler is configured but not yet wired.
-        if self.approval_handler.is_some() {
-            tracing::warn!(
-                "APCoreMCP built with approval_handler configured but it is not yet \
-                wired into the execution pipeline"
-            );
-        }
+        // Build approval handler: approval_store takes precedence over approval_handler.
+        let approval_handler = if let Some(store) = self.approval_store {
+            use crate::adapters::approval::StorageBackedApprovalHandler;
+            let mut handler = StorageBackedApprovalHandler::new(store);
+            if let Some(cb) = self.approval_notify_callback {
+                handler = handler.with_notify(move |id, module, args| cb(id, module, args));
+            }
+            Some(Arc::new(handler) as Arc<dyn ApprovalHandler>)
+        } else {
+            if self.approval_handler.is_some() {
+                tracing::warn!(
+                    "APCoreMCP built with approval_handler configured but it is not yet \
+                    wired into the execution pipeline"
+                );
+            }
+            self.approval_handler
+        };
 
         Ok(APCoreMCP {
             config: self.config,
@@ -1445,7 +1484,7 @@ impl APCoreMCPBuilder {
             auto_metrics,
             auto_usage,
             output_formatter: self.output_formatter,
-            approval_handler: self.approval_handler,
+            approval_handler,
         })
     }
 }
@@ -3084,6 +3123,88 @@ mod tests {
         assert!(
             mcp.approval_handler.is_some(),
             "approval_handler must be stored on APCoreMCP after build"
+        );
+    }
+
+    // ── A-002 regression: approval_store / approval_notify builder methods ────
+
+    #[test]
+    fn builder_approval_store_setter_stores_field() {
+        // [A-002] APCoreMCPBuilder::approval_store() must store the store.
+        use crate::approval_store::InMemoryApprovalStore;
+
+        let store = Arc::new(InMemoryApprovalStore::new());
+        let builder = APCoreMCP::builder()
+            .name("approval-store-test")
+            .approval_store(store);
+
+        assert!(
+            builder.approval_store.is_some(),
+            "approval_store must be stored on the builder"
+        );
+    }
+
+    #[test]
+    fn builder_approval_notify_setter_stores_callback() {
+        // [A-002] APCoreMCPBuilder::approval_notify() must store the callback.
+        use crate::approval_store::InMemoryApprovalStore;
+
+        let store = Arc::new(InMemoryApprovalStore::new());
+        let builder = APCoreMCP::builder()
+            .name("approval-notify-test")
+            .approval_store(store)
+            .approval_notify(|_id, _module, _args| {});
+
+        assert!(
+            builder.approval_notify_callback.is_some(),
+            "approval_notify_callback must be stored on the builder"
+        );
+    }
+
+    #[test]
+    fn builder_build_with_approval_store_wires_handler() {
+        // [A-002] build() with approval_store must create a StorageBackedApprovalHandler
+        // and store it as approval_handler on APCoreMCP.
+        use crate::approval_store::InMemoryApprovalStore;
+
+        let store = Arc::new(InMemoryApprovalStore::new());
+        let reg = Registry::new();
+        let exec = Arc::new(Executor::new(reg, Config::default()));
+
+        let mcp = APCoreMCP::builder()
+            .backend(BackendSource::Executor(exec))
+            .name("approval-store-build-test")
+            .approval_store(store)
+            .build()
+            .expect("build with approval_store must succeed");
+
+        assert!(
+            mcp.approval_handler.is_some(),
+            "approval_handler must be wired from approval_store after build"
+        );
+    }
+
+    #[test]
+    fn builder_build_with_approval_store_and_notify_wires_handler() {
+        // [A-002] build() with both approval_store and approval_notify must
+        // produce a handler (with notify callback attached).
+        use crate::approval_store::InMemoryApprovalStore;
+
+        let store = Arc::new(InMemoryApprovalStore::new());
+        let reg = Registry::new();
+        let exec = Arc::new(Executor::new(reg, Config::default()));
+
+        let mcp = APCoreMCP::builder()
+            .backend(BackendSource::Executor(exec))
+            .name("approval-notify-build-test")
+            .approval_store(store)
+            .approval_notify(|_id, _module, _args| {})
+            .build()
+            .expect("build with approval_store+notify must succeed");
+
+        assert!(
+            mcp.approval_handler.is_some(),
+            "approval_handler must be wired when both store and notify are configured"
         );
     }
 }
