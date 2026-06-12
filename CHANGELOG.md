@@ -6,7 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
-## [0.17.0] - 2026-06-12
+## [0.16.0] - 2026-06-12
 
 ### Added
 
@@ -25,8 +25,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     Optional `notify_callback`.
   - `ApprovalBridge` — registers `__apcore_approval_check` as an MCP meta-tool,
     symmetric with `AsyncTaskBridge`.
-
-## [0.16.0] - 2026-06-12
 
 Closes [issue #70](https://github.com/aiperceivable/apcore/issues/70): remove bridge-level `user_fixable` stamping now that apcore 0.24.0 resolves it at construction time via `user_fixable_for_code`.
 
