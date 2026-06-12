@@ -35,8 +35,11 @@ pub fn get_pipeline_config() -> Option<serde_json::Value> {
     // Discover the config (from file or defaults), then read the MCP namespace.
     // Called once during build(), so the file-system discovery cost is acceptable.
     let config = Config::discover().ok()?;
-    let ns_value = config.namespace(MCP_NAMESPACE)?;
-    ns_value.get("pipeline").cloned().filter(|v| !v.is_null())
+    config
+        .namespace(MCP_NAMESPACE)
+        .get("pipeline")
+        .cloned()
+        .filter(|v| !v.is_null())
 }
 
 /// Attempt to read the `mcp.middleware` configuration from the Config Bus.
@@ -46,8 +49,8 @@ pub fn get_pipeline_config() -> Option<serde_json::Value> {
 /// `middleware_builder::build_middleware_from_config` during `build()`.
 pub fn get_middleware_config() -> Option<serde_json::Value> {
     let config = Config::discover().ok()?;
-    let ns_value = config.namespace(MCP_NAMESPACE)?;
-    ns_value
+    config
+        .namespace(MCP_NAMESPACE)
         .get("middleware")
         .cloned()
         .filter(|v| !v.is_null() && v.as_array().is_some_and(|a| !a.is_empty()))
@@ -61,8 +64,11 @@ pub fn get_middleware_config() -> Option<serde_json::Value> {
 /// `acl_builder::build_acl_from_config` during `build()`.
 pub fn get_acl_config() -> Option<serde_json::Value> {
     let config = Config::discover().ok()?;
-    let ns_value = config.namespace(MCP_NAMESPACE)?;
-    ns_value.get("acl").cloned().filter(|v| !v.is_null())
+    config
+        .namespace(MCP_NAMESPACE)
+        .get("acl")
+        .cloned()
+        .filter(|v| !v.is_null())
 }
 
 /// Scalar Config Bus values consumed by the convenience [`crate::serve`] /
@@ -93,7 +99,8 @@ pub fn get_scalar_config() -> McpScalarConfig {
     fn read(config: &Config, key: &str) -> Option<serde_json::Value> {
         config
             .namespace(MCP_NAMESPACE)
-            .and_then(|ns| ns.get(key).cloned())
+            .get(key)
+            .cloned()
             .filter(|v| !v.is_null())
     }
     let Ok(config) = Config::discover() else {

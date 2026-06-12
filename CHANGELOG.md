@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.16.0] - 2026-06-12
+
+Closes [issue #70](https://github.com/aiperceivable/apcore/issues/70): remove bridge-level `user_fixable` stamping now that apcore 0.24.0 resolves it at construction time via `user_fixable_for_code`.
+
+### Changed
+
+- **Raised apcore floor to `0.24` and apcore-toolkit to `0.8.1`** (`Cargo.toml`). apcore 0.24.0 auto-populates `user_fixable` on `ModuleError` at construction time; apcore-toolkit 0.8.1 declares the matching `apcore = "^0.24"` dependency (resolving the pre-1.0 semver conflict that blocked the upgrade from 0.8.0).
+- **Removed bridge-level stamping** from `src/adapters/errors.rs`: deleted the `USER_FIXABLE_ERROR_CODES` constant, the `stamp_user_fixable` helper, and the two explicit match arms that applied it for `DependencyNotFound | DependencyVersionMismatch` and `BindingSchemaInferenceFailed | BindingSchemaModeConflict | BindingStrictSchemaIncompatible | VersionConstraintInvalid`. `user_fixable` now flows through the existing `attach_ai_guidance` path.
+- **Adapted `Config::namespace()` call sites** (`src/config.rs`) to the apcore 0.24 API change: `namespace()` now returns `HashMap<String, serde_json::Value>` directly (no longer `Option`). Updated `get_pipeline_config`, `get_middleware_config`, `get_acl_config`, and the inner `read` closure in `get_scalar_config` accordingly. All 861 tests pass.
+
 ## [0.15.0] - 2026-05-29
 
 Audit-driven consistency work from `/apcore-skills:audit --scope mcp`. Ten Rust-side fixes land here; the docs/spec repo (`apcore-mcp/`) remains at 0.15.0 because no spec contracts changed, so SDK versions also stay at 0.15.0 pending an explicit release decision. The entries below describe changes already committed on `main`.

@@ -19,24 +19,6 @@ const INTERNAL_ERROR_CODES: &[ApcoreErrorCode] = &[
 /// Error codes that require detail sanitization (hide sensitive info).
 const SANITIZED_ERROR_CODES: &[ApcoreErrorCode] = &[ApcoreErrorCode::ACLDenied];
 
-/// Error codes that always represent user-fixable conditions — the MCP
-/// envelope must stamp `userFixable=true` even when the upstream
-/// [`ModuleError`] does not set the field. Mirrors Python's
-/// `_USER_FIXABLE_CODES` set and TypeScript's explicit branch stamping.
-/// [A-D-240, A-D-241]
-///
-/// Note: `BindingPolicyViolation` is in the cross-SDK list but apcore 0.21
-/// removed the enum variant, so it cannot appear here. If/when apcore
-/// re-introduces the variant, add it back for parity.
-const USER_FIXABLE_ERROR_CODES: &[ApcoreErrorCode] = &[
-    ApcoreErrorCode::DependencyNotFound,
-    ApcoreErrorCode::DependencyVersionMismatch,
-    ApcoreErrorCode::VersionConstraintInvalid,
-    ApcoreErrorCode::BindingSchemaInferenceFailed,
-    ApcoreErrorCode::BindingSchemaModeConflict,
-    ApcoreErrorCode::BindingStrictSchemaIncompatible,
-];
-
 /// Structured MCP error response.
 ///
 /// Wire format uses camelCase keys to match MCP/TypeScript convention.
@@ -248,36 +230,6 @@ impl ErrorMapper {
 
         // STEP_NOT_FOUND, VERSION_INCOMPATIBLE → handled by default passthrough below.
 
-        // DependencyNotFound / DependencyVersionMismatch — apcore 0.19.0 §5.3 /
-        // §5.15.2. Pass `error.message` through verbatim to match
-        // apcore-mcp-python and apcore-mcp-typescript wire format. `details`
-        // remains in the response so callers can inspect `module_id`,
-        // `dependency_id`, `required`, and `actual` programmatically.
-        if matches!(
-            code,
-            ApcoreErrorCode::DependencyNotFound | ApcoreErrorCode::DependencyVersionMismatch
-        ) {
-            let mut resp = build_detail_response(error, error_type, error.message.clone());
-            stamp_user_fixable(&code, &mut resp);
-            return resp;
-        }
-
-        // apcore 0.19.0 binding-configuration errors: keep the original message
-        // but pass details through so surfaces can inspect `module_id`,
-        // `declared_mode`, etc. Default passthrough already does that, but we
-        // route them explicitly to document the contract.
-        if matches!(
-            code,
-            ApcoreErrorCode::BindingSchemaInferenceFailed
-                | ApcoreErrorCode::BindingSchemaModeConflict
-                | ApcoreErrorCode::BindingStrictSchemaIncompatible
-                | ApcoreErrorCode::VersionConstraintInvalid
-        ) {
-            let mut resp = build_detail_response(error, error_type, error.message.clone());
-            stamp_user_fixable(&code, &mut resp);
-            return resp;
-        }
-
         // Async-task capacity: map `TaskLimitExceeded` to a retryable
         // envelope with an explicit agent-facing message, mirroring the
         // MCP async-task-bridge spec (`ASYNC_CAPACITY_EXCEEDED`).
@@ -365,18 +317,6 @@ fn attach_ai_guidance(error: &ModuleError, resp: &mut McpErrorResponse) {
     }
     if resp.suggestion.is_none() {
         resp.suggestion = error.suggestion.clone();
-    }
-}
-
-/// Stamp `userFixable=true` for codes that are unconditionally user-fixable.
-///
-/// Mirrors Python's `_USER_FIXABLE_CODES` set and TypeScript's explicit
-/// branch stamping. Always overwrites any prior value because the codes in
-/// [`USER_FIXABLE_ERROR_CODES`] are guaranteed user-fixable by spec.
-/// [A-D-240, A-D-241]
-fn stamp_user_fixable(code: &ApcoreErrorCode, resp: &mut McpErrorResponse) {
-    if USER_FIXABLE_ERROR_CODES.contains(code) {
-        resp.user_fixable = Some(true);
     }
 }
 
@@ -679,7 +619,8 @@ mod tests {
 
     #[test]
     fn test_ai_guidance_none_omitted() {
-        let err = make_error(ApcoreErrorCode::ModuleNotFound, "not found");
+        // MODULE_EXECUTE_ERROR has no policy entry — all guidance fields stay None.
+        let err = make_error(ApcoreErrorCode::ModuleExecuteError, "execute failed");
         let resp = ErrorMapper::to_mcp_error(&err);
         assert!(resp.retryable.is_none());
         assert!(resp.ai_guidance.is_none());
@@ -840,14 +781,12 @@ mod tests {
         assert_eq!(resp_typed.message, resp_any.message);
     }
 
-    // ---- userFixable stamping for DEPENDENCY_*, VERSION_CONSTRAINT_INVALID,
-    // BINDING_* (cross-SDK parity, A-D-240 + A-D-241) ----
+    // ---- userFixable pass-through for DEPENDENCY_*, VERSION_CONSTRAINT_INVALID,
+    // BINDING_* — apcore 0.24 resolves user_fixable at construction via
+    // user_fixable_for_code; the bridge passes it through attach_ai_guidance. ----
 
     #[test]
-    fn test_user_fixable_dependency_not_found_stamped_true() {
-        // A-D-240: DEPENDENCY_NOT_FOUND must surface userFixable=true even
-        // when the upstream ModuleError doesn't set it. Matches Python's
-        // `_USER_FIXABLE_CODES` and TS's explicit branch stamping.
+    fn test_user_fixable_dependency_not_found_passes_through() {
         let err = ModuleError::new(ApcoreErrorCode::DependencyNotFound, "missing dependency");
         let resp = ErrorMapper::to_mcp_error(&err);
         assert_eq!(resp.error_type, "DEPENDENCY_NOT_FOUND");
@@ -855,8 +794,7 @@ mod tests {
     }
 
     #[test]
-    fn test_user_fixable_dependency_version_mismatch_stamped_true() {
-        // A-D-240
+    fn test_user_fixable_dependency_version_mismatch_passes_through() {
         let err = ModuleError::new(
             ApcoreErrorCode::DependencyVersionMismatch,
             "version mismatch",
@@ -867,8 +805,7 @@ mod tests {
     }
 
     #[test]
-    fn test_user_fixable_version_constraint_invalid_stamped_true() {
-        // A-D-241
+    fn test_user_fixable_version_constraint_invalid_passes_through() {
         let err = ModuleError::new(
             ApcoreErrorCode::VersionConstraintInvalid,
             "invalid constraint",
@@ -879,8 +816,7 @@ mod tests {
     }
 
     #[test]
-    fn test_user_fixable_binding_schema_inference_failed_stamped_true() {
-        // A-D-241
+    fn test_user_fixable_binding_schema_inference_failed_passes_through() {
         let err = ModuleError::new(
             ApcoreErrorCode::BindingSchemaInferenceFailed,
             "could not infer schema",
@@ -891,8 +827,7 @@ mod tests {
     }
 
     #[test]
-    fn test_user_fixable_binding_schema_mode_conflict_stamped_true() {
-        // A-D-241
+    fn test_user_fixable_binding_schema_mode_conflict_passes_through() {
         let err = ModuleError::new(
             ApcoreErrorCode::BindingSchemaModeConflict,
             "schema mode conflict",
@@ -903,8 +838,7 @@ mod tests {
     }
 
     #[test]
-    fn test_user_fixable_binding_strict_schema_incompatible_stamped_true() {
-        // A-D-241
+    fn test_user_fixable_binding_strict_schema_incompatible_passes_through() {
         let err = ModuleError::new(
             ApcoreErrorCode::BindingStrictSchemaIncompatible,
             "strict schema incompatible",
@@ -915,12 +849,12 @@ mod tests {
     }
 
     #[test]
-    fn test_user_fixable_default_remains_none_for_other_codes() {
-        // Codes NOT in USER_FIXABLE_ERROR_CODES must keep userFixable=None
-        // (unless the upstream ModuleError explicitly sets it).
-        let err = ModuleError::new(ApcoreErrorCode::ModuleNotFound, "module not found");
+    fn test_user_fixable_none_for_unlisted_codes() {
+        // Codes absent from user_fixable_for_code (e.g. MODULE_EXECUTE_ERROR)
+        // keep userFixable=None unless the caller explicitly sets it.
+        let err = ModuleError::new(ApcoreErrorCode::ModuleExecuteError, "execute failed");
         let resp = ErrorMapper::to_mcp_error(&err);
-        assert_eq!(resp.error_type, "MODULE_NOT_FOUND");
+        assert_eq!(resp.error_type, "MODULE_EXECUTE_ERROR");
         assert!(resp.user_fixable.is_none());
     }
 
