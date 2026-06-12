@@ -14,6 +14,7 @@
 pub mod acl_builder;
 pub mod adapters;
 pub mod apcore_mcp;
+pub mod approval_store;
 pub mod auth;
 pub mod cli;
 pub mod config;
@@ -109,3 +110,10 @@ pub const META_TOOL_NAMES: [&str; 5] = [
     META_TOOL_LIST,
     META_TOOL_PREVIEW,
 ];
+
+// ---- Re-exports: approval store & bridge ------------------------------------
+pub use crate::adapters::StorageBackedApprovalHandler;
+pub use crate::approval_store::{
+    ApprovalRecord, ApprovalStatus, ApprovalStore, InMemoryApprovalStore,
+};
+pub use crate::server::approval_bridge::{ApprovalBridge, APPROVAL_META_TOOL_NAMES};

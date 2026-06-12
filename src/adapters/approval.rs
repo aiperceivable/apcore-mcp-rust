@@ -1,12 +1,18 @@
 //! ElicitationApprovalHandler — uses MCP elicitation to request user approval
 //! for destructive or sensitive tool executions.
+//!
+//! Also contains `StorageBackedApprovalHandler` — Phase B async approval handler
+//! backed by a pluggable `ApprovalStore`.
 
 use std::fmt;
+use std::sync::Arc;
 
 use apcore::approval::{ApprovalHandler, ApprovalRequest, ApprovalResult};
 use apcore::errors::ModuleError;
 use async_trait::async_trait;
+use uuid::Uuid;
 
+use crate::approval_store::ApprovalStore;
 use crate::helpers::{ElicitAction, ElicitCallback};
 
 /// Handles user approval requests via MCP elicitation.
@@ -145,6 +151,123 @@ impl ApprovalHandler for ElicitationApprovalHandler {
 
     async fn check_approval(&self, _approval_id: &str) -> Result<ApprovalResult, ModuleError> {
         Ok(rejected("Phase B not supported via MCP elicitation"))
+    }
+}
+
+// ── StorageBackedApprovalHandler ─────────────────────────────────────────────
+
+/// Callback type for out-of-band approval notifications (approval_id, module_id, arguments).
+pub type ApprovalNotifyCallback =
+    Arc<dyn Fn(String, String, serde_json::Value) + Send + Sync + 'static>;
+
+/// Phase B approval handler backed by a pluggable [`ApprovalStore`].
+///
+/// On `request_approval`, generates a UUID, writes a pending record to the
+/// store, fires an optional notify callback, and returns
+/// `ApprovalResult { status: "pending", approval_id: Some(uuid) }`.
+///
+/// On `check_approval`, reads the record from the store and maps its status
+/// to the corresponding `ApprovalResult`.
+pub struct StorageBackedApprovalHandler {
+    store: Arc<dyn ApprovalStore>,
+    notify_callback: Option<ApprovalNotifyCallback>,
+}
+
+impl StorageBackedApprovalHandler {
+    /// Create a new handler backed by the given store.
+    pub fn new(store: Arc<dyn ApprovalStore>) -> Self {
+        Self {
+            store,
+            notify_callback: None,
+        }
+    }
+
+    /// Attach an optional notification callback.
+    ///
+    /// The callback receives `(approval_id, module_id, arguments)` and can
+    /// be used to send an out-of-band notification (e.g. Slack, email).
+    pub fn with_notify<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(String, String, serde_json::Value) + Send + Sync + 'static,
+    {
+        self.notify_callback = Some(Arc::new(callback));
+        self
+    }
+}
+
+impl fmt::Debug for StorageBackedApprovalHandler {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StorageBackedApprovalHandler")
+            .field("has_notify", &self.notify_callback.is_some())
+            .finish()
+    }
+}
+
+#[async_trait]
+impl ApprovalHandler for StorageBackedApprovalHandler {
+    async fn request_approval(
+        &self,
+        request: &ApprovalRequest,
+    ) -> Result<ApprovalResult, ModuleError> {
+        let approval_id = Uuid::new_v4().to_string();
+        let module_id = request.module_id.as_str();
+        let arguments = request.arguments.clone();
+
+        if let Err(e) = self
+            .store
+            .save_pending(&approval_id, module_id, &arguments)
+            .await
+        {
+            tracing::error!("approval store save_pending failed: {e}");
+            let mut result = ApprovalResult::default();
+            result.status = "rejected".to_string();
+            result.reason = Some("internal store error".to_string());
+            return Ok(result);
+        }
+
+        if let Some(cb) = &self.notify_callback {
+            cb(approval_id.clone(), module_id.to_string(), arguments);
+        }
+
+        let mut result = ApprovalResult::default();
+        result.status = "pending".to_string();
+        result.approval_id = Some(approval_id);
+        Ok(result)
+    }
+
+    async fn check_approval(&self, approval_id: &str) -> Result<ApprovalResult, ModuleError> {
+        match self.store.get_result(approval_id).await {
+            Err(e) => {
+                let mut result = ApprovalResult::default();
+                result.status = "rejected".to_string();
+                result.reason = Some(format!("store error: {e}"));
+                Ok(result)
+            }
+            Ok(None) => {
+                let mut result = ApprovalResult::default();
+                result.status = "rejected".to_string();
+                result.reason = Some("approval_id not found".to_string());
+                Ok(result)
+            }
+            Ok(Some(rec)) => {
+                use crate::approval_store::ApprovalStatus;
+                let mut result = ApprovalResult::default();
+                result.approval_id = Some(approval_id.to_string());
+                match rec.status {
+                    ApprovalStatus::Approved => {
+                        result.status = "approved".to_string();
+                    }
+                    ApprovalStatus::Rejected => {
+                        result.status = "rejected".to_string();
+                        result.reason = rec.reason;
+                    }
+                    ApprovalStatus::Pending => {
+                        result.status = "pending".to_string();
+                    }
+                }
+                Ok(result)
+            }
+        }
     }
 }
 

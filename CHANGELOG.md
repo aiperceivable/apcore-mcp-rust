@@ -6,6 +6,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.17.0] - 2026-06-12
+
+### Added
+
+- **Approval Phase B: async polling via `__apcore_approval_check` meta-tool**.
+  apcore-mcp now supports out-of-band human approvals that do not block the MCP connection.
+
+  New public API:
+  - `ApprovalStore` (trait) — pluggable persistence; three async methods:
+    `save_pending`, `get_result`, `resolve`.
+  - `InMemoryApprovalStore` — in-process implementation for testing/local dev.
+    Bounded memory: per-record TTL via `tokio::spawn` + `time::sleep`, background
+    sweep task via `start_sweep()`, and `max_records` hard cap with oldest-pending eviction.
+    **Not suitable for production.**
+  - `StorageBackedApprovalHandler` (implements `apcore::approval::ApprovalHandler`) —
+    writes pending records on `request_approval()`, reads on `check_approval()`.
+    Optional `notify_callback`.
+  - `ApprovalBridge` — registers `__apcore_approval_check` as an MCP meta-tool,
+    symmetric with `AsyncTaskBridge`.
+
 ## [0.16.0] - 2026-06-12
 
 Closes [issue #70](https://github.com/aiperceivable/apcore/issues/70): remove bridge-level `user_fixable` stamping now that apcore 0.24.0 resolves it at construction time via `user_fixable_for_code`.

@@ -877,7 +877,7 @@ impl APCoreMCP {
         let tags_slice: Option<&[&str]> = tags_refs.as_deref();
         let prefix = self.config.prefix.as_deref();
 
-        let tools = converter.convert_registry(
+        let tools = converter.convert_registry_json(
             &registry_json,
             embed_annotations,
             strict,

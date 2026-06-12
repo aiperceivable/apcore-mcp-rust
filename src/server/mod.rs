@@ -4,6 +4,7 @@
 // server/trace-context.ts. Add equivalents here (or document the consolidated layout) — see
 // audit D8-004.
 
+pub mod approval_bridge;
 pub mod async_task_bridge;
 pub mod factory;
 pub mod listener;

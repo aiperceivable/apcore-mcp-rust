@@ -33,7 +33,7 @@ pub enum ConverterError {
 ///   build the options inline:
 ///
 /// ```ignore
-/// let tools = converter.convert_registry_with_options(
+/// let tools = converter.convert_registry_json_with_options(
 ///     &registry_json,
 ///     ConvertOptions::default()
 ///         .with_embed_annotations(true)
@@ -121,7 +121,7 @@ impl OpenAIConverter {
     /// * `strict` — if true, enable OpenAI strict mode on schemas.
     /// * `tags` — if provided, only include modules whose tags contain ALL specified tags.
     /// * `prefix` — if provided, only include modules whose ID starts with the prefix.
-    pub fn convert_registry_apcore(
+    pub fn convert_registry(
         &self,
         registry: &Registry,
         embed_annotations: bool,
@@ -129,7 +129,7 @@ impl OpenAIConverter {
         tags: Option<&[&str]>,
         prefix: Option<&str>,
     ) -> Result<Vec<Value>, ConverterError> {
-        self.convert_registry_apcore_with_options(
+        self.convert_registry_with_options(
             registry,
             ConvertOptions::default()
                 .with_embed_annotations(embed_annotations)
@@ -139,10 +139,10 @@ impl OpenAIConverter {
         )
     }
 
-    /// Like [`Self::convert_registry_apcore`] but takes a [`ConvertOptions`]
+    /// Like [`Self::convert_registry`] but takes a [`ConvertOptions`]
     /// struct, supporting `rich_description` for Markdown-rendered tool
     /// descriptions (apcore-toolkit `format_module(Markdown)`).
-    pub fn convert_registry_apcore_with_options(
+    pub fn convert_registry_with_options(
         &self,
         registry: &Registry,
         options: ConvertOptions,
@@ -221,7 +221,7 @@ impl OpenAIConverter {
     ///
     /// # Returns
     /// A vector of OpenAI-compatible tool objects.
-    pub fn convert_registry(
+    pub fn convert_registry_json(
         &self,
         registry: &Value,
         embed_annotations: bool,
@@ -229,7 +229,7 @@ impl OpenAIConverter {
         tags: Option<&[&str]>,
         prefix: Option<&str>,
     ) -> Result<Vec<Value>, ConverterError> {
-        self.convert_registry_with_options(
+        self.convert_registry_json_with_options(
             registry,
             ConvertOptions::default()
                 .with_embed_annotations(embed_annotations)
@@ -244,7 +244,7 @@ impl OpenAIConverter {
     /// descriptions. The JSON entry for each module is adapted to a
     /// transient [`ScannedModule`] via [`json_entry_to_scanned_module`]
     /// before delegating to `apcore_toolkit::format_module(Markdown)`.
-    pub fn convert_registry_with_options(
+    pub fn convert_registry_json_with_options(
         &self,
         registry: &Value,
         options: ConvertOptions,
@@ -301,7 +301,7 @@ impl OpenAIConverter {
             // When rich_description is on, project the JSON entry into a
             // transient ScannedModule and delegate to apcore-toolkit's
             // `format_module(Markdown)`. This is the JSON-path equivalent
-            // of what `convert_registry_apcore_with_options` does with
+            // of what `convert_registry_with_options` does with
             // a real `ModuleDescriptor`. The toolkit's Markdown style
             // gracefully handles missing fields (empty `## Examples`,
             // empty `## Behavior` table) so a sparse JSON entry still
@@ -1421,7 +1421,7 @@ mod tests {
         let converter = OpenAIConverter::new();
         let registry = json!({});
         let result = converter
-            .convert_registry(&registry, false, false, None, None)
+            .convert_registry_json(&registry, false, false, None, None)
             .unwrap();
         assert!(result.is_empty());
     }
@@ -1431,7 +1431,7 @@ mod tests {
         let converter = OpenAIConverter::new();
         let registry = Value::Null;
         let result = converter
-            .convert_registry(&registry, false, false, None, None)
+            .convert_registry_json(&registry, false, false, None, None)
             .unwrap();
         assert!(result.is_empty());
     }
@@ -1451,7 +1451,7 @@ mod tests {
             }
         });
         let result = converter
-            .convert_registry(&registry, false, false, None, None)
+            .convert_registry_json(&registry, false, false, None, None)
             .unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0]["type"], "function");
@@ -1477,7 +1477,7 @@ mod tests {
             }
         });
         let result = converter
-            .convert_registry(&registry, false, false, None, None)
+            .convert_registry_json(&registry, false, false, None, None)
             .unwrap();
         assert_eq!(result.len(), 3);
     }
@@ -1504,13 +1504,13 @@ mod tests {
         });
         // Filter by "image" tag — should include resize and crop
         let result = converter
-            .convert_registry(&registry, false, false, Some(&["image"]), None)
+            .convert_registry_json(&registry, false, false, Some(&["image"]), None)
             .unwrap();
         assert_eq!(result.len(), 2);
 
         // Filter by both "image" and "transform" — should only include resize
         let result = converter
-            .convert_registry(&registry, false, false, Some(&["image", "transform"]), None)
+            .convert_registry_json(&registry, false, false, Some(&["image", "transform"]), None)
             .unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0]["function"]["name"], "image-resize");
@@ -1534,7 +1534,7 @@ mod tests {
             }
         });
         let result = converter
-            .convert_registry(&registry, false, false, None, Some("image"))
+            .convert_registry_json(&registry, false, false, None, Some("image"))
             .unwrap();
         assert_eq!(result.len(), 2);
         // All names should start with "image-"
@@ -1559,7 +1559,7 @@ mod tests {
             }
         });
         let result = converter
-            .convert_registry(&registry, true, false, None, None)
+            .convert_registry_json(&registry, true, false, None, None)
             .unwrap();
         assert_eq!(result.len(), 1);
         let desc = result[0]["function"]["description"].as_str().unwrap();
@@ -1581,7 +1581,7 @@ mod tests {
             }
         });
         let result = converter
-            .convert_registry(&registry, false, true, None, None)
+            .convert_registry_json(&registry, false, true, None, None)
             .unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0]["function"]["strict"], true);
@@ -1602,7 +1602,7 @@ mod tests {
             }
         });
         let result = converter
-            .convert_registry(&registry, false, false, Some(&["needed"]), None)
+            .convert_registry_json(&registry, false, false, Some(&["needed"]), None)
             .unwrap();
         assert!(result.is_empty());
     }
@@ -1629,7 +1629,7 @@ mod tests {
         });
         // Both prefix "image" and tag "transform"
         let result = converter
-            .convert_registry(&registry, false, false, Some(&["transform"]), Some("image"))
+            .convert_registry_json(&registry, false, false, Some(&["transform"]), Some("image"))
             .unwrap();
         assert_eq!(result.len(), 2);
     }
@@ -1653,7 +1653,7 @@ mod tests {
             }
         });
         let result = converter
-            .convert_registry(&registry, false, false, None, None)
+            .convert_registry_json(&registry, false, false, None, None)
             .unwrap();
         assert_eq!(result.len(), 1);
 
@@ -1703,7 +1703,7 @@ mod tests {
             }
         });
         let result = converter
-            .convert_registry(&registry, false, true, None, None)
+            .convert_registry_json(&registry, false, true, None, None)
             .unwrap();
         assert_eq!(result.len(), 1);
 
@@ -1760,7 +1760,7 @@ mod tests {
             }
         });
         let result = converter
-            .convert_registry(&registry, true, false, None, None)
+            .convert_registry_json(&registry, true, false, None, None)
             .unwrap();
         assert_eq!(result.len(), 1);
 
@@ -1793,7 +1793,7 @@ mod tests {
 
         // Filter by "image" tag -> 2 tools
         let result = converter
-            .convert_registry(&registry, false, false, Some(&["image"]), None)
+            .convert_registry_json(&registry, false, false, Some(&["image"]), None)
             .unwrap();
         assert_eq!(result.len(), 2);
         let names: Vec<&str> = result
@@ -1806,7 +1806,7 @@ mod tests {
 
         // Filter by "image" + "transform" -> only resize
         let result = converter
-            .convert_registry(&registry, false, false, Some(&["image", "transform"]), None)
+            .convert_registry_json(&registry, false, false, Some(&["image", "transform"]), None)
             .unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0]["function"]["name"], "image-resize");
@@ -1831,7 +1831,7 @@ mod tests {
         });
 
         let result = converter
-            .convert_registry(&registry, false, false, None, Some("image"))
+            .convert_registry_json(&registry, false, false, None, Some("image"))
             .unwrap();
         assert_eq!(result.len(), 2);
         for tool in &result {
@@ -1844,7 +1844,7 @@ mod tests {
         }
 
         let result = converter
-            .convert_registry(&registry, false, false, None, Some("audio"))
+            .convert_registry_json(&registry, false, false, None, Some("audio"))
             .unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0]["function"]["name"], "audio-play");
@@ -1860,7 +1860,7 @@ mod tests {
             }
         });
         let result = converter
-            .convert_registry(&registry, false, false, None, None)
+            .convert_registry_json(&registry, false, false, None, None)
             .unwrap();
         assert_eq!(result.len(), 1);
 
@@ -1882,7 +1882,7 @@ mod tests {
             }
         });
         let result = converter
-            .convert_registry(&registry, false, false, None, None)
+            .convert_registry_json(&registry, false, false, None, None)
             .unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(
@@ -1901,7 +1901,7 @@ mod tests {
             }
         });
         let result = converter
-            .convert_registry(&registry, false, false, None, None)
+            .convert_registry_json(&registry, false, false, None, None)
             .unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(
@@ -1921,24 +1921,24 @@ mod tests {
             }
         });
         let result = converter
-            .convert_registry(&registry, false, false, None, None)
+            .convert_registry_json(&registry, false, false, None, None)
             .unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0]["function"]["description"], "");
     }
 
-    // ---- Issue D11-024: convert_registry_apcore with live Registry ----------
+    // ---- Issue D11-024: convert_registry with live Registry ----------
 
     #[test]
-    fn test_convert_registry_apcore_empty_registry() {
-        // [D11-024] convert_registry_apcore must work with live apcore Registry.
+    fn test_convert_registry_empty_registry() {
+        // [D11-024] convert_registry must work with live apcore Registry.
         use apcore::registry::registry::Registry;
         use std::sync::Arc;
 
         let registry = Arc::new(Registry::default());
         let converter = OpenAIConverter::new();
         let result = converter
-            .convert_registry_apcore(&registry, false, false, None, None)
+            .convert_registry(&registry, false, false, None, None)
             .unwrap();
         assert!(
             result.is_empty(),
@@ -1947,8 +1947,8 @@ mod tests {
     }
 
     #[test]
-    fn test_convert_registry_apcore_with_module() {
-        // [D11-024] convert_registry_apcore enumerates live Registry and produces tools.
+    fn test_convert_registry_with_module() {
+        // [D11-024] convert_registry enumerates live Registry and produces tools.
         use apcore::context::Context;
         use apcore::errors::ModuleError;
         use apcore::module::Module;
@@ -2001,7 +2001,7 @@ mod tests {
 
         let converter = OpenAIConverter::new();
         let result = converter
-            .convert_registry_apcore(&registry, false, false, None, None)
+            .convert_registry(&registry, false, false, None, None)
             .unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0]["function"]["name"], "math-add");
@@ -2124,7 +2124,7 @@ mod tests {
     }
 
     #[test]
-    fn convert_registry_with_options_rich_description_propagates_to_every_tool() {
+    fn convert_registry_json_with_options_rich_description_propagates_to_every_tool() {
         // rich_description on the JSON-path convert_registry must
         // render Markdown for every emitted tool — proving
         // json_entry_to_scanned_module sees per-entry data.
@@ -2142,7 +2142,7 @@ mod tests {
             }
         });
         let tools = converter
-            .convert_registry_with_options(
+            .convert_registry_json_with_options(
                 &registry,
                 ConvertOptions::default().with_rich_description(true),
                 None,
@@ -2164,7 +2164,7 @@ mod tests {
     }
 
     #[test]
-    fn convert_registry_apcore_with_options_rich_description_uses_real_descriptor() {
+    fn convert_registry_with_options_rich_description_uses_real_descriptor() {
         // The apcore-Registry path can lean on `markdown::render_module_markdown`
         // because it has the real `ModuleDescriptor` (incl. documentation,
         // examples, display overlay) — strictly richer than the JSON path.
@@ -2222,7 +2222,7 @@ mod tests {
 
         let converter = OpenAIConverter::new();
         let tools = converter
-            .convert_registry_apcore_with_options(
+            .convert_registry_with_options(
                 &registry,
                 ConvertOptions::default().with_rich_description(true),
                 None,
