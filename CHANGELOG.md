@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.16.1] - 2026-06-18
+
+### Changed
+Remove the local duplicate CancelToken implementation and import the official type from apcore instead. Update all usage sites to use the imported token, add tests to verify the cancellation state propagates correctly into the apcore Context. This keeps the codebase in sync with apcore's official cancellation token and enables proper cross-component cancellation notifications.
+
 ## [0.16.0] - 2026-06-12
 
 ### Added

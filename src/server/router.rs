@@ -16,6 +16,7 @@ use serde_json::{json, Value};
 use tokio_stream::Stream;
 
 use apcore::trace_context::{TraceContext, TraceParent};
+use apcore::CancelToken;
 
 use crate::auth::middleware::AUTH_IDENTITY;
 use crate::helpers::{ElicitResult, MCP_ELICIT_KEY, MCP_PROGRESS_KEY};
@@ -327,33 +328,12 @@ pub struct ExecutionRouter {
 /// in FIFO order to prevent unbounded growth from spam-cancel tombstones.
 const CANCEL_TOKENS_MAX: usize = 4096;
 
-/// Cooperative cancellation token, mirrors apcore-py's `CancelToken`.
-/// [B-002]
-#[derive(Debug)]
-pub struct CancelToken {
-    cancelled: std::sync::atomic::AtomicBool,
-}
-
-impl Default for CancelToken {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl CancelToken {
-    pub fn new() -> Self {
-        Self {
-            cancelled: std::sync::atomic::AtomicBool::new(false),
-        }
-    }
-    pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(std::sync::atomic::Ordering::SeqCst)
-    }
-    pub fn cancel(&self) {
-        self.cancelled
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-    }
-}
+// [B-002] Cancellation uses apcore's real `CancelToken` (imported above), not a
+// local mirror. apcore::CancelToken is the same cooperative `AtomicBool` token
+// (`Arc`-backed, `Clone`) and a strict superset of the previous local struct
+// (it adds `check`/`check_for`/`reset`). Using the real type keeps the bridge
+// from drifting and lets the token be threaded into `Context.cancel_token` so
+// the executor pipeline and modules observe inbound `notifications/cancelled`.
 
 /// RAII guard returned by [`ExecutionRouter::_cancel_guard`]. On drop,
 /// releases the call_id slot from the router's cancel_tokens map so
@@ -563,8 +543,11 @@ impl ExecutionRouter {
     }
 
     /// Internal: register a CancelToken for `call_id` and return an RAII
-    /// guard that releases the slot when dropped. [B-002]
-    fn _cancel_guard(&self, call_id: &str) -> CancelGuard {
+    /// guard that releases the slot when dropped, plus a clone of the token
+    /// to thread into the execution Context. The returned token shares the
+    /// same cancellation state (`Arc<AtomicBool>` inside apcore::CancelToken)
+    /// as the one held in the map, so `cancel_call` flips both. [B-002]
+    fn _cancel_guard(&self, call_id: &str) -> (CancelGuard, CancelToken) {
         let token = std::sync::Arc::new(CancelToken::new());
         let mut guard = self.cancel_tokens.lock().unwrap_or_else(|p| p.into_inner());
         // Tombstone race: if a tombstone was recorded earlier via
@@ -576,10 +559,14 @@ impl ExecutionRouter {
         }
         guard.insert(call_id.to_string(), std::sync::Arc::clone(&token));
         Self::_evict_cancel_tokens_locked(&mut guard);
-        CancelGuard {
-            call_id: call_id.to_string(),
-            tokens: std::sync::Arc::clone(&self.cancel_tokens),
-        }
+        let cancel_token = (*token).clone();
+        (
+            CancelGuard {
+                call_id: call_id.to_string(),
+                tokens: std::sync::Arc::clone(&self.cancel_tokens),
+            },
+            cancel_token,
+        )
     }
 
     /// [B-002] When the cancel-tokens map exceeds [`CANCEL_TOKENS_MAX`],
@@ -827,7 +814,7 @@ impl ExecutionRouter {
                     })
             })
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let _cancel_guard = self._cancel_guard(&call_id);
+        let (_cancel_guard, cancel_token) = self._cancel_guard(&call_id);
 
         let redacted = self.redact_inputs(tool_name, arguments);
         tracing::debug!(
@@ -882,7 +869,7 @@ impl ExecutionRouter {
             typed_identity: None,
         };
         let (context_value, _context_data, apcore_ctx) =
-            Self::build_context_with_trace(&call_extra, trace_parent.clone());
+            Self::build_context_with_trace(&call_extra, trace_parent.clone(), Some(cancel_token));
 
         // Short-circuit async-task meta-tools and async-routed modules via
         // the AsyncTaskBridge, when configured.
@@ -1202,14 +1189,17 @@ impl ExecutionRouter {
         HashMap<String, Box<dyn std::any::Any + Send + Sync>>,
         apcore::Context<Value>,
     ) {
-        Self::build_context_with_trace(extra, None)
+        Self::build_context_with_trace(extra, None, None)
     }
 
     /// Like [`build_context`] but inherits the W3C trace_id from
-    /// `trace_parent` when provided.
+    /// `trace_parent` when provided, and threads `cancel_token` into the
+    /// resulting Context so the executor pipeline and modules observe inbound
+    /// MCP `notifications/cancelled`.
     fn build_context_with_trace(
         extra: &CallExtra,
         trace_parent: Option<TraceParent>,
+        cancel_token: Option<CancelToken>,
     ) -> (
         Value,
         HashMap<String, Box<dyn std::any::Any + Send + Sync>>,
@@ -1235,7 +1225,7 @@ impl ExecutionRouter {
         // When `trace_parent` is Some, use ContextBuilder so the incoming
         // W3C trace_id propagates into the Context (subject to apcore's
         // validation per PROTOCOL_SPEC §10.5).
-        let apcore_ctx: apcore::Context<Value> = match (&resolved_identity, &trace_parent) {
+        let mut apcore_ctx: apcore::Context<Value> = match (&resolved_identity, &trace_parent) {
             (Some(ident), Some(_)) => apcore::Context::<Value>::builder()
                 .identity(Some(ident.clone()))
                 .trace_parent(trace_parent.clone())
@@ -1246,6 +1236,16 @@ impl ExecutionRouter {
             (Some(ident), None) => apcore::Context::new(ident.clone()),
             (None, None) => apcore::Context::anonymous(),
         };
+
+        // Thread the inbound cancel token into the Context so the executor
+        // pipeline (which checks `context.cancel_token`) and modules observe
+        // MCP `notifications/cancelled`. Set at construction time — before the
+        // Context enters the pipeline — so this is not the post-dispatch
+        // mutation anti-pattern. Matches apcore-mcp-python / -typescript, which
+        // pass `cancel_token` into `Context.create()`. Field assignment (rather
+        // than the builder) keeps all four construction branches above intact,
+        // preserving their `data`/identity initialization semantics.
+        apcore_ctx.cancel_token = cancel_token;
 
         let has_progress = extra.progress_token.is_some() && extra.send_notification.is_some();
         let has_elicit = extra.session.is_some();
@@ -3909,8 +3909,34 @@ mod tests {
             identity: None,
             typed_identity: None,
         };
-        let (_, _, apcore_ctx) = ExecutionRouter::build_context_with_trace(&extra, tp);
+        let (_, _, apcore_ctx) = ExecutionRouter::build_context_with_trace(&extra, tp, None);
         assert_eq!(apcore_ctx.trace_id, "4bf92f3577b34da6a3ce929d0e0e4736");
+    }
+
+    #[tokio::test]
+    async fn build_context_with_trace_threads_cancel_token() {
+        // [B-002] The cancel token registered for a call must reach the
+        // Context so the executor pipeline and modules observe inbound MCP
+        // `notifications/cancelled` (parity with apcore-mcp-python/-typescript).
+        let extra = CallExtra {
+            progress_token: None,
+            send_notification: None,
+            session: None,
+            identity: None,
+            typed_identity: None,
+        };
+        let token = CancelToken::new();
+        let (_, _, apcore_ctx) =
+            ExecutionRouter::build_context_with_trace(&extra, None, Some(token.clone()));
+        let ctx_token = apcore_ctx
+            .cancel_token
+            .as_ref()
+            .expect("cancel_token threaded into Context");
+        assert!(!ctx_token.is_cancelled());
+        // Cancelling via a sibling clone (as `cancel_call` does on the map's
+        // token) flips the Context's token — shared `Arc<AtomicBool>` state.
+        token.cancel();
+        assert!(apcore_ctx.cancel_token.as_ref().unwrap().is_cancelled());
     }
 
     #[tokio::test]
