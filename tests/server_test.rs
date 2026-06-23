@@ -6,7 +6,7 @@ use apcore::module::ModuleAnnotations;
 use apcore::registry::ModuleDescriptor;
 use apcore_mcp::server::factory::MCPServerFactory;
 use apcore_mcp::server::server::{MCPServer, MCPServerConfig};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::collections::HashMap;
 
 // ---- MCPServer construction -------------------------------------------------
@@ -131,4 +131,139 @@ fn factory_create_server_accepts_valid_name_at_boundary() {
         factory.create_server(&name, "1.0.0").is_ok(),
         "255-char name should be accepted"
     );
+}
+
+// ---- H-3: async_serve mounts /mcp ------------------------------------------
+
+use apcore::config::Config;
+use apcore::context::Context;
+use apcore::executor::Executor;
+use apcore::module::Module;
+use apcore::registry::registry::Registry;
+use apcore_mcp::{async_serve, AsyncServeConfig};
+use async_trait::async_trait;
+use axum::body::{to_bytes, Body};
+use axum::http::{Request, StatusCode};
+use std::sync::Arc;
+use tower::ServiceExt;
+
+#[derive(Debug)]
+struct AddModule;
+
+#[async_trait]
+impl Module for AddModule {
+    fn input_schema(&self) -> serde_json::Value {
+        json!({"type": "object", "properties": {"a": {"type": "number"}, "b": {"type": "number"}}})
+    }
+    fn output_schema(&self) -> serde_json::Value {
+        json!({"type": "object"})
+    }
+    fn description(&self) -> &str {
+        "Add two numbers"
+    }
+    async fn execute(
+        &self,
+        inputs: serde_json::Value,
+        _ctx: &Context<serde_json::Value>,
+    ) -> Result<serde_json::Value, apcore::errors::ModuleError> {
+        let a = inputs.get("a").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let b = inputs.get("b").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        Ok(json!({"sum": a + b}))
+    }
+}
+
+fn build_executor_with_add() -> Arc<Executor> {
+    let registry = Registry::new();
+    let descriptor = ModuleDescriptor {
+        module_id: "math.add".to_string(),
+        name: None,
+        description: "Add two numbers".to_string(),
+        documentation: None,
+        input_schema: json!({"type": "object", "properties": {"a": {"type": "number"}, "b": {"type": "number"}}}),
+        output_schema: json!({"type": "object"}),
+        version: "1.0.0".to_string(),
+        tags: vec![],
+        annotations: Some(ModuleAnnotations::default()),
+        examples: vec![],
+        metadata: HashMap::new(),
+        display: None,
+        sunset_date: None,
+        dependencies: vec![],
+        enabled: true,
+    };
+    registry
+        .register("math.add", Box::new(AddModule), descriptor)
+        .expect("register math.add");
+    Arc::new(Executor::new(registry, Config::default()))
+}
+
+#[tokio::test]
+async fn async_serve_router_serves_mcp_tools_list() {
+    // [H-3] The Router returned by async_serve must mount `/mcp` and serve
+    // real MCP traffic (tools/list), not just /health, /metrics, /usage.
+    let executor = build_executor_with_add();
+    let app = async_serve(
+        executor,
+        AsyncServeConfig {
+            name: "h3-test".to_string(),
+            require_auth: Some(false),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("async_serve should build a router");
+
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/list",
+        "params": {}
+    });
+    let request = Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "/mcp POST must return 200"
+    );
+
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let resp: Value = serde_json::from_slice(&bytes).unwrap();
+    let tools = resp["result"]["tools"].as_array().expect("tools array");
+    let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+    assert!(
+        names.contains(&"math.add"),
+        "math.add must be listed; got {names:?}"
+    );
+}
+
+#[tokio::test]
+async fn async_serve_router_still_serves_health() {
+    // [H-3] Regression: the /health endpoint must remain available after
+    // switching from health_metrics_router() to build_streamable_http_app().
+    let executor = build_executor_with_add();
+    let app = async_serve(
+        executor,
+        AsyncServeConfig {
+            name: "h3-health".to_string(),
+            require_auth: Some(false),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("async_serve should build a router");
+
+    let request = Request::builder()
+        .method("GET")
+        .uri("/health")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "/health must return 200");
 }

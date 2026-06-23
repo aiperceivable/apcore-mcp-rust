@@ -161,7 +161,10 @@ pub struct APCoreMCPConfig {
     pub log_level: Option<String>,
     /// Validate tool inputs against schemas before execution.
     pub validate_inputs: bool,
-    /// Redact sensitive fields from tool outputs before returning to the client.
+    /// Redact sensitive (`x-sensitive`) fields from tool outputs before
+    /// returning them to the client. Defaults to `true` (secure by default);
+    /// the convenience [`ServeConfig`]/[`AsyncServeConfig`] expose this as a
+    /// three-state `Option<bool>` where `None` keeps this default. [M-2]
     pub redact_output: bool,
     /// If true, unauthenticated requests receive 401.
     pub require_auth: bool,
@@ -239,6 +242,10 @@ const VALID_LOG_LEVELS: &[&str] = &["CRITICAL", "DEBUG", "ERROR", "INFO", "WARNI
 /// so that `ExecutionRouter` can dispatch MCP tool calls through it.
 struct ApcoreExecutorAdapter {
     inner: Arc<Executor>,
+    /// Optional resolved pipeline strategy override. When set, trace-path
+    /// calls (`call_with_trace`) run under this strategy instead of the
+    /// executor default. [L-3]
+    strategy: Option<Arc<apcore::ExecutionStrategy>>,
 }
 
 #[async_trait::async_trait]
@@ -269,11 +276,13 @@ impl crate::server::router::Executor for ApcoreExecutorAdapter {
     ) -> Option<Result<(Value, Value), ExecutorError>> {
         // Delegates to apcore::Executor::call_with_trace. As of apcore 0.22.0
         // the trace variant accepts `version_hint` (4th arg) and a `strategy`
-        // override (5th arg); we forward the resolved version_hint and leave
-        // strategy at the executor default (`None`).
+        // override (5th arg). We forward the resolved version_hint and, when a
+        // pipeline strategy preset was configured on the builder, the resolved
+        // strategy override so trace-path calls honour it. [L-3]
+        let strategy_ref = self.strategy.as_deref();
         let result = self
             .inner
-            .call_with_trace(module_id, inputs.clone(), None, version_hint, None)
+            .call_with_trace(module_id, inputs.clone(), None, version_hint, strategy_ref)
             .await;
         Some(match result {
             Ok((out, trace)) => {
@@ -326,11 +335,18 @@ pub struct APCoreMCP {
     /// `Arc<dyn Fn>` or taking `&mut self`).
     #[allow(dead_code)]
     output_formatter: Option<OutputFormatter>,
-    /// Reserved — accepted by builder but not yet passed to the executor
-    /// pipeline (requires `resolve_executor` to support post-construction
-    /// injection).
-    #[allow(dead_code)]
+    /// Phase B approval handler. When present, `build_server_components`
+    /// instantiates an [`ApprovalBridge`](crate::server::approval_bridge::ApprovalBridge)
+    /// and advertises the `__apcore_approval_check` meta-tool. [H-1]
     approval_handler: Option<Arc<dyn ApprovalHandler>>,
+    /// Retained Phase B approval store (when configured via
+    /// [`approval_store`](APCoreMCPBuilder::approval_store)). Kept so the
+    /// serve entry points can start its TTL sweep
+    /// ([`ApprovalStore::start_sweep`]). [H-1]
+    approval_store: Option<Arc<dyn crate::approval_store::ApprovalStore>>,
+    /// Pre-resolved pipeline execution strategy (from builder/Config Bus).
+    /// Threaded into the executor adapter so trace-path calls honour it. [L-3]
+    resolved_strategy: Option<Arc<apcore::ExecutionStrategy>>,
 }
 
 /// Project a tool list down to the entries shown in the Explorer UI,
@@ -491,19 +507,34 @@ impl APCoreMCP {
         let mut tools = tools;
         MCPServerFactory::append_meta_tools(&mut tools);
 
+        // [H-1] Phase B approvals: when an approval handler is configured,
+        // instantiate the ApprovalBridge and advertise the
+        // `__apcore_approval_check` meta-tool so MCP clients can poll the
+        // status of pending approval requests.
+        let approval_bridge = self.approval_handler.as_ref().map(|handler| {
+            MCPServerFactory::append_approval_meta_tools(&mut tools);
+            Arc::new(crate::server::approval_bridge::ApprovalBridge::new(
+                Arc::clone(handler),
+            ))
+        });
+
         // Create execution router backed by the real apcore Executor, and
         // wire in the async bridge.
         let adapter = ApcoreExecutorAdapter {
             inner: Arc::clone(&self.executor),
+            strategy: self.resolved_strategy.clone(),
         };
-        let router = Arc::new(
+        let mut router_builder =
             ExecutionRouter::new(Box::new(adapter), self.config.validate_inputs, None)
                 .with_redact_output(self.config.redact_output)
                 .with_output_format(self.config.output_format)
                 .with_trace(self.config.trace)
                 .with_output_schemas(output_schema_map)
-                .with_async_bridge(Arc::clone(&bridge)),
-        );
+                .with_async_bridge(Arc::clone(&bridge));
+        if let Some(ref approval_bridge) = approval_bridge {
+            router_builder = router_builder.with_approval_bridge(Arc::clone(approval_bridge));
+        }
+        let router = Arc::new(router_builder);
 
         // Register handlers
         factory.register_handlers(&mut server, tools.clone(), Arc::clone(&router));
@@ -697,6 +728,12 @@ impl APCoreMCP {
             .map_err(|e| APCoreMCPError::ServerError(e.to_string()))?
             .block_on(async {
                 use crate::server::transport::HttpAuthConfig;
+                // [H-1] Start the approval store TTL sweep, if configured.
+                if let Some(ref store) = self.approval_store {
+                    if store.start_sweep().is_some() {
+                        tracing::info!("Approval store TTL sweep started");
+                    }
+                }
                 match transport.as_str() {
                     "streamable-http" => transport_manager
                         .run_streamable_http_with_auth(
@@ -765,7 +802,7 @@ impl APCoreMCP {
             return Err(APCoreMCPError::InvalidExplorerPrefix);
         }
 
-        let (mut server, router, tools, _init_options, version, async_bridge) =
+        let (server, router, tools, init_options, version, async_bridge) =
             self.build_server_components()?;
 
         tracing::info!(
@@ -776,6 +813,13 @@ impl APCoreMCP {
         );
 
         let _listener = Self::maybe_start_listener(opts.dynamic);
+
+        // [H-1] Start the approval store TTL sweep, if configured.
+        if let Some(ref store) = self.approval_store {
+            if store.start_sweep().is_some() {
+                tracing::info!("Approval store TTL sweep started");
+            }
+        }
 
         // Build the transport manager with optional auto-wired observability
         // exporters.
@@ -803,19 +847,36 @@ impl APCoreMCP {
             })));
         }
         let transport_manager = Arc::new(transport_manager);
-        // Silence unused-variable warning; router/bridge are kept alive via
-        // the ExecutionRouter stored on the server handler.
+        // router/bridge are kept alive via the ServerHandler built below
+        // (the ExecutionRouter is captured by the server's call_tool handler).
         let _ = &router;
-        let _ = &async_bridge;
 
-        // Start the server
-        server
-            .start()
-            .await
-            .map_err(|e| APCoreMCPError::ServerError(e.to_string()))?;
+        // [H-3] Build the MCP handler from the server's registered handlers
+        // and install the async-task cancel bridge, mirroring
+        // `serve_with_options`. The handler is then mounted under `/mcp` so the
+        // returned Router actually serves MCP traffic — not just /health,
+        // /metrics, /usage.
+        let mut server_handler = ServerHandler::from_server(&server, init_options)
+            .ok_or_else(|| APCoreMCPError::ServerError("no tool handlers registered".into()))?;
+        if let Some(ref bridge) = async_bridge {
+            let bridge_weak = Arc::downgrade(bridge);
+            server_handler = server_handler.with_cancel_handler(Arc::new(move |key: &str| {
+                if let Some(b) = bridge_weak.upgrade() {
+                    let key = key.to_string();
+                    tokio::spawn(async move {
+                        let n = b.cancel_session_tasks(&key).await;
+                        if n == 0 {
+                            b.cancel(&key).await;
+                        }
+                    });
+                }
+            }));
+        }
+        let handler: Arc<dyn crate::server::transport::McpHandler> = Arc::new(server_handler);
 
-        // Build health/metrics router from the transport manager
-        let mut app = transport_manager.health_metrics_router();
+        // Build the app router with `/health`, `/metrics`, `/usage`, and the
+        // nested `/mcp` endpoint wired to the MCP handler.
+        let mut app = transport_manager.build_streamable_http_app(Arc::clone(&handler), None);
 
         // Mount explorer if enabled
         if opts.explorer.explorer {
@@ -1131,17 +1192,14 @@ impl APCoreMCPBuilder {
         self
     }
 
-    /// Set the approval handler.
+    /// Set the Phase B approval handler directly.
     ///
-    /// **Note:** Reserved — not yet wired into the executor pipeline. A warning
-    /// is emitted at the call site and again at `build()` time so that callers
-    /// who configure this field are not silently surprised.
+    /// When set, `build()` retains the handler and `build_server_components`
+    /// instantiates an [`ApprovalBridge`](crate::server::approval_bridge::ApprovalBridge),
+    /// advertising the `__apcore_approval_check` meta-tool so MCP clients can
+    /// poll pending approvals. Prefer [`approval_store`](Self::approval_store)
+    /// for the storage-backed handler with an optional notify callback. [H-1]
     pub fn approval_handler(mut self, handler: Arc<dyn ApprovalHandler>) -> Self {
-        tracing::warn!(
-            "approval_handler: not yet wired into the execution pipeline — \
-            this setting has no effect in the current release. \
-            Approval handlers must be configured at the executor level."
-        );
         self.approval_handler = Some(handler);
         self
     }
@@ -1363,22 +1421,45 @@ impl APCoreMCPBuilder {
 
         let (standalone_registry, mut executor) = match backend {
             BackendSource::ExtensionsDir(path) => {
-                return Err(APCoreMCPError::BackendResolution(format!(
-                    "ExtensionsDir resolution not yet implemented for path: {}",
+                // [L-1] Runtime directory discovery has a structural limitation
+                // in Rust: modules are compiled in at build time (unlike
+                // Python/TS where `Registry.discover(dir)` imports module files
+                // at runtime). apcore's `Registry::discover` invokes the
+                // discoverer with empty roots and `register_discovered` is
+                // private, so a directory path cannot be threaded through the
+                // public API to register executable modules. We therefore build
+                // an empty Registry + Executor and warn, rather than failing
+                // outright — callers that genuinely need discovered modules
+                // should construct a `Registry`/`Executor` themselves (wiring a
+                // `DefaultDiscoverer` with their own module factory) and pass it
+                // via [`BackendSource::Registry`] or [`BackendSource::Executor`].
+                tracing::warn!(
+                    "ExtensionsDir backend ('{}'): Rust modules are compiled in at \
+                     build time; runtime directory discovery is not supported via the \
+                     apcore public API. Building an empty registry. Pass a pre-built \
+                     Registry or Executor for non-empty backends.",
                     path.display()
-                )));
-            }
-            BackendSource::Registry(_reg) => {
-                // Registry cannot be cloned (contains Box<dyn Module>, callbacks),
-                // so we cannot create an Executor from it.  Users must create an
-                // Executor themselves and pass it via BackendSource::Executor.
-                return Err(APCoreMCPError::BackendResolution(
-                    "Registry backend is not supported: Registry cannot be shared with \
-                     Executor because it is not Clone. Create an Executor from your \
-                     Registry first: `let exec = Arc::new(Executor::new(registry, config)); \
-                     builder.backend(exec)`"
-                        .to_string(),
+                );
+                let registry = Arc::new(Registry::new());
+                let executor = Arc::new(Executor::new(
+                    Arc::clone(&registry),
+                    apcore::config::Config::default(),
                 ));
+                (Some(registry), executor)
+            }
+            BackendSource::Registry(reg) => {
+                // [L-1] `Executor::new` accepts `impl Into<Arc<Registry>>`, and
+                // `Arc<Registry>` satisfies that bound, so a pre-built shared
+                // registry can be wrapped into an Executor directly. The
+                // registry is shared (not cloned), so tool discovery and
+                // execution observe the same module set. (The previous
+                // "Registry is not Clone" limitation no longer applies — sharing
+                // via `Arc` sidesteps it.)
+                let executor = Arc::new(Executor::new(
+                    Arc::clone(&reg),
+                    apcore::config::Config::default(),
+                ));
+                (Some(reg), executor)
             }
             BackendSource::Executor(exec) => (None, exec),
         };
@@ -1458,6 +1539,9 @@ impl APCoreMCPBuilder {
         };
 
         // Build approval handler: approval_store takes precedence over approval_handler.
+        // The store (when supplied) is retained so the serve entry points can
+        // start its TTL sweep. [H-1]
+        let retained_store = self.approval_store.clone();
         let approval_handler = if let Some(store) = self.approval_store {
             use crate::adapters::approval::StorageBackedApprovalHandler;
             let mut handler = StorageBackedApprovalHandler::new(store);
@@ -1466,14 +1550,26 @@ impl APCoreMCPBuilder {
             }
             Some(Arc::new(handler) as Arc<dyn ApprovalHandler>)
         } else {
-            if self.approval_handler.is_some() {
-                tracing::warn!(
-                    "APCoreMCP built with approval_handler configured but it is not yet \
-                    wired into the execution pipeline"
-                );
-            }
             self.approval_handler
         };
+
+        // [L-3] Resolve the strategy preset by name (when set) so it can be
+        // threaded into execution. Unknown names surface a warning and are
+        // ignored (the executor keeps its default strategy) rather than
+        // failing the build.
+        let resolved_strategy: Option<Arc<apcore::ExecutionStrategy>> =
+            _resolved_strategy.as_deref().and_then(|name| {
+                match apcore::executor::resolve_strategy_by_name(name) {
+                    Ok(strat) => {
+                        tracing::info!("Pipeline execution strategy resolved: {}", name);
+                        Some(Arc::new(strat))
+                    }
+                    Err(e) => {
+                        tracing::warn!("Ignoring unknown pipeline strategy '{}': {}", name, e);
+                        None
+                    }
+                }
+            });
 
         Ok(APCoreMCP {
             config: self.config,
@@ -1485,6 +1581,8 @@ impl APCoreMCPBuilder {
             auto_usage,
             output_formatter: self.output_formatter,
             approval_handler,
+            approval_store: retained_store,
+            resolved_strategy,
         })
     }
 }
@@ -1525,12 +1623,38 @@ pub struct ServeConfig {
     pub require_auth: Option<bool>,
     /// HTTP paths that bypass authentication.
     pub exempt_paths: Option<Vec<String>>,
-    /// Whether to redact sensitive fields from output.
+    /// Whether to redact sensitive (`x-sensitive`) fields from tool output.
+    ///
+    /// Three-state semantics — `None` is **not** "redaction off": [M-2]
+    /// - `None` (default): defer to the builder default, which is `true`
+    ///   (redaction **enabled**). The convenience function only calls
+    ///   `builder.redact_output(..)` when this is `Some`, so leaving it `None`
+    ///   keeps the secure-by-default behaviour.
+    /// - `Some(true)`: explicitly enable redaction.
+    /// - `Some(false)`: explicitly **disable** redaction (sensitive fields are
+    ///   returned to the client verbatim).
     pub redact_output: Option<bool>,
     /// Built-in output format.
     pub output_format: Option<crate::server::router::OutputFormat>,
     /// Observability configuration.
     pub observability: Option<serde_json::Value>,
+    // ---- [M-1] Config-surface alignment with the builder -------------------
+    /// Enable pipeline trace mode (responses include strategy/duration/steps).
+    pub trace: Option<bool>,
+    /// Optional custom output formatter closure (shareable variant).
+    pub output_formatter: Option<crate::server::router::SharedOutputFormatter>,
+    /// Enable the browser-based Tool Explorer UI (HTTP transports).
+    pub explorer: Option<bool>,
+    /// URL prefix for the explorer.
+    pub explorer_prefix: Option<String>,
+    /// Page title shown in the explorer browser tab and heading (branding).
+    pub explorer_title: Option<String>,
+    /// Optional project name shown in the explorer footer (branding).
+    pub explorer_project_name: Option<String>,
+    /// Optional project URL linked in the explorer footer (branding).
+    pub explorer_project_url: Option<String>,
+    /// Allow tool execution from the explorer UI.
+    pub allow_execute: Option<bool>,
 }
 
 impl Default for ServeConfig {
@@ -1552,6 +1676,14 @@ impl Default for ServeConfig {
             redact_output: None,
             output_format: None,
             observability: None,
+            trace: None,
+            output_formatter: None,
+            explorer: None,
+            explorer_prefix: None,
+            explorer_title: None,
+            explorer_project_name: None,
+            explorer_project_url: None,
+            allow_execute: None,
         }
     }
 }
@@ -1582,12 +1714,38 @@ pub struct AsyncServeConfig {
     pub require_auth: Option<bool>,
     /// HTTP paths that bypass authentication.
     pub exempt_paths: Option<Vec<String>>,
-    /// Whether to redact sensitive fields from output.
+    /// Whether to redact sensitive (`x-sensitive`) fields from tool output.
+    ///
+    /// Three-state semantics — `None` is **not** "redaction off": [M-2]
+    /// - `None` (default): defer to the builder default, which is `true`
+    ///   (redaction **enabled**). The convenience function only calls
+    ///   `builder.redact_output(..)` when this is `Some`, so leaving it `None`
+    ///   keeps the secure-by-default behaviour.
+    /// - `Some(true)`: explicitly enable redaction.
+    /// - `Some(false)`: explicitly **disable** redaction (sensitive fields are
+    ///   returned to the client verbatim).
     pub redact_output: Option<bool>,
     /// Built-in output format.
     pub output_format: Option<crate::server::router::OutputFormat>,
     /// Observability configuration.
     pub observability: Option<serde_json::Value>,
+    // ---- [M-1] Config-surface alignment with the builder -------------------
+    /// Enable pipeline trace mode (responses include strategy/duration/steps).
+    pub trace: Option<bool>,
+    /// Optional custom output formatter closure (shareable variant).
+    pub output_formatter: Option<crate::server::router::SharedOutputFormatter>,
+    /// Enable the browser-based Tool Explorer UI.
+    pub explorer: Option<bool>,
+    /// URL prefix for the explorer.
+    pub explorer_prefix: Option<String>,
+    /// Page title shown in the explorer browser tab and heading (branding).
+    pub explorer_title: Option<String>,
+    /// Optional project name shown in the explorer footer (branding).
+    pub explorer_project_name: Option<String>,
+    /// Optional project URL linked in the explorer footer (branding).
+    pub explorer_project_url: Option<String>,
+    /// Allow tool execution from the explorer UI.
+    pub allow_execute: Option<bool>,
 }
 
 impl Default for AsyncServeConfig {
@@ -1606,6 +1764,14 @@ impl Default for AsyncServeConfig {
             redact_output: None,
             output_format: None,
             observability: None,
+            trace: None,
+            output_formatter: None,
+            explorer: None,
+            explorer_prefix: None,
+            explorer_title: None,
+            explorer_project_name: None,
+            explorer_project_url: None,
+            allow_execute: None,
         }
     }
 }
@@ -1715,8 +1881,38 @@ pub fn serve(backend: impl Into<BackendSource>, config: ServeConfig) -> Result<(
         builder = builder.observability(enabled);
     }
 
+    // [M-1] Forward newly-aligned ServeConfig fields to the builder.
+    if let Some(trace) = config.trace {
+        builder = builder.trace(trace);
+    }
+    if let Some(formatter) = config.output_formatter.clone() {
+        builder =
+            builder.output_formatter(crate::server::router::shared_to_output_formatter(formatter));
+    }
+
+    // [M-1] Build ServeOptions so explorer/branding flags configured on the
+    // convenience ServeConfig actually take effect (serve_with_options reads
+    // explorer from ServeOptions, not from the builder config).
+    let opts = ServeOptions {
+        explorer: ExplorerOptions {
+            explorer: config.explorer.unwrap_or(false),
+            explorer_prefix: config
+                .explorer_prefix
+                .clone()
+                .unwrap_or_else(|| "/explorer".to_string()),
+            explorer_title: config
+                .explorer_title
+                .clone()
+                .unwrap_or_else(|| "MCP Tool Explorer".to_string()),
+            explorer_project_name: config.explorer_project_name.clone(),
+            explorer_project_url: config.explorer_project_url.clone(),
+            allow_execute: config.allow_execute.unwrap_or(false),
+        },
+        ..Default::default()
+    };
+
     let mcp = builder.build()?;
-    mcp.serve()
+    mcp.serve_with_options(opts)
 }
 
 /// Convenience: build and serve in one call (async).
@@ -1792,8 +1988,36 @@ pub async fn async_serve(
         builder = builder.observability(enabled);
     }
 
+    // [M-1] Forward newly-aligned AsyncServeConfig fields to the builder.
+    if let Some(trace) = config.trace {
+        builder = builder.trace(trace);
+    }
+    if let Some(formatter) = config.output_formatter.clone() {
+        builder =
+            builder.output_formatter(crate::server::router::shared_to_output_formatter(formatter));
+    }
+
+    // [M-1] Build AsyncServeOptions so explorer/branding flags take effect.
+    let opts = AsyncServeOptions {
+        explorer: ExplorerOptions {
+            explorer: config.explorer.unwrap_or(false),
+            explorer_prefix: config
+                .explorer_prefix
+                .clone()
+                .unwrap_or_else(|| "/explorer".to_string()),
+            explorer_title: config
+                .explorer_title
+                .clone()
+                .unwrap_or_else(|| "MCP Tool Explorer".to_string()),
+            explorer_project_name: config.explorer_project_name.clone(),
+            explorer_project_url: config.explorer_project_url.clone(),
+            allow_execute: config.allow_execute.unwrap_or(false),
+        },
+        ..Default::default()
+    };
+
     let mcp = builder.build()?;
-    mcp.async_serve(AsyncServeOptions::default()).await
+    mcp.async_serve(opts).await
 }
 
 /// Convenience: convert a registry to OpenAI tool definitions without starting a server.
@@ -1908,6 +2132,8 @@ mod tests {
             auto_usage: None,
             output_formatter: None,
             approval_handler: None,
+            approval_store: None,
+            resolved_strategy: None,
         }
     }
 
@@ -1928,6 +2154,8 @@ mod tests {
             auto_usage: None,
             output_formatter: None,
             approval_handler: None,
+            approval_store: None,
+            resolved_strategy: None,
         }
     }
 
@@ -1956,6 +2184,8 @@ mod tests {
             auto_usage: None,
             output_formatter: None,
             approval_handler: None,
+            approval_store: None,
+            resolved_strategy: None,
         }
     }
 
@@ -1980,6 +2210,8 @@ mod tests {
             auto_usage: None,
             output_formatter: None,
             approval_handler: None,
+            approval_store: None,
+            resolved_strategy: None,
         }
     }
 
@@ -2000,6 +2232,8 @@ mod tests {
             auto_usage: None,
             output_formatter: None,
             approval_handler: None,
+            approval_store: None,
+            resolved_strategy: None,
         }
     }
 
@@ -2236,13 +2470,27 @@ mod tests {
     }
 
     #[test]
-    fn builder_with_registry_backend_returns_error() {
-        let reg = Arc::new(Registry::new());
-        let result = APCoreMCP::builder()
+    fn builder_with_registry_backend_succeeds() {
+        // [L-1] A pre-built `Arc<Registry>` is now a supported backend: it is
+        // shared into an Executor via `Executor::new(Arc<Registry>, ..)`.
+        let reg = Arc::new(make_test_registry(vec![("mod.a", "Module A", vec![])]));
+        let mcp = APCoreMCP::builder()
             .backend(BackendSource::Registry(reg))
-            .build();
-        assert!(result.is_err());
-        assert!(matches!(result, Err(APCoreMCPError::BackendResolution(_))));
+            .build()
+            .expect("Registry backend must build");
+        // Tool discovery goes through the shared registry.
+        assert!(mcp.tools().iter().any(|t| t == "mod.a"));
+    }
+
+    #[test]
+    fn builder_with_extensions_dir_builds_empty_backend() {
+        // [L-1] ExtensionsDir cannot load compiled-in Rust modules at runtime;
+        // it builds an empty backend with a warning rather than erroring.
+        let mcp = APCoreMCP::builder()
+            .backend("./nonexistent-extensions")
+            .build()
+            .expect("ExtensionsDir must build an empty backend");
+        assert!(mcp.tools().is_empty());
     }
 
     #[test]
@@ -2255,6 +2503,83 @@ mod tests {
         // Executor backend: stored registry is a placeholder (empty),
         // tool discovery uses executor.registry() via reg().
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn builder_resolves_known_strategy() {
+        // [L-3] A known strategy preset must resolve and be retained on the
+        // built APCoreMCP so the trace path can apply it.
+        let reg = Registry::new();
+        let exec = Arc::new(Executor::new(reg, Config::default()));
+        let mcp = APCoreMCP::builder()
+            .backend(BackendSource::Executor(exec))
+            .strategy("testing")
+            .build()
+            .expect("build should succeed");
+        assert!(
+            mcp.resolved_strategy.is_some(),
+            "known strategy 'testing' must resolve to an ExecutionStrategy"
+        );
+    }
+
+    #[test]
+    fn builder_ignores_unknown_strategy() {
+        // [L-3] An unknown strategy name is logged and ignored rather than
+        // failing the build (executor keeps its default strategy).
+        let reg = Registry::new();
+        let exec = Arc::new(Executor::new(reg, Config::default()));
+        let mcp = APCoreMCP::builder()
+            .backend(BackendSource::Executor(exec))
+            .strategy("does-not-exist")
+            .build()
+            .expect("unknown strategy must not fail the build");
+        assert!(
+            mcp.resolved_strategy.is_none(),
+            "unknown strategy must resolve to None"
+        );
+    }
+
+    #[test]
+    fn builder_with_approval_store_advertises_meta_tool() {
+        // [H-1] When an approval store is configured, the built server's tool
+        // list must include the __apcore_approval_check meta-tool.
+        use crate::approval_store::InMemoryApprovalStore;
+        let reg = Registry::new();
+        let exec = Arc::new(Executor::new(reg, Config::default()));
+        let store = Arc::new(InMemoryApprovalStore::new());
+        let mcp = APCoreMCP::builder()
+            .backend(BackendSource::Executor(exec))
+            .approval_store(store)
+            .build()
+            .expect("build should succeed");
+        assert!(mcp.approval_handler.is_some(), "handler must be built");
+        assert!(mcp.approval_store.is_some(), "store must be retained");
+        let (_server, _router, tools, _init, _ver, _bridge) =
+            mcp.build_server_components().expect("components");
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(
+            names.contains(&"__apcore_approval_check"),
+            "approval meta-tool must be advertised; got {names:?}"
+        );
+    }
+
+    #[test]
+    fn builder_without_approval_store_omits_meta_tool() {
+        // [H-1] Without an approval handler, the approval meta-tool must NOT
+        // be advertised.
+        let reg = Registry::new();
+        let exec = Arc::new(Executor::new(reg, Config::default()));
+        let mcp = APCoreMCP::builder()
+            .backend(BackendSource::Executor(exec))
+            .build()
+            .expect("build should succeed");
+        let (_server, _router, tools, _init, _ver, _bridge) =
+            mcp.build_server_components().expect("components");
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(
+            !names.contains(&"__apcore_approval_check"),
+            "approval meta-tool must be absent without a handler"
+        );
     }
 
     // -- Middleware support tests (Phase 1.1) ----------------------------------
@@ -2523,6 +2848,8 @@ mod tests {
             auto_usage: None,
             output_formatter: None,
             approval_handler: None,
+            approval_store: None,
+            resolved_strategy: None,
         }
     }
 

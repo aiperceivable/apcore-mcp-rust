@@ -575,6 +575,16 @@ impl MCPServerFactory {
         tools.extend(AsyncTaskBridge::build_meta_tools());
     }
 
+    /// Append the `__apcore_approval_check` meta-tool so it appears in
+    /// `tools/list` responses. Only called when an approval handler is
+    /// configured (Phase B async approvals). Callers must also install the
+    /// [`ApprovalBridge`](crate::server::approval_bridge::ApprovalBridge) on
+    /// the router via
+    /// [`ExecutionRouter::with_approval_bridge`](crate::server::router::ExecutionRouter::with_approval_bridge).
+    pub fn append_approval_meta_tools(tools: &mut Vec<Tool>) {
+        tools.extend(crate::server::approval_bridge::ApprovalBridge::build_meta_tools());
+    }
+
     // ---- Task: register_resources ----
 
     /// Register `list_resources` and `read_resource` handlers for modules
@@ -1804,6 +1814,19 @@ mod tests {
         // apcore 0.21 PROTOCOL_SPEC §5.6: predict state changes without
         // executing.
         assert!(names.contains(&"__apcore_module_preview"));
+    }
+
+    #[test]
+    fn append_approval_meta_tools_adds_approval_check() {
+        // [H-1] Approval meta-tool is appended on top of the task meta-tools
+        // only when an approval handler is configured.
+        let mut tools = Vec::new();
+        MCPServerFactory::append_meta_tools(&mut tools);
+        let before = tools.len();
+        MCPServerFactory::append_approval_meta_tools(&mut tools);
+        assert_eq!(tools.len(), before + 1);
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"__apcore_approval_check"));
     }
 
     /// Regression test for [A-D-009].

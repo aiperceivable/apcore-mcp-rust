@@ -61,6 +61,18 @@ pub trait ApprovalStore: Send + Sync + 'static {
         approved: bool,
         reason: Option<String>,
     ) -> StoreResult<bool>;
+
+    /// Start a background TTL sweep for this store, returning the spawned
+    /// task handle (or `None` if the store needs no sweeping).
+    ///
+    /// Called once from an async context when the MCP server starts. The
+    /// default implementation is a no-op (returns `None`), which suits
+    /// external stores (Redis, DB) that manage their own expiry. The
+    /// in-process [`InMemoryApprovalStore`] overrides this to evict stale
+    /// pending/resolved records.
+    fn start_sweep(&self) -> Option<tokio::task::JoinHandle<()>> {
+        None
+    }
 }
 
 // ── InMemoryApprovalStore ────────────────────────────────────────────────────
@@ -103,7 +115,7 @@ impl InMemoryApprovalStore {
     }
 
     /// Start a background sweep task. Call once from async context.
-    pub fn start_sweep(&self) -> tokio::task::JoinHandle<()> {
+    pub fn start_sweep_task(&self) -> tokio::task::JoinHandle<()> {
         let records = Arc::clone(&self.records);
         let pending_ttl = self.pending_ttl;
         let resolved_ttl = self.resolved_ttl;
@@ -222,6 +234,10 @@ impl ApprovalStore for InMemoryApprovalStore {
         });
 
         Ok(true)
+    }
+
+    fn start_sweep(&self) -> Option<tokio::task::JoinHandle<()>> {
+        Some(self.start_sweep_task())
     }
 }
 

@@ -81,7 +81,7 @@ impl TransportKind {
 /// Configuration for constructing an [`MCPServer`].
 ///
 /// Defaults match the Python `MCPServer.__init__` defaults.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MCPServerConfig {
     /// Transport protocol.
     pub transport: TransportKind,
@@ -103,10 +103,58 @@ pub struct MCPServerConfig {
     pub require_auth: bool,
     /// Paths exempt from authentication.
     pub exempt_paths: Option<HashSet<String>>,
+    // ---- [M-1] Config-surface alignment with the builder -------------------
+    /// Enable pipeline trace mode (responses include strategy/duration/steps).
+    pub trace: bool,
+    /// Pipeline execution strategy preset (e.g. "standard", "internal").
+    pub strategy: Option<String>,
+    /// Enable the browser-based Tool Explorer UI (HTTP transports).
+    pub explorer: bool,
+    /// URL prefix for the explorer.
+    pub explorer_prefix: String,
+    /// Page title shown in the explorer browser tab and heading.
+    pub explorer_title: String,
+    /// Optional project name shown in the explorer footer (branding).
+    pub explorer_project_name: Option<String>,
+    /// Optional project URL linked in the explorer footer (branding).
+    pub explorer_project_url: Option<String>,
+    /// Allow tool execution from the explorer UI.
+    pub allow_execute: bool,
+    /// Optional custom output formatter closure (shareable/cloneable variant).
+    pub output_formatter: Option<crate::server::router::SharedOutputFormatter>,
     // NOTE: authenticator and metrics_collector are trait-object fields.
     // They will be added when their trait definitions are available.
     // pub authenticator: Option<Arc<dyn Authenticator>>,
     // pub metrics_collector: Option<Arc<dyn MetricsExporter>>,
+}
+
+impl fmt::Debug for MCPServerConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MCPServerConfig")
+            .field("transport", &self.transport)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("name", &self.name)
+            .field("version", &self.version)
+            .field("validate_inputs", &self.validate_inputs)
+            .field("tags", &self.tags)
+            .field("prefix", &self.prefix)
+            .field("require_auth", &self.require_auth)
+            .field("exempt_paths", &self.exempt_paths)
+            .field("trace", &self.trace)
+            .field("strategy", &self.strategy)
+            .field("explorer", &self.explorer)
+            .field("explorer_prefix", &self.explorer_prefix)
+            .field("explorer_title", &self.explorer_title)
+            .field("explorer_project_name", &self.explorer_project_name)
+            .field("explorer_project_url", &self.explorer_project_url)
+            .field("allow_execute", &self.allow_execute)
+            .field(
+                "output_formatter",
+                &self.output_formatter.as_ref().map(|_| "<closure>"),
+            )
+            .finish()
+    }
 }
 
 impl Default for MCPServerConfig {
@@ -122,6 +170,15 @@ impl Default for MCPServerConfig {
             prefix: None,
             require_auth: true,
             exempt_paths: None,
+            trace: false,
+            strategy: None,
+            explorer: false,
+            explorer_prefix: "/explorer".to_string(),
+            explorer_title: "MCP Tool Explorer".to_string(),
+            explorer_project_name: None,
+            explorer_project_url: None,
+            allow_execute: false,
+            output_formatter: None,
         }
     }
 }
@@ -177,15 +234,26 @@ pub type ReadResourceHandler =
 
 /// Input to [`MCPServer`]: either a registry or an executor.
 ///
-/// The exact inner types are left as opaque trait objects so that the server
-/// module does not depend on concrete `apcore` types directly.  Placeholder
-/// types (`()`) are used until the `apcore` crate exposes the real traits.
-#[derive(Debug, Clone)]
+/// Holds the concrete apcore types. `apcore::Executor`, `apcore::Registry`,
+/// and `apcore::Module` are all `pub` in the `apcore` crate (and used
+/// directly by the parent `apcore_mcp` module), so the server can depend on
+/// them without an `Any` indirection.
+#[derive(Clone)]
 pub enum RegistryOrExecutor {
-    /// An apcore Registry (owns both registry data and an executor).
-    Registry(Arc<dyn std::any::Any + Send + Sync>),
-    /// A standalone Executor.
-    Executor(Arc<dyn std::any::Any + Send + Sync>),
+    /// A standalone apcore [`Registry`](apcore::registry::registry::Registry).
+    Registry(Arc<apcore::registry::registry::Registry>),
+    /// A standalone apcore [`Executor`](apcore::executor::Executor), which
+    /// owns its own registry.
+    Executor(Arc<apcore::executor::Executor>),
+}
+
+impl fmt::Debug for RegistryOrExecutor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Registry(_) => f.write_str("RegistryOrExecutor::Registry(..)"),
+            Self::Executor(_) => f.write_str("RegistryOrExecutor::Executor(..)"),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -196,7 +264,10 @@ pub enum RegistryOrExecutor {
 pub struct MCPServer {
     config: MCPServerConfig,
 
-    /// Optional registry-or-executor input (not yet wired to factory/router).
+    /// Optional registry-or-executor input. Retained so callers that
+    /// construct via [`MCPServer::with_registry_or_executor`] can introspect
+    /// the backend; handler wiring is performed by
+    /// [`MCPServerFactory`](super::factory::MCPServerFactory).
     registry_or_executor: Option<RegistryOrExecutor>,
 
     // --- Handler storage ---
@@ -334,6 +405,15 @@ impl MCPServer {
     ///
     /// This is idempotent: calling `start()` on an already-running server is
     /// a no-op and returns `Ok(())`.
+    ///
+    /// When tool handlers have been registered (via
+    /// [`MCPServerFactory::register_handlers`](super::factory::MCPServerFactory::register_handlers))
+    /// the spawned task drives the configured transport
+    /// ([`TransportManager`](super::transport::TransportManager)) — stdio,
+    /// streamable-HTTP, or SSE — racing the transport future against the
+    /// shutdown channel. When no handlers are registered the task simply
+    /// awaits shutdown (used by lifecycle tests that exercise start/stop
+    /// without a real transport).
     pub async fn start(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         // Idempotent: already started.
         if self.join_handle.is_some() {
@@ -345,18 +425,61 @@ impl MCPServer {
 
         let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
 
+        // Build a transport handler from the registered tool handlers, if any.
+        let init_options = InitializationOptions {
+            server_name: self.config.name.clone(),
+            server_version: self
+                .config
+                .version
+                .clone()
+                .unwrap_or_else(|| crate::VERSION.to_string()),
+            capabilities: crate::server::types::ServerCapabilities {
+                tools: if self.has_tool_handlers() {
+                    Some(crate::server::types::ToolsCapability { list_changed: true })
+                } else {
+                    None
+                },
+                resources: if self.has_resource_handlers() {
+                    Some(crate::server::types::ResourcesCapability { list_changed: true })
+                } else {
+                    None
+                },
+            },
+        };
+        let handler: Option<Arc<dyn crate::server::transport::McpHandler>> =
+            ServerHandler::from_server(self, init_options)
+                .map(|h| Arc::new(h) as Arc<dyn crate::server::transport::McpHandler>);
+
+        let transport = self.config.transport;
+        let host = self.config.host.clone();
+        let port = self.config.port;
+
         let handle: JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>> =
             tokio::spawn(async move {
                 // Signal that the task has started.
                 let _ = started_tx.send(());
 
-                // Wait for shutdown signal.
-                // In the future this will run the actual transport loop via
-                // `tokio::select!` racing the transport future against the
-                // shutdown channel.  For now the task simply awaits shutdown.
-                let _ = shutdown_rx.changed().await;
-
-                Ok(())
+                match handler {
+                    Some(handler) => {
+                        use crate::server::transport::TransportManager;
+                        let tm = Arc::new(TransportManager::new(None));
+                        // Race the transport future against the shutdown signal
+                        // so `stop()` cleanly tears the server down.
+                        tokio::select! {
+                            res = Self::run_transport(&tm, handler, transport, &host, port) => {
+                                res.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                                    Box::new(e)
+                                })
+                            }
+                            _ = shutdown_rx.changed() => Ok(()),
+                        }
+                    }
+                    None => {
+                        // No handlers registered — just await shutdown.
+                        let _ = shutdown_rx.changed().await;
+                        Ok(())
+                    }
+                }
             });
 
         self.join_handle = Some(handle);
@@ -368,6 +491,26 @@ impl MCPServer {
             .map_err(|_| "server start channel dropped")?;
 
         Ok(())
+    }
+
+    /// Drive the configured transport with the given MCP handler. Mirrors the
+    /// transport selection in
+    /// [`APCoreMCP::serve_with_options`](crate::apcore_mcp::APCoreMCP::serve_with_options).
+    async fn run_transport(
+        tm: &Arc<crate::server::transport::TransportManager>,
+        handler: Arc<dyn crate::server::transport::McpHandler>,
+        transport: TransportKind,
+        host: &str,
+        port: u16,
+    ) -> Result<(), crate::server::transport::TransportError> {
+        match transport {
+            TransportKind::Stdio => tm.run_stdio(&*handler).await,
+            TransportKind::StreamableHttp => {
+                tm.run_streamable_http(handler, host, port, None).await
+            }
+            #[allow(deprecated)]
+            TransportKind::Sse => tm.run_sse(handler, host, port, None).await,
+        }
     }
 
     /// Wait for the server to shut down.
@@ -792,6 +935,7 @@ mod tests {
             tags: Some(vec!["tag1".to_string()]),
             prefix: Some("my_prefix".to_string()),
             exempt_paths: Some(HashSet::from(["/_health".to_string()])),
+            ..Default::default()
         };
         assert_eq!(config.transport, TransportKind::StreamableHttp);
         assert_eq!(config.host, "0.0.0.0");
@@ -860,22 +1004,25 @@ mod tests {
 
     #[test]
     fn registry_or_executor_registry_variant() {
-        let val: Arc<dyn std::any::Any + Send + Sync> = Arc::new(42u32);
-        let roe = RegistryOrExecutor::Registry(val);
+        let reg = Arc::new(apcore::registry::registry::Registry::new());
+        let roe = RegistryOrExecutor::Registry(reg);
         assert!(matches!(roe, RegistryOrExecutor::Registry(_)));
     }
 
     #[test]
     fn registry_or_executor_executor_variant() {
-        let val: Arc<dyn std::any::Any + Send + Sync> = Arc::new("executor");
-        let roe = RegistryOrExecutor::Executor(val);
+        let exec = Arc::new(apcore::executor::Executor::new(
+            apcore::registry::registry::Registry::new(),
+            apcore::config::Config::default(),
+        ));
+        let roe = RegistryOrExecutor::Executor(exec);
         assert!(matches!(roe, RegistryOrExecutor::Executor(_)));
     }
 
     #[test]
     fn server_with_registry_or_executor_stores_it() {
-        let val: Arc<dyn std::any::Any + Send + Sync> = Arc::new(42u32);
-        let roe = RegistryOrExecutor::Registry(val);
+        let reg = Arc::new(apcore::registry::registry::Registry::new());
+        let roe = RegistryOrExecutor::Registry(reg);
         let server = MCPServer::with_registry_or_executor(roe, MCPServerConfig::default());
         assert!(server.registry_or_executor().is_some());
         assert!(matches!(
@@ -981,6 +1128,38 @@ mod tests {
         server.stop().await.unwrap();
         assert!(!server.is_running());
         assert!(server.shutdown_tx.is_none());
+    }
+
+    #[tokio::test]
+    async fn start_with_handlers_drives_transport_and_stops() {
+        // [H-2] When tool handlers are registered, start() drives the
+        // configured transport. Use streamable-HTTP on an ephemeral-ish port
+        // so the transport future is actually entered, then stop() must race
+        // the shutdown channel and tear the server down cleanly.
+        // Grab a free port from the OS, then release it so the server can bind.
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let config = MCPServerConfig {
+            transport: TransportKind::StreamableHttp,
+            host: "127.0.0.1".to_string(),
+            port,
+            ..Default::default()
+        };
+        let mut server = MCPServer::new(config);
+        server.list_tools_handler = Some(Arc::new(Vec::new));
+        server.call_tool_handler = Some(Arc::new(|_n, _a, _e| {
+            Box::pin(async { CallToolResult::new(vec![], false) })
+        }));
+        assert!(server.has_tool_handlers());
+
+        server.start().await.unwrap();
+        assert!(server.is_running());
+        // Give the transport a moment to bind.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        server.stop().await.unwrap();
+        assert!(!server.is_running());
     }
 
     // ---- Handler tests ----

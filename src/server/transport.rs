@@ -369,7 +369,8 @@ impl TransportManager {
     ///
     /// Includes `/health`, `/metrics`, and `/mcp` endpoints.
     /// The `/mcp` endpoint handles POST (JSON-RPC request/response),
-    /// GET (SSE streaming placeholder), and DELETE (session termination).
+    /// GET (per-connection SSE server→client stream, see
+    /// [`streamable_http_get_handler`]), and DELETE (session termination).
     /// Extra routes are merged into the router if provided.
     pub fn build_streamable_http_app(
         self: &Arc<Self>,
@@ -617,20 +618,51 @@ async fn streamable_http_post_handler(
     }
 }
 
-/// GET /mcp — SSE-based streaming endpoint (placeholder).
+/// GET /mcp — per-connection SSE streaming endpoint.
+///
+/// [L-2] Opens a long-lived server→client Server-Sent Events stream for the
+/// session (MCP Streamable HTTP transport). The stream first emits the
+/// `endpoint` event carrying the session-scoped POST URL, then holds the
+/// connection open with periodic keep-alive comments until the client
+/// disconnects. Each GET gets its own independent stream — the previous
+/// placeholder emitted one event and closed the connection immediately, which
+/// prevented clients from receiving any server-initiated messages.
 async fn streamable_http_get_handler(
     axum::extract::State(state): axum::extract::State<StreamableHttpState>,
 ) -> axum::response::Response {
-    // Placeholder: return a simple SSE stream that sends the session ID and closes.
-    use axum::response::sse::{Event, Sse};
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use std::time::Duration;
 
     let session_id = state.session_id.clone();
-    let stream = tokio_stream::once(Ok::<_, Infallible>(
-        Event::default()
+
+    // Per-connection channel: the first item is the `endpoint` event; the
+    // stream then stays open. axum's `KeepAlive` injects SSE comment frames so
+    // intermediaries do not close an otherwise-idle connection. When the client
+    // disconnects, axum drops the response future and the spawned task's send
+    // attempts fail, tearing the per-connection task down.
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(16);
+    tokio::spawn(async move {
+        // Advertise the session-scoped POST endpoint (MCP `endpoint` event).
+        let endpoint = Event::default()
             .event("endpoint")
-            .data(format!("/mcp?sessionId={}", session_id)),
-    ));
-    Sse::new(stream).into_response()
+            .data(format!("/mcp?sessionId={session_id}"));
+        if tx.send(Ok(endpoint)).await.is_err() {
+            return;
+        }
+        // Hold the stream open. The KeepAlive layer below handles liveness;
+        // this loop simply keeps the sender alive until the receiver (client)
+        // goes away, at which point `closed()` resolves and the task exits.
+        tx.closed().await;
+    });
+
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+    Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("keep-alive"),
+        )
+        .into_response()
 }
 
 /// DELETE /mcp — session termination.
@@ -1012,6 +1044,59 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["module_count"], 7);
+    }
+
+    #[tokio::test]
+    async fn streamable_http_get_emits_endpoint_event_and_stays_open() {
+        // [L-2] GET /mcp must open a per-connection SSE stream that emits the
+        // `endpoint` event and then stays open (held by KeepAlive) rather than
+        // closing immediately.
+        use axum::body::Body;
+        use axum::http::Request;
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let tm = Arc::new(TransportManager::new(None));
+        let handler: Arc<dyn McpHandler> = Arc::new(EchoHandler);
+        let app = tm.build_streamable_http_app(handler, None);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/mcp")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            ct.starts_with("text/event-stream"),
+            "GET /mcp must be an SSE stream; content-type was {ct}"
+        );
+
+        // Read just the first frame; the stream stays open afterwards, so wrap
+        // the read in a timeout (a closed-immediately stream would instead
+        // yield None / end quickly).
+        let mut body = resp.into_body();
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(2), body.frame())
+            .await
+            .expect("first SSE frame should arrive promptly")
+            .expect("stream must yield a frame")
+            .expect("frame must not be an error");
+        let data = frame.into_data().expect("data frame");
+        let text = String::from_utf8_lossy(&data);
+        assert!(
+            text.contains("event:endpoint") || text.contains("event: endpoint"),
+            "first SSE frame must be the endpoint event; got: {text:?}"
+        );
+        assert!(
+            text.contains("/mcp?sessionId="),
+            "endpoint event must carry the session-scoped URL; got: {text:?}"
+        );
     }
 
     // -----------------------------------------------------------------------

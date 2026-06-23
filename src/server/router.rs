@@ -20,6 +20,7 @@ use apcore::CancelToken;
 
 use crate::auth::middleware::AUTH_IDENTITY;
 use crate::helpers::{ElicitResult, MCP_ELICIT_KEY, MCP_PROGRESS_KEY};
+use crate::server::approval_bridge::ApprovalBridge;
 use crate::server::async_task_bridge::AsyncTaskBridge;
 
 /// A boxed stream of result chunks from a streaming executor.
@@ -202,6 +203,18 @@ pub(crate) fn deep_merge(base: &Value, overlay: &Value, depth: usize) -> Value {
 pub type OutputFormatter =
     Box<dyn Fn(&Value) -> Result<String, Box<dyn std::error::Error>> + Send + Sync>;
 
+/// Cloneable, shareable output-formatter closure for configuration structs
+/// (which derive `Clone`). A `Box`-based [`OutputFormatter`] cannot be cloned,
+/// so config surfaces hold an `Arc` variant and convert to a [`OutputFormatter`]
+/// via [`shared_to_output_formatter`] when forwarding to the builder.
+pub type SharedOutputFormatter =
+    Arc<dyn Fn(&Value) -> Result<String, Box<dyn std::error::Error>> + Send + Sync>;
+
+/// Wrap a [`SharedOutputFormatter`] into a boxed [`OutputFormatter`].
+pub fn shared_to_output_formatter(shared: SharedOutputFormatter) -> OutputFormatter {
+    Box::new(move |value| shared(value))
+}
+
 /// Built-in output formats supported by the router.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -316,6 +329,9 @@ pub struct ExecutionRouter {
     /// Optional bridge for routing async-hinted modules and handling
     /// `__apcore_task_*` meta-tools.
     async_bridge: Option<Arc<AsyncTaskBridge>>,
+    /// Optional bridge for handling the `__apcore_approval_check` meta-tool
+    /// (Phase B async approval polling). Symmetric with `async_bridge`.
+    approval_bridge: Option<Arc<ApprovalBridge>>,
     /// [B-002] Per-server `call_id → CancelToken` map. Populated on
     /// tool-call entry by handle_call(); consulted by cancel(call_id).
     /// Transport layer should forward inbound MCP
@@ -368,6 +384,7 @@ impl ExecutionRouter {
             tool_schemas: HashMap::new(),
             output_schemas: HashMap::new(),
             async_bridge: None,
+            approval_bridge: None,
             cancel_tokens: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
@@ -390,6 +407,7 @@ impl ExecutionRouter {
             tool_schemas: HashMap::new(),
             output_schemas: HashMap::new(),
             async_bridge: None,
+            approval_bridge: None,
             cancel_tokens: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
@@ -415,6 +433,7 @@ impl ExecutionRouter {
             tool_schemas: HashMap::new(),
             output_schemas: HashMap::new(),
             async_bridge: None,
+            approval_bridge: None,
             cancel_tokens: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
@@ -512,6 +531,17 @@ impl ExecutionRouter {
     /// registry mutations and has been dropped. [A-D-031]
     pub fn with_async_bridge(mut self, bridge: Arc<AsyncTaskBridge>) -> Self {
         self.async_bridge = Some(bridge);
+        self
+    }
+
+    /// Attach an [`ApprovalBridge`] so the router can service the reserved
+    /// `__apcore_approval_check` meta-tool (Phase B async approval polling).
+    ///
+    /// Symmetric with [`with_async_bridge`](Self::with_async_bridge): when set,
+    /// `handle_call` short-circuits the approval meta-tool to the bridge before
+    /// any executor dispatch.
+    pub fn with_approval_bridge(mut self, bridge: Arc<ApprovalBridge>) -> Self {
+        self.approval_bridge = Some(bridge);
         self
     }
 
@@ -870,6 +900,29 @@ impl ExecutionRouter {
         };
         let (context_value, _context_data, apcore_ctx) =
             Self::build_context_with_trace(&call_extra, trace_parent.clone(), Some(cancel_token));
+
+        // Short-circuit the `__apcore_approval_check` meta-tool via the
+        // ApprovalBridge, when configured. Symmetric with the AsyncTaskBridge
+        // dispatch below.
+        if let Some(approval_bridge) = &self.approval_bridge {
+            if ApprovalBridge::is_meta_tool(tool_name) {
+                let (value, is_error) =
+                    approval_bridge.handle_meta_tool(tool_name, arguments).await;
+                let result = if is_error {
+                    Err(apcore::errors::ModuleError::new(
+                        apcore::errors::ErrorCode::GeneralInvalidInput,
+                        value
+                            .get("error")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("approval check failed")
+                            .to_string(),
+                    ))
+                } else {
+                    Ok(value)
+                };
+                return Self::meta_tool_response(result, &apcore_ctx);
+            }
+        }
 
         // Short-circuit async-task meta-tools and async-routed modules via
         // the AsyncTaskBridge, when configured.
@@ -1957,6 +2010,7 @@ mod tests {
             tool_schemas: HashMap::new(),
             output_schemas: HashMap::new(),
             async_bridge: None,
+            approval_bridge: None,
             cancel_tokens: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
         let result = router.format_result(&json!({"a": 1, "b": 2}));
@@ -1976,6 +2030,7 @@ mod tests {
             tool_schemas: HashMap::new(),
             output_schemas: HashMap::new(),
             async_bridge: None,
+            approval_bridge: None,
             cancel_tokens: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
         // Non-object values should fall back to JSON
@@ -1997,6 +2052,7 @@ mod tests {
             tool_schemas: HashMap::new(),
             output_schemas: HashMap::new(),
             async_bridge: None,
+            approval_bridge: None,
             cancel_tokens: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
         // Should fall back to JSON when formatter returns an error
@@ -4060,6 +4116,63 @@ mod tests {
         assert!(
             parsed.get("module_id").is_none(),
             "envelope must NOT contain module_id (spec shape); got: {parsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_check_meta_tool_routes_via_approval_bridge() {
+        // [H-1] When an ApprovalBridge is installed, the router must
+        // short-circuit `__apcore_approval_check` to the bridge instead of
+        // dispatching to the executor.
+        use crate::server::approval_bridge::ApprovalBridge;
+        use apcore::approval::{ApprovalHandler, ApprovalRequest, ApprovalResult};
+        use apcore::errors::ModuleError;
+
+        #[derive(Debug)]
+        struct StubHandler;
+        #[async_trait]
+        impl ApprovalHandler for StubHandler {
+            async fn request_approval(
+                &self,
+                _request: &ApprovalRequest,
+            ) -> Result<ApprovalResult, ModuleError> {
+                let mut r = ApprovalResult::default();
+                r.status = "approved".to_string();
+                Ok(r)
+            }
+            async fn check_approval(
+                &self,
+                _approval_id: &str,
+            ) -> Result<ApprovalResult, ModuleError> {
+                let mut r = ApprovalResult::default();
+                r.status = "approved".to_string();
+                Ok(r)
+            }
+        }
+
+        let bridge = Arc::new(ApprovalBridge::new(Arc::new(StubHandler)));
+        let router =
+            ExecutionRouter::new(Box::new(MockExecutor), false, None).with_approval_bridge(bridge);
+        let (content, is_error, _trace_id) = router
+            .handle_call(
+                "__apcore_approval_check",
+                &json!({"approval_id": "abc-123"}),
+                None,
+            )
+            .await;
+        assert!(!is_error);
+        let text = match &content[0].data {
+            Value::String(s) => s.clone(),
+            _ => panic!("expected string content"),
+        };
+        let parsed: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            parsed.get("status").and_then(|v| v.as_str()),
+            Some("approved")
+        );
+        assert_eq!(
+            parsed.get("approval_id").and_then(|v| v.as_str()),
+            Some("abc-123")
         );
     }
 

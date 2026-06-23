@@ -6,6 +6,66 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.17.0] - 2026-06-23
+
+Audit-driven hardening of the serve/embed entry points and the Phase B approval
+chain, plus the apcore 0.25 / apcore-toolkit 0.9.1 dependency uplift.
+
+### Fixed
+
+- **Phase B approvals were end-to-end dead code**: the wrapped
+  `StorageBackedApprovalHandler` was stored on the builder but never read by the
+  serve path, the `__apcore_approval_check` meta-tool was never advertised, and
+  `start_sweep()` was never started. `build_server_components` now instantiates
+  `ApprovalBridge` from the configured handler, advertises the meta-tool, and the
+  TTL sweep runs in both `serve_with_options` and `async_serve`. The stale
+  "not yet wired" warning was removed (no silent-failure path remains).
+- **`MCPServer` could not actually serve**: `RegistryOrExecutor` held an
+  `Arc<dyn Any>` placeholder and `start()` only awaited shutdown. It now holds
+  real `Arc<apcore::Registry>` / `Arc<apcore::Executor>`, registers tool/resource
+  handlers, and drives the configured transport (stdio / streamable-HTTP / SSE)
+  via `TransportManager`. The obsolete "until the apcore crate exposes the real
+  traits" comment was removed.
+- **`async_serve()` returned a Router with no `/mcp` route**: it now builds a
+  `ServerHandler` and returns `build_streamable_http_app(...)` (which nests
+  `/mcp`) instead of `health_metrics_router()`.
+- **`strategy` was computed then dropped**: it is now resolved via
+  `apcore::executor::resolve_strategy_by_name` and applied on the trace execution
+  path (see Known limitations).
+
+### Added
+
+- `MCPServerConfig`, `ServeConfig`, and `AsyncServeConfig` gained `trace`,
+  `strategy`, explorer branding (`explorer` / `explorer_prefix` /
+  `explorer_title` / `explorer_project_name` / `explorer_project_url` /
+  `allow_execute`), and `output_formatter`, aligning the framework-integration
+  surface with the builder. `ServeConfig` / `AsyncServeConfig` also expose
+  `approval_store` / `approval_notify` / `approval_handler`.
+- `BackendSource::Registry` is now fully supported (shared into an `Executor`
+  via `Arc`); `ApprovalStore::start_sweep` is now a trait method.
+- Real per-connection SSE streaming on `GET /mcp` (endpoint event + keep-alive
+  until disconnect), replacing the one-shot placeholder.
+
+### Changed
+
+- Raised apcore floor to `0.25` and apcore-toolkit to `0.9.1` (`Cargo.toml`).
+- Documented the `redact_output: Option<bool>` tri-state (`None` = builder
+  default enabled, `Some(false)` = explicitly disabled).
+
+### Known limitations
+
+- `strategy` overrides apply on the trace execution path; the non-trace `call()`
+  path has no strategy-override parameter and still runs the executor's own
+  strategy.
+- `BackendSource::ExtensionsDir` builds an empty registry with a warning —
+  runtime directory discovery cannot be honored through apcore's public API
+  (`register_discovered` is private). Callers needing discovered modules should
+  build a `Registry` / `Executor` with their own discoverer and pass it via
+  `Registry` / `Executor`.
+
+All 949 tests pass.
+
+
 ## [0.16.1] - 2026-06-18
 
 ### Changed
