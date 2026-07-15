@@ -782,11 +782,11 @@ impl ExecutionRouter {
                     e.errors
                         .iter()
                         .map(|sub| {
-                            format!("{}: {}", sub.field.as_deref().unwrap_or("?"), &sub.message)
+                            format!("{}: {}", sub.field.as_deref().unwrap_or("?"), sub.message)
                         })
                         .collect::<Vec<_>>()
                 } else if let Some(ref field) = e.field {
-                    vec![format!("{field}: {}", &e.message)]
+                    vec![format!("{field}: {}", e.message)]
                 } else {
                     vec![e.message.clone()]
                 }
