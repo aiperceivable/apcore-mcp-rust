@@ -65,6 +65,27 @@ fn approved() -> ApprovalResult {
     result
 }
 
+/// JSON Schema (MCP elicitation `requested_schema`) for a yes/no approval prompt.
+///
+/// A boolean gives form-rendering clients (Cursor, Codex, ...) a concrete control
+/// to display; an empty schema is tolerated by minimal SDK clients but
+/// ignored/rejected by form-rendering clients, so the request returns no response
+/// and the gate fails closed.
+fn approval_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "title": "Approval required",
+        "properties": {
+            "approve": {
+                "type": "boolean",
+                "title": "Approve this action?",
+                "description": "Select yes to allow the operation to proceed."
+            }
+        },
+        "required": ["approve"]
+    })
+}
+
 #[async_trait]
 impl ApprovalHandler for ElicitationApprovalHandler {
     async fn request_approval(
@@ -123,7 +144,9 @@ impl ApprovalHandler for ElicitationApprovalHandler {
         // futures::FutureExt::catch_unwind handles async panics across
         // .await points; std::panic::catch_unwind cannot.
         use futures::FutureExt;
-        let result_outcome = std::panic::AssertUnwindSafe(elicit(message, None))
+        // Send a non-empty schema so form-rendering clients can display an
+        // approve/deny control; an empty schema is silently dropped by them.
+        let result_outcome = std::panic::AssertUnwindSafe(elicit(message, Some(approval_schema())))
             .catch_unwind()
             .await;
         let result = match result_outcome {
@@ -139,7 +162,21 @@ impl ApprovalHandler for ElicitationApprovalHandler {
         };
 
         match result.action {
-            ElicitAction::Accept => Ok(approved()),
+            ElicitAction::Accept => {
+                // Honor an explicit approve=false from the form; clients that
+                // render no field send none, so accept itself means approval.
+                let approve = result
+                    .content
+                    .as_ref()
+                    .and_then(|c| c.get("approve"))
+                    .map(|v| v.as_bool().unwrap_or(true))
+                    .unwrap_or(true);
+                if approve {
+                    Ok(approved())
+                } else {
+                    Ok(rejected("User declined approval"))
+                }
+            }
             ElicitAction::Decline => Ok(rejected("User action: decline")),
             ElicitAction::Cancel => Ok(rejected("User action: cancel")),
             // [D11-020] Python+TS treat any non-"accept" string as rejected.
@@ -329,6 +366,66 @@ mod tests {
         let result = handler.request_approval(&test_request()).await.unwrap();
         assert_eq!(result.status, "approved");
         assert!(result.reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_request_approval_sends_nonempty_schema() {
+        // The approval elicitation must carry a non-empty object schema; an
+        // empty schema breaks form-rendering clients (Cursor / Codex).
+        let captured: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+        let captured_clone = captured.clone();
+        let cb: ElicitCallback = Box::new(move |_msg, schema| {
+            let captured = captured_clone.clone();
+            Box::pin(async move {
+                *captured.lock().unwrap() = schema;
+                Some(ElicitResult {
+                    action: ElicitAction::Accept,
+                    content: None,
+                })
+            })
+        });
+        let handler = ElicitationApprovalHandler::new(Some(cb));
+        handler.request_approval(&test_request()).await.unwrap();
+
+        let schema = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("schema must be sent");
+        assert_eq!(schema["type"], "object");
+        assert!(schema["properties"]["approve"].is_object());
+    }
+
+    #[tokio::test]
+    async fn test_request_approval_accept_but_approve_false() {
+        // action=accept with content.approve=false must reject.
+        let cb: ElicitCallback = Box::new(move |_msg, _schema| {
+            Box::pin(async move {
+                Some(ElicitResult {
+                    action: ElicitAction::Accept,
+                    content: Some(json!({"approve": false})),
+                })
+            })
+        });
+        let handler = ElicitationApprovalHandler::new(Some(cb));
+        let result = handler.request_approval(&test_request()).await.unwrap();
+        assert_eq!(result.status, "rejected");
+    }
+
+    #[tokio::test]
+    async fn test_request_approval_accept_with_approve_true() {
+        // action=accept with content.approve=true must approve.
+        let cb: ElicitCallback = Box::new(move |_msg, _schema| {
+            Box::pin(async move {
+                Some(ElicitResult {
+                    action: ElicitAction::Accept,
+                    content: Some(json!({"approve": true})),
+                })
+            })
+        });
+        let handler = ElicitationApprovalHandler::new(Some(cb));
+        let result = handler.request_approval(&test_request()).await.unwrap();
+        assert_eq!(result.status, "approved");
     }
 
     #[tokio::test]

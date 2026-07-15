@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.2] - 2026-07-14
+
+Patch release. Fixes the MCP elicitation approval flow and bumps the required `apcore` floor to `0.26`.
+
+### Fixed
+
+- **`ElicitationApprovalHandler` now sends a non-empty elicitation `requested_schema`.** The approval elicitation was previously sent with an empty schema; clients that render an approval form (Cursor, Codex, ...) ignore or reject an empty schema, so the request returned no response and the gate failed closed. The handler now sends an object schema with a boolean `approve` field and honors an explicit `approve: false` from the form. Mirrors apcore-mcp (Python) 0.17.2.
+- **Elicitation send failures now log at `warn`** (was `debug`) so a failing elicitation surfaces instead of silently denying.
+
+### Changed
+
+- **Required `apcore` floor raised to `0.26`** to align the ecosystem on the 0.26.0 governance layer.
+
 ## [0.17.1] - 2026-07-07
 update package dependency version for apcore-toolkit (0.10.0) and increment project patch version
 

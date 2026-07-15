@@ -1349,7 +1349,7 @@ impl ExecutionRouter {
                         match session.elicit_form(&message, &schema).await {
                             Ok(result) => Some(result),
                             Err(e) => {
-                                tracing::debug!("Elicitation request failed: {e}");
+                                tracing::warn!("Elicitation request failed: {e}");
                                 None
                             }
                         }
