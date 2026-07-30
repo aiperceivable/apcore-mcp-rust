@@ -65,6 +65,17 @@ pub const META_TOOL_LIST: &str = "__apcore_task_list";
 /// in the world if I called this module?" before executing.
 pub const META_TOOL_PREVIEW: &str = "__apcore_module_preview";
 
+/// Name of the preflight check carrying the ACL verdict. apcore's
+/// `step_to_check_name` maps the `acl_check` pipeline step onto it.
+const ACL_CHECK_NAME: &str = "acl";
+
+/// Preflight checks that are module-level introspection. apcore runs them
+/// whenever module lookup succeeded, regardless of whether an earlier check
+/// failed, and for a CLI-wrapping module their output names the resolved
+/// binary and the argv that would be executed. They are withheld from a
+/// preview the ACL denied.
+const INTROSPECTION_CHECK_NAMES: [&str; 2] = ["module_preflight", "module_preview"];
+
 /// Default `AsyncTaskManager` configuration.
 pub const DEFAULT_MAX_CONCURRENT: usize = 10;
 pub const DEFAULT_MAX_TASKS: usize = 1000;
@@ -768,40 +779,68 @@ impl AsyncTaskBridge {
         // executor.validate is non-throwing on input-shape errors; it
         // returns a structured PreflightResult with valid=false instead.
         let preflight = self.executor.validate(module_id, &inputs, ctx_ref).await?;
+
+        // An ACL denial must short-circuit the envelope. `Executor::validate`
+        // runs the module-level preflight and preview steps "whenever module
+        // lookup succeeded, regardless of whether earlier checks passed", so a
+        // denied caller still got back `predicted_changes` naming the resolved
+        // binary and the full argv. A denial that discloses what was denied is
+        // not a denial, so the disclosing parts are withheld here; the failed
+        // check itself is kept so the caller still learns why.
+        let acl_denied = preflight
+            .checks
+            .iter()
+            .any(|c| c.check == ACL_CHECK_NAME && !c.passed);
+        if acl_denied {
+            tracing::warn!(
+                module_id = %module_id,
+                "module preview denied by ACL; predicted changes withheld"
+            );
+        }
+
         let checks: Vec<Value> = preflight
             .checks
             .iter()
-            .map(|c| {
-                let mut obj = serde_json::Map::new();
-                obj.insert("check".to_string(), Value::String(c.check.clone()));
-                obj.insert("passed".to_string(), Value::Bool(c.passed));
-                if let Some(err) = &c.error {
-                    obj.insert(
-                        "error".to_string(),
-                        serde_json::to_value(err).unwrap_or(Value::Null),
-                    );
-                }
-                if !c.warnings.is_empty() {
-                    obj.insert(
-                        "warnings".to_string(),
-                        Value::Array(c.warnings.iter().cloned().map(Value::String).collect()),
-                    );
-                }
-                Value::Object(obj)
-            })
+            .filter(|c| !acl_denied || !INTROSPECTION_CHECK_NAMES.contains(&c.check.as_str()))
+            .map(preflight_check_to_json)
             .collect();
-        let predicted: Vec<Value> = preflight
-            .predicted_changes
-            .iter()
-            .map(|c| serde_json::to_value(c).unwrap_or(Value::Null))
-            .collect();
+        let predicted: Vec<Value> = if acl_denied {
+            Vec::new()
+        } else {
+            preflight
+                .predicted_changes
+                .iter()
+                .map(|c| serde_json::to_value(c).unwrap_or(Value::Null))
+                .collect()
+        };
         Ok(json!({
-            "valid": preflight.valid,
-            "requires_approval": preflight.requires_approval,
+            "valid": preflight.valid && !acl_denied,
+            "requires_approval": preflight.requires_approval && !acl_denied,
             "predicted_changes": predicted,
             "checks": checks,
         }))
     }
+}
+
+/// Render a single [`apcore::module::PreflightCheckResult`] as the wire
+/// object shared by the Python and TypeScript bridges.
+fn preflight_check_to_json(check: &apcore::module::PreflightCheckResult) -> Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("check".to_string(), Value::String(check.check.clone()));
+    obj.insert("passed".to_string(), Value::Bool(check.passed));
+    if let Some(err) = &check.error {
+        obj.insert(
+            "error".to_string(),
+            serde_json::to_value(err).unwrap_or(Value::Null),
+        );
+    }
+    if !check.warnings.is_empty() {
+        obj.insert(
+            "warnings".to_string(),
+            Value::Array(check.warnings.iter().cloned().map(Value::String).collect()),
+        );
+    }
+    Value::Object(obj)
 }
 
 // ===========================================================================
@@ -1307,6 +1346,140 @@ mod tests {
         assert_eq!(
             changes[0].get("action").and_then(|v| v.as_str()),
             Some("create"),
+        );
+    }
+
+    #[tokio::test]
+    async fn preview_meta_tool_withholds_predicted_changes_when_acl_denies() {
+        use apcore::module::{Change, PreviewResult};
+        use async_trait::async_trait;
+
+        /// Stands in for a CLI-wrapping module: both its preflight warning
+        /// and its predicted change name the resolved binary and the argv.
+        #[derive(Debug)]
+        struct DestructiveModule;
+
+        #[async_trait]
+        impl apcore::module::Module for DestructiveModule {
+            fn input_schema(&self) -> Value {
+                json!({"type": "object"})
+            }
+            fn output_schema(&self) -> Value {
+                json!({"type": "object"})
+            }
+            fn description(&self) -> &str {
+                "destructive demo"
+            }
+            async fn execute(
+                &self,
+                _inputs: Value,
+                _ctx: &Context<Value>,
+            ) -> Result<Value, apcore::errors::ModuleError> {
+                Ok(json!({}))
+            }
+            fn preflight(&self, _inputs: &Value, _ctx: Option<&Context<Value>>) -> Vec<String> {
+                vec!["This will run: /bin/cp src dst".to_string()]
+            }
+            fn preview(
+                &self,
+                _inputs: &Value,
+                _ctx: Option<&Context<Value>>,
+            ) -> Option<PreviewResult> {
+                let mut change = Change::default();
+                change.action = "overwrite".to_string();
+                change.target = "/bin/cp src dst".to_string();
+                change.summary = "This will run: /bin/cp src dst".to_string();
+                let mut result = PreviewResult::default();
+                result.changes = vec![change];
+                Some(result)
+            }
+        }
+
+        let registry = Arc::new(Registry::default());
+        let descriptor = apcore::registry::ModuleDescriptor {
+            module_id: "demo.destructive".to_string(),
+            name: None,
+            description: "destructive demo".to_string(),
+            documentation: None,
+            input_schema: json!({"type": "object"}),
+            output_schema: json!({"type": "object"}),
+            version: "1.0.0".to_string(),
+            tags: vec![],
+            annotations: Some(apcore::module::ModuleAnnotations {
+                requires_approval: true,
+                ..Default::default()
+            }),
+            examples: vec![],
+            metadata: HashMap::new(),
+            display: None,
+            sunset_date: None,
+            dependencies: vec![],
+            enabled: true,
+        };
+        registry
+            .register("demo.destructive", Box::new(DestructiveModule), descriptor)
+            .expect("register destructive module");
+
+        let acl = apcore::ACL::new(
+            vec![apcore::ACLRule {
+                callers: vec!["*".to_string()],
+                targets: vec!["demo.destructive".to_string()],
+                effect: "deny".to_string(),
+                description: Some("deny the destructive demo".to_string()),
+                conditions: None,
+            }],
+            "allow",
+            None,
+        );
+        let mut executor =
+            apcore::executor::Executor::new(registry, Arc::new(apcore::config::Config::default()));
+        executor.set_acl(acl);
+
+        let bridge = AsyncTaskBridge::new(Arc::new(executor));
+        let result = bridge
+            .handle_meta_tool(
+                META_TOOL_PREVIEW,
+                &json!({"module_id": "demo.destructive", "arguments": {}}),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("meta-tool must be routed")
+            .expect("preview should return Ok");
+
+        // The denial itself is still reported, so the caller learns why.
+        let checks = result
+            .get("checks")
+            .and_then(|v| v.as_array())
+            .expect("checks must be an array");
+        assert!(
+            checks
+                .iter()
+                .any(|c| c.get("check").and_then(Value::as_str) == Some("acl")
+                    && c.get("passed").and_then(Value::as_bool) == Some(false)),
+            "the failed acl check must survive: {checks:?}"
+        );
+
+        // Nothing that names the resolved binary or the argv may survive it.
+        assert_eq!(result.get("valid").and_then(Value::as_bool), Some(false));
+        assert_eq!(
+            result.get("requires_approval").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            result
+                .get("predicted_changes")
+                .and_then(|v| v.as_array())
+                .map(Vec::len),
+            Some(0),
+            "predicted_changes must be withheld from a denied caller"
+        );
+        let rendered = serde_json::to_string(&result).expect("envelope serialises");
+        assert!(
+            !rendered.contains("/bin/cp"),
+            "the resolved binary leaked into a denied preview: {rendered}"
         );
     }
 
