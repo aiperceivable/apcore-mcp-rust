@@ -38,6 +38,7 @@ fn sample_tools() -> Vec<ToolInfo> {
                     "b": { "type": "number" }
                 }
             }),
+            annotations: Some(json!({"destructiveHint": true})),
         },
         ToolInfo {
             name: "text.upper".to_string(),
@@ -46,6 +47,7 @@ fn sample_tools() -> Vec<ToolInfo> {
                 "type": "object",
                 "properties": { "s": { "type": "string" } }
             }),
+            annotations: None,
         },
     ]
 }
@@ -112,6 +114,35 @@ async fn explorer_mount_lists_tools_as_json() {
         .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
         .collect();
     assert_eq!(names, vec!["math.add", "text.upper"]);
+}
+
+#[tokio::test]
+async fn explorer_tool_detail_serves_annotations() {
+    // The explorer UI has a render branch for a tool's annotations — the
+    // destructive-tool warning among them — on the one surface that also
+    // offers direct execution. It can only fire if the detail endpoint
+    // actually carries them.
+    let config = ExplorerConfig::new(sample_tools())
+        .allow_execute(true)
+        .handle_call(echo_handler());
+    let app = create_explorer_mount(config);
+
+    let req = Request::get("/explorer/tools/math.add")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let detail: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        detail
+            .get("annotations")
+            .and_then(|a| a.get("destructiveHint"))
+            .and_then(Value::as_bool),
+        Some(true),
+        "tool detail must carry annotations; got {detail}"
+    );
 }
 
 #[tokio::test]

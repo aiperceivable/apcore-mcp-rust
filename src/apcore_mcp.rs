@@ -354,6 +354,12 @@ pub struct APCoreMCP {
 /// meta-tools remain in the MCP `tools/list` response — only the human-
 /// facing UI hides them, since their multi-step submit/status/cancel/list
 /// flow does not fit a one-form-per-tool layout.
+///
+/// Annotations are carried across so the UI can render its hint badges — the
+/// destructive-tool warning in particular, on the surface that also offers
+/// direct execution. The Python bridge hands the MCP tool objects to the
+/// shared UI library verbatim and gets this for free; Rust has to project
+/// them onto [`ToolInfo`] explicitly.
 fn filter_explorer_tools(tools: &[Tool]) -> Vec<ToolInfo> {
     tools
         .iter()
@@ -365,6 +371,10 @@ fn filter_explorer_tools(tools: &[Tool]) -> Vec<ToolInfo> {
             name: t.name.clone(),
             description: t.description.clone(),
             input_schema: t.input_schema.clone(),
+            annotations: t
+                .annotations
+                .as_ref()
+                .and_then(|a| serde_json::to_value(a).ok()),
         })
         .collect()
 }
@@ -3212,6 +3222,31 @@ mod tests {
         assert_eq!(infos[0].name, "a.b");
         assert_eq!(infos[0].description, "desc-a.b");
         assert_eq!(infos[1].name, "c.d");
+    }
+
+    #[test]
+    fn filter_explorer_tools_carries_annotations() {
+        // Without this the explorer's annotation render branch can never
+        // fire, so no destructive-tool warning is ever shown for any tool.
+        let mut tool = make_tool("cli.cp");
+        tool.annotations = Some(crate::server::types::ToolAnnotations {
+            title: None,
+            read_only_hint: Some(false),
+            destructive_hint: Some(true),
+            idempotent_hint: None,
+            open_world_hint: None,
+        });
+        let infos = filter_explorer_tools(&[tool]);
+        assert_eq!(
+            infos[0]
+                .annotations
+                .as_ref()
+                .and_then(|a| a.get("destructiveHint"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "annotations must reach the explorer: {:?}",
+            infos[0].annotations
+        );
     }
 
     #[test]

@@ -30,6 +30,13 @@ pub struct ToolInfo {
     /// The JSON Schema describing the tool's input parameters.
     #[serde(rename = "inputSchema")]
     pub input_schema: serde_json::Value,
+    /// MCP tool annotations (`destructiveHint`, `readOnlyHint`, ...).
+    ///
+    /// The explorer UI renders these as hint badges — including the
+    /// destructive-tool warning shown on the one surface that also offers
+    /// direct execution. Left `None`, that warning can never appear.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<serde_json::Value>,
 }
 
 impl mcp_embedded_ui::Tool for ToolInfo {
@@ -43,6 +50,10 @@ impl mcp_embedded_ui::Tool for ToolInfo {
 
     fn input_schema(&self) -> serde_json::Value {
         self.input_schema.clone()
+    }
+
+    fn annotations(&self) -> Option<serde_json::Value> {
+        self.annotations.clone()
     }
 }
 
@@ -356,6 +367,7 @@ mod tests {
                     "b": { "type": "number" }
                 }
             }),
+            annotations: None,
         };
 
         let serialized = serde_json::to_value(&tool).unwrap();
@@ -371,6 +383,7 @@ mod tests {
             name: "search".to_string(),
             description: "Search documents".to_string(),
             input_schema: json!({"type": "object"}),
+            annotations: None,
         };
 
         let json_str = serde_json::to_string(&tool).unwrap();
@@ -394,11 +407,13 @@ mod tests {
                 name: "tool_one".to_string(),
                 description: "First tool".to_string(),
                 input_schema: json!({"type": "object"}),
+                annotations: Some(json!({"destructiveHint": true})),
             },
             ToolInfo {
                 name: "tool_two".to_string(),
                 description: "Second tool".to_string(),
                 input_schema: json!({"type": "object"}),
+                annotations: None,
             },
         ]
     }
