@@ -466,17 +466,23 @@ impl TransportManager {
     /// Build an axum [`Router`] for the SSE transport.
     ///
     /// Includes `/health`, `/metrics`, `/sse` (GET), and `/messages/` (POST).
+    ///
+    /// Each `GET /sse` opens an independent session: it is assigned a fresh
+    /// session id, gets its own inbound queue, and receives only the responses
+    /// to messages posted to `/messages/?sessionId=<its own id>`. Sessions are
+    /// removed from the registry when the client disconnects. Mirrors the
+    /// TypeScript SDK's `runSse`, which keys one `SSEServerTransport` per
+    /// session id, and the Python SDK's `SseServerTransport.connect_sse`.
     #[deprecated(note = "SSE transport is deprecated. Use streamable-HTTP instead.")]
     pub fn build_sse_app(
         self: &Arc<Self>,
         handler: Arc<dyn McpHandler>,
         extra_routes: Option<Router>,
     ) -> Router {
-        let (tx, rx) = tokio::sync::mpsc::channel::<Value>(256);
         let sse_state = SseState {
             handler,
-            sender: tx,
-            receiver: Arc::new(tokio::sync::Mutex::new(rx)),
+            sessions: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            manager: Arc::clone(self),
         };
 
         let sse_router = Router::new()
@@ -676,67 +682,128 @@ async fn streamable_http_delete_handler(
 // SSE transport state & handlers (deprecated)
 // ---------------------------------------------------------------------------
 
+/// Registry of live SSE sessions: session id → that connection's inbound queue.
+type SseSessions =
+    Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::mpsc::Sender<Value>>>>;
+
 /// Shared state for the SSE transport.
+///
+/// The registry is the only shared piece; every connection owns its own inbound
+/// queue and its own outbound event stream, so one client can never observe
+/// another client's responses.
 #[derive(Clone)]
 struct SseState {
     handler: Arc<dyn McpHandler>,
-    sender: tokio::sync::mpsc::Sender<Value>,
-    receiver: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Value>>>,
+    sessions: SseSessions,
+    manager: Arc<TransportManager>,
 }
 
-/// GET /sse — server-sent event stream.
+/// Query parameters accepted by `POST /messages/`.
+#[derive(serde::Deserialize)]
+struct SseMessageQuery {
+    #[serde(rename = "sessionId")]
+    session_id: Option<String>,
+}
+
+/// GET /sse — open a session-scoped server-sent event stream.
 ///
-/// Reads messages from the mpsc channel, processes them through the MCP handler,
-/// and streams responses as SSE events.
+/// Emits the MCP `endpoint` event carrying this session's POST URL, then
+/// streams the responses to messages posted for this session and nothing else.
+/// A keep-alive comment is sent periodically so the stream is never silent and
+/// intermediaries do not close an idle connection. When the client disconnects
+/// the session is removed from the registry and its consumer task exits, so no
+/// zombie consumer is left behind to swallow a later message.
 async fn sse_stream_handler(
     axum::extract::State(state): axum::extract::State<SseState>,
-) -> axum::response::sse::Sse<
-    impl tokio_stream::Stream<Item = Result<axum::response::sse::Event, Infallible>>,
-> {
-    use axum::response::sse::{Event, Sse};
+) -> axum::response::Response {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use std::time::Duration;
+
+    let session_id = uuid::Uuid::new_v4().to_string();
+
+    // Inbound: messages posted to /messages/?sessionId=<this session>.
+    let (inbound_tx, mut inbound_rx) = tokio::sync::mpsc::channel::<Value>(256);
+    // Outbound: the SSE frames this connection — and only this one — receives.
+    let (event_tx, event_rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(256);
+
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), inbound_tx);
 
     let handler = state.handler.clone();
-    let receiver = state.receiver.clone();
+    let sessions = state.sessions.clone();
+    let manager = state.manager.clone();
+    let owned_session_id = session_id.clone();
 
-    let stream = tokio_stream::wrappers::ReceiverStream::new({
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(256);
-        tokio::spawn(async move {
+    tokio::spawn(async move {
+        let endpoint = Event::default()
+            .event("endpoint")
+            .data(format!("/messages/?sessionId={owned_session_id}"));
+        if event_tx.send(Ok(endpoint)).await.is_ok() {
             loop {
-                let msg = {
-                    let mut guard = receiver.lock().await;
-                    guard.recv().await
-                };
-                match msg {
-                    Some(message) => {
+                tokio::select! {
+                    // The client went away: axum dropped the response body and
+                    // with it the receiving half of the event channel.
+                    _ = event_tx.closed() => break,
+                    inbound = inbound_rx.recv() => {
+                        let Some(message) = inbound else { break };
                         if let Some(response) = handler.handle_message(message).await {
                             let data = serde_json::to_string(&response).unwrap_or_default();
                             let event = Event::default().event("message").data(data);
-                            if tx.send(Ok(event)).await.is_err() {
+                            if event_tx.send(Ok(event)).await.is_err() {
                                 break;
                             }
                         }
                     }
-                    None => break,
                 }
             }
-        });
-        rx
+        }
+        sessions.lock().await.remove(&owned_session_id);
+        // [TM-4] Cancel any async tasks bound to the disconnecting session,
+        // matching the TypeScript `transport.onclose` handler.
+        manager.notify_cancel(&owned_session_id);
+        tracing::debug!(session_id = %owned_session_id, "sse session closed");
     });
 
-    Sse::new(stream)
+    Sse::new(tokio_stream::wrappers::ReceiverStream::new(event_rx))
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("keep-alive"),
+        )
+        .into_response()
 }
 
-/// POST /messages/ — accept a client-to-server JSON-RPC message.
+/// POST /messages/?sessionId=... — accept a client-to-server JSON-RPC message.
 ///
-/// Sends the message into the mpsc channel for processing by the SSE stream handler.
-/// Returns 202 Accepted.
+/// The `sessionId` query parameter names the SSE stream that will receive the
+/// response; it is the value advertised by that stream's `endpoint` event.
+/// Returns 202 Accepted once queued, or 400 when the session is missing or
+/// unknown — a message with nowhere to go must not be silently absorbed.
 async fn sse_messages_handler(
     axum::extract::State(state): axum::extract::State<SseState>,
+    axum::extract::Query(query): axum::extract::Query<SseMessageQuery>,
     axum::Json(body): axum::Json<Value>,
-) -> StatusCode {
-    match state.sender.send(body).await {
-        Ok(()) => StatusCode::ACCEPTED,
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+) -> axum::response::Response {
+    let Some(session_id) = query.session_id else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "missing sessionId query parameter; use the URL from the endpoint event",
+        )
+            .into_response();
+    };
+
+    let sender = state.sessions.lock().await.get(&session_id).cloned();
+    let Some(sender) = sender else {
+        return (StatusCode::BAD_REQUEST, "unknown session").into_response();
+    };
+
+    match sender.send(body).await {
+        Ok(()) => StatusCode::ACCEPTED.into_response(),
+        // The stream closed between lookup and send.
+        Err(_) => (StatusCode::BAD_REQUEST, "unknown session").into_response(),
     }
 }
 
@@ -1433,22 +1500,105 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
-    #[tokio::test]
-    async fn sse_messages_post_returns_202() {
+    /// Open a `GET /sse` stream and return its body plus the session id read
+    /// off the mandatory `endpoint` event.
+    async fn open_sse_session(app: &Router) -> (axum::body::Body, String) {
         use axum::body::Body;
         use axum::http::Request;
         use tower::ServiceExt;
 
+        let req = Request::builder().uri("/sse").body(Body::empty()).unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut body = resp.into_body();
+        let text = read_sse_chunk(&mut body).await;
+        assert!(
+            text.contains("event:endpoint") || text.contains("event: endpoint"),
+            "first SSE frame must be the endpoint event; got: {text:?}"
+        );
+        let session_id = text
+            .split("sessionId=")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .expect("endpoint event must carry sessionId")
+            .to_string();
+        (body, session_id)
+    }
+
+    /// Read the next data chunk from an SSE body as UTF-8 text.
+    async fn read_sse_chunk(body: &mut axum::body::Body) -> String {
+        use http_body_util::BodyExt;
+
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(2), body.frame())
+            .await
+            .expect("SSE frame should arrive promptly")
+            .expect("stream must yield a frame")
+            .expect("frame must not be an error");
+        let data = frame.into_data().expect("data frame");
+        String::from_utf8_lossy(&data).to_string()
+    }
+
+    /// Collect the JSON-RPC ids carried by the next `count` `message` events.
+    async fn collect_sse_response_ids(body: &mut axum::body::Body, count: usize) -> Vec<i64> {
+        let mut ids = Vec::new();
+        while ids.len() < count {
+            let chunk = read_sse_chunk(body).await;
+            for line in chunk.lines() {
+                let Some(payload) = line.strip_prefix("data:") else {
+                    continue;
+                };
+                let Ok(value) = serde_json::from_str::<Value>(payload.trim()) else {
+                    continue;
+                };
+                if let Some(id) = value.get("id").and_then(Value::as_i64) {
+                    ids.push(id);
+                }
+            }
+        }
+        ids
+    }
+
+    /// POST a JSON-RPC request bound to a specific SSE session.
+    async fn post_sse_message(app: &Router, session_id: &str, id: i64) -> StatusCode {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let body = serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": "test" });
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/messages/?sessionId={session_id}"))
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        app.clone().oneshot(req).await.unwrap().status()
+    }
+
+    fn sse_test_app() -> Router {
         let tm = Arc::new(TransportManager::new(None));
         let handler: Arc<dyn McpHandler> = Arc::new(EchoHandler);
         #[allow(deprecated)]
-        let app = tm.build_sse_app(handler, None);
+        tm.build_sse_app(handler, None)
+    }
 
-        let body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "test"
-        });
+    #[tokio::test]
+    async fn sse_messages_post_returns_202_for_a_live_session() {
+        let app = sse_test_app();
+        let (_body, session_id) = open_sse_session(&app).await;
+        assert_eq!(
+            post_sse_message(&app, &session_id, 1).await,
+            StatusCode::ACCEPTED
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_messages_post_rejects_missing_session_id() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let app = sse_test_app();
+        let body = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "test" });
         let req = Request::builder()
             .method("POST")
             .uri("/messages/")
@@ -1456,7 +1606,16 @@ mod tests {
             .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn sse_messages_post_rejects_unknown_session_id() {
+        let app = sse_test_app();
+        assert_eq!(
+            post_sse_message(&app, "no-such-session", 1).await,
+            StatusCode::BAD_REQUEST
+        );
     }
 
     #[tokio::test]
@@ -1465,11 +1624,7 @@ mod tests {
         use axum::http::Request;
         use tower::ServiceExt;
 
-        let tm = Arc::new(TransportManager::new(None));
-        let handler: Arc<dyn McpHandler> = Arc::new(EchoHandler);
-        #[allow(deprecated)]
-        let app = tm.build_sse_app(handler, None);
-
+        let app = sse_test_app();
         let req = Request::builder().uri("/sse").body(Body::empty()).unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1480,6 +1635,83 @@ mod tests {
             .to_str()
             .unwrap();
         assert!(ct.contains("text/event-stream"));
+    }
+
+    #[tokio::test]
+    async fn sse_get_emits_endpoint_event_before_any_message() {
+        // A spec-compliant SSE client waits for `endpoint` to learn the POST
+        // URL; a stream that stays silent until the first response hangs it.
+        let app = sse_test_app();
+        let (_body, session_id) = open_sse_session(&app).await;
+        assert!(!session_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sse_concurrent_sessions_receive_only_their_own_responses() {
+        // Two simultaneous streams, messages interleaved across both: each
+        // stream must see exactly its own ids. The previous implementation
+        // shared one process-global receiver, so responses were handed out
+        // round-robin and one client received another client's tool output.
+        let app = sse_test_app();
+        let (mut body_a, session_a) = open_sse_session(&app).await;
+        let (mut body_b, session_b) = open_sse_session(&app).await;
+        assert_ne!(
+            session_a, session_b,
+            "each connection needs its own session"
+        );
+
+        for (session, id) in [
+            (&session_a, 1),
+            (&session_b, 2),
+            (&session_a, 3),
+            (&session_b, 4),
+            (&session_a, 5),
+            (&session_b, 6),
+        ] {
+            assert_eq!(
+                post_sse_message(&app, session, id).await,
+                StatusCode::ACCEPTED
+            );
+        }
+
+        let mut ids_a = collect_sse_response_ids(&mut body_a, 3).await;
+        let mut ids_b = collect_sse_response_ids(&mut body_b, 3).await;
+        ids_a.sort_unstable();
+        ids_b.sort_unstable();
+        assert_eq!(ids_a, vec![1, 3, 5], "stream A leaked or lost responses");
+        assert_eq!(ids_b, vec![2, 4, 6], "stream B leaked or lost responses");
+    }
+
+    #[tokio::test]
+    async fn sse_disconnect_does_not_swallow_later_messages() {
+        // Every past disconnect used to leave a zombie consumer that ate
+        // exactly one subsequent message while POST still answered 202.
+        let app = sse_test_app();
+        for _ in 0..3 {
+            let (body, session_id) = open_sse_session(&app).await;
+            drop(body);
+            // Let the consumer task observe the closed stream and deregister.
+            for _ in 0..50 {
+                tokio::task::yield_now().await;
+                if post_sse_message(&app, &session_id, 0).await == StatusCode::BAD_REQUEST {
+                    break;
+                }
+            }
+        }
+
+        let (mut body, session_id) = open_sse_session(&app).await;
+        for id in [1, 2, 3] {
+            assert_eq!(
+                post_sse_message(&app, &session_id, id).await,
+                StatusCode::ACCEPTED
+            );
+        }
+        let ids = collect_sse_response_ids(&mut body, 3).await;
+        assert_eq!(
+            ids,
+            vec![1, 2, 3],
+            "messages were swallowed after disconnect"
+        );
     }
 
     #[tokio::test]

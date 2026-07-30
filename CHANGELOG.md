@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **SSE transport delivered one client's responses to another client.** `build_sse_app` created a single process-global `mpsc` channel and shared its receiver across every connection behind an `Arc<Mutex<...>>`, so responses were handed out round-robin to whichever stream was next: with two clients connected, one client received the other's tool output. Each `GET /sse` now opens an independent session with its own inbound queue and its own event stream, keyed by a session id — as the TypeScript SDK's `runSse` (one `SSEServerTransport` per session id) and the Python SDK's `SseServerTransport.connect_sse` already did.
+- **SSE dropped one message per past disconnect.** The shared-receiver consumer loop only exited after a failed send, so every disconnected client left a zombie consumer that silently swallowed exactly one later message while `POST /messages/` still answered `202 Accepted`. The per-connection consumer now also watches for the client going away and deregisters its session, and a message posted to a closed or unknown session is rejected rather than absorbed.
+- **`GET /sse` emitted no bytes until the first message arrived.** It now emits the MCP `endpoint` event (`data: /messages/?sessionId=<id>`) immediately, so a spec-compliant SSE client can learn its POST URL, and holds the stream open with a 15-second keep-alive. This matches the streamable-HTTP `GET /mcp` handler.
+
+### Changed
+
+- **`POST /messages/` now requires a `sessionId` query parameter** naming the SSE stream that should receive the response; the value is advertised by that stream's `endpoint` event. A request without it, or naming an unknown session, returns `400`. Previously any POST was accepted and its response went to an arbitrary stream. Matches the TypeScript SDK, which returns `400` in both cases.
+- **SSE client disconnect now invokes the transport's cancel handler** with the closing session id (TM-4), mirroring the TypeScript `transport.onclose` handler and the Python `_scoped_session` teardown.
+
 ## [0.17.2] - 2026-07-14
 
 Patch release. Fixes the MCP elicitation approval flow and bumps the required `apcore` floor to `0.26`.
