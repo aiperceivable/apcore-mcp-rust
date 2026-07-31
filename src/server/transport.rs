@@ -705,14 +705,59 @@ struct SseMessageQuery {
     session_id: Option<String>,
 }
 
+/// Write the transport-minted session id onto an inbound client message as
+/// `params._meta.sessionId`.
+///
+/// This is the Rust counterpart of the TypeScript SDK's `extra.sessionId`
+/// (supplied by `SSEServerTransport`) and of the Python SDK's
+/// `transport_session_var` ContextVar, which `_scoped_session` sets around the
+/// server run. All three publish the *transport's own* id, not the client's:
+/// the value keys [`AsyncTaskBridge::session_tasks`], and
+/// `notifications/cancelled` already routes a caller-supplied key into
+/// `cancel_session_tasks`, so a client permitted to choose its own session id
+/// could name — and mass-cancel — another connection's tasks. The write is
+/// therefore an unconditional **overwrite**, never a default-if-absent.
+///
+/// Messages whose `params` is absent or is not a JSON object are left alone:
+/// the handler reads `params._meta` by key, so such a message can neither
+/// carry a session id nor smuggle one in.
+fn stamp_session_id(message: &mut Value, session_id: &str) {
+    let Some(object) = message.as_object_mut() else {
+        return;
+    };
+    let Some(params) = object.get_mut("params").and_then(Value::as_object_mut) else {
+        return;
+    };
+    match params.get_mut("_meta") {
+        // Preserve sibling keys such as `progressToken`.
+        Some(Value::Object(meta)) => {
+            meta.insert(
+                "sessionId".to_string(),
+                Value::String(session_id.to_string()),
+            );
+        }
+        // Absent, or present but not an object — replace it wholesale so a
+        // non-object `_meta` cannot shadow the id we are about to publish.
+        _ => {
+            params.insert(
+                "_meta".to_string(),
+                serde_json::json!({ "sessionId": session_id }),
+            );
+        }
+    }
+}
+
 /// GET /sse — open a session-scoped server-sent event stream.
 ///
 /// Emits the MCP `endpoint` event carrying this session's POST URL, then
 /// streams the responses to messages posted for this session and nothing else.
 /// A keep-alive comment is sent periodically so the stream is never silent and
-/// intermediaries do not close an idle connection. When the client disconnects
-/// the session is removed from the registry and its consumer task exits, so no
-/// zombie consumer is left behind to swallow a later message.
+/// intermediaries do not close an idle connection. Every dispatched message is
+/// stamped with this connection's session id (see [`stamp_session_id`]) so
+/// tasks submitted over it are bound to it and can be cancelled on disconnect.
+/// When the client disconnects the session is removed from the registry and its
+/// consumer task exits, so no zombie consumer is left behind to swallow a later
+/// message.
 async fn sse_stream_handler(
     axum::extract::State(state): axum::extract::State<SseState>,
 ) -> axum::response::Response {
@@ -748,7 +793,8 @@ async fn sse_stream_handler(
                     // with it the receiving half of the event channel.
                     _ = event_tx.closed() => break,
                     inbound = inbound_rx.recv() => {
-                        let Some(message) = inbound else { break };
+                        let Some(mut message) = inbound else { break };
+                        stamp_session_id(&mut message, &owned_session_id);
                         if let Some(response) = handler.handle_message(message).await {
                             let data = serde_json::to_string(&response).unwrap_or_default();
                             let event = Event::default().event("message").data(data);
@@ -762,7 +808,9 @@ async fn sse_stream_handler(
         }
         sessions.lock().await.remove(&owned_session_id);
         // [TM-4] Cancel any async tasks bound to the disconnecting session,
-        // matching the TypeScript `transport.onclose` handler.
+        // matching the TypeScript `transport.onclose` handler. The id matches
+        // because every dispatched message was stamped with it — see
+        // [`stamp_session_id`].
         manager.notify_cancel(&owned_session_id);
         tracing::debug!(session_id = %owned_session_id, "sse session closed");
     });
@@ -1538,10 +1586,10 @@ mod tests {
         String::from_utf8_lossy(&data).to_string()
     }
 
-    /// Collect the JSON-RPC ids carried by the next `count` `message` events.
-    async fn collect_sse_response_ids(body: &mut axum::body::Body, count: usize) -> Vec<i64> {
-        let mut ids = Vec::new();
-        while ids.len() < count {
+    /// Collect the next `count` JSON-RPC responses carried by `message` events.
+    async fn collect_sse_responses(body: &mut axum::body::Body, count: usize) -> Vec<Value> {
+        let mut responses = Vec::new();
+        while responses.len() < count {
             let chunk = read_sse_chunk(body).await;
             for line in chunk.lines() {
                 let Some(payload) = line.strip_prefix("data:") else {
@@ -1550,21 +1598,44 @@ mod tests {
                 let Ok(value) = serde_json::from_str::<Value>(payload.trim()) else {
                     continue;
                 };
-                if let Some(id) = value.get("id").and_then(Value::as_i64) {
-                    ids.push(id);
+                if value.get("id").is_some() {
+                    responses.push(value);
                 }
             }
         }
-        ids
+        responses
+    }
+
+    /// Collect the JSON-RPC ids carried by the next `count` `message` events.
+    async fn collect_sse_response_ids(body: &mut axum::body::Body, count: usize) -> Vec<i64> {
+        collect_sse_responses(body, count)
+            .await
+            .iter()
+            .filter_map(|v| v.get("id").and_then(Value::as_i64))
+            .collect()
     }
 
     /// POST a JSON-RPC request bound to a specific SSE session.
     async fn post_sse_message(app: &Router, session_id: &str, id: i64) -> StatusCode {
+        post_sse_message_with_params(app, session_id, id, Value::Null).await
+    }
+
+    /// POST a JSON-RPC request carrying explicit `params` to a specific
+    /// SSE session. `Value::Null` omits the member entirely.
+    async fn post_sse_message_with_params(
+        app: &Router,
+        session_id: &str,
+        id: i64,
+        params: Value,
+    ) -> StatusCode {
         use axum::body::Body;
         use axum::http::Request;
         use tower::ServiceExt;
 
-        let body = serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": "test" });
+        let mut body = serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": "test" });
+        if !params.is_null() {
+            body["params"] = params;
+        }
         let req = Request::builder()
             .method("POST")
             .uri(format!("/messages/?sessionId={session_id}"))
@@ -1644,6 +1715,82 @@ mod tests {
         let app = sse_test_app();
         let (_body, session_id) = open_sse_session(&app).await;
         assert!(!session_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sse_dispatch_stamps_the_connection_session_id() {
+        // Without this the session id never reaches the AsyncTaskBridge:
+        // `notify_cancel` fires with the server-minted uuid on disconnect,
+        // but `session_tasks` is keyed from `params._meta.sessionId`, so
+        // `cancel_session_tasks` matches zero tasks and a submitted task
+        // runs to completion after the client is gone.
+        let app = sse_test_app();
+        let (mut body, session_id) = open_sse_session(&app).await;
+        assert_eq!(
+            post_sse_message_with_params(&app, &session_id, 1, serde_json::json!({})).await,
+            StatusCode::ACCEPTED
+        );
+
+        // EchoHandler mirrors `params` back as `result`.
+        let responses = collect_sse_responses(&mut body, 1).await;
+        assert_eq!(
+            responses[0]["result"]["_meta"]["sessionId"],
+            Value::String(session_id.clone()),
+            "the dispatched message must carry this connection's session id"
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_dispatch_overwrites_a_client_supplied_session_id() {
+        // A client that could name its own session could name someone
+        // else's: `notifications/cancelled` routes a caller-supplied key
+        // straight into `cancel_session_tasks`. The transport id must win.
+        let app = sse_test_app();
+        let (mut body, session_id) = open_sse_session(&app).await;
+        let params = serde_json::json!({
+            "_meta": { "sessionId": "victim-session", "progressToken": 7 }
+        });
+        assert_eq!(
+            post_sse_message_with_params(&app, &session_id, 1, params).await,
+            StatusCode::ACCEPTED
+        );
+
+        let responses = collect_sse_responses(&mut body, 1).await;
+        let meta = &responses[0]["result"]["_meta"];
+        assert_eq!(
+            meta["sessionId"],
+            Value::String(session_id),
+            "a client-supplied sessionId must be overwritten, not honoured"
+        );
+        assert_eq!(
+            meta["progressToken"], 7,
+            "stamping must preserve the other _meta members"
+        );
+    }
+
+    #[test]
+    fn stamp_session_id_replaces_a_non_object_meta() {
+        let mut message = serde_json::json!({
+            "method": "tools/call",
+            "params": { "name": "t", "_meta": "not-an-object" }
+        });
+        stamp_session_id(&mut message, "sess-1");
+        assert_eq!(message["params"]["_meta"]["sessionId"], "sess-1");
+        assert_eq!(message["params"]["name"], "t");
+    }
+
+    #[test]
+    fn stamp_session_id_leaves_a_message_without_object_params_untouched() {
+        // Nothing to stamp and nothing to smuggle: the handler reads
+        // `params._meta` by key, which neither shape can satisfy.
+        for mut message in [
+            serde_json::json!({ "method": "tools/list" }),
+            serde_json::json!({ "method": "tools/list", "params": [1, 2] }),
+        ] {
+            let before = message.clone();
+            stamp_session_id(&mut message, "sess-1");
+            assert_eq!(message, before);
+        }
     }
 
     #[tokio::test]

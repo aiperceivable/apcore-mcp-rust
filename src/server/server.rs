@@ -778,6 +778,12 @@ impl crate::server::transport::McpHandler for ServerHandler {
                 // carry the in-flight `requestId` in `params.requestId`
                 // (MCP spec 2025-03-26). We stringify it so the handler
                 // can treat it as an opaque session/task key.
+                //
+                // This key is caller-supplied, so it is only safe because
+                // session keys are not: the SSE transport overwrites
+                // `params._meta.sessionId` with its own 122-bit random uuid
+                // before dispatch (`transport::stamp_session_id`), so a
+                // caller cannot name another connection's session here.
                 if let Some(h) = &self.cancel_handler {
                     let key = message
                         .get("params")
