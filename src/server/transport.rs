@@ -498,7 +498,7 @@ impl TransportManager {
     ) -> (Router, SseSessions) {
         let sse_state = SseState {
             handler,
-            sessions: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             manager: Arc::clone(self),
         };
         let sessions = Arc::clone(&sse_state.sessions);
@@ -701,8 +701,74 @@ async fn streamable_http_delete_handler(
 // ---------------------------------------------------------------------------
 
 /// Registry of live SSE sessions: session id → that connection's inbound queue.
+///
+/// Guarded by a `std::sync::Mutex` rather than tokio's: every critical section
+/// is a single `HashMap` operation with no `.await` inside, and a synchronous
+/// lock is what lets [`SseSessionGuard::drop`] deregister a session during a
+/// panic unwind, where awaiting is impossible.
 type SseSessions =
-    Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::mpsc::Sender<Value>>>>;
+    Arc<std::sync::Mutex<std::collections::HashMap<String, tokio::sync::mpsc::Sender<Value>>>>;
+
+/// Lock the session registry, recovering from a poisoned mutex.
+///
+/// Poisoning carries no meaning here: the map holds channel senders, and a
+/// panic mid-`insert`/`remove` cannot leave a `HashMap` in a state that a
+/// later `get`/`remove` misreads. Failing every subsequent connection over it
+/// would turn one panicking session into a dead transport.
+fn lock_sessions(
+    sessions: &SseSessions,
+) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, tokio::sync::mpsc::Sender<Value>>>
+{
+    sessions
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// RAII teardown for one SSE session: deregisters it and fires the transport's
+/// cancellation handler when the consumer task ends, however it ends.
+///
+/// The teardown used to be two statements after the dispatch loop, which a
+/// panic inside `McpHandler::handle_message` unwound straight past — leaking
+/// the registry entry for the lifetime of the process and skipping [TM-4]
+/// cancellation for every task the session had launched. Python brackets the
+/// same work in `try`/`finally` (`_scoped_session`); `Drop` is the Rust
+/// equivalent, and the family spec requires RAII for resource cleanup.
+struct SseSessionGuard {
+    session_id: String,
+    sessions: SseSessions,
+    manager: Arc<TransportManager>,
+}
+
+impl SseSessionGuard {
+    /// Register `session_id` against its inbound queue and return the guard
+    /// that will remove it again. Registration happens before the consumer
+    /// task starts so the advertised endpoint URL is usable immediately.
+    fn register(
+        session_id: String,
+        sessions: SseSessions,
+        manager: Arc<TransportManager>,
+        inbound_tx: tokio::sync::mpsc::Sender<Value>,
+    ) -> Self {
+        lock_sessions(&sessions).insert(session_id.clone(), inbound_tx);
+        Self {
+            session_id,
+            sessions,
+            manager,
+        }
+    }
+}
+
+impl Drop for SseSessionGuard {
+    fn drop(&mut self) {
+        lock_sessions(&self.sessions).remove(&self.session_id);
+        // [TM-4] Cancel any async tasks bound to the disconnecting session,
+        // matching the TypeScript `transport.onclose` handler. The id matches
+        // because every dispatched message was stamped with it — see
+        // [`stamp_session_id`].
+        self.manager.notify_cancel(&self.session_id);
+        tracing::debug!(session_id = %self.session_id, "sse session closed");
+    }
+}
 
 /// Shared state for the SSE transport.
 ///
@@ -775,7 +841,8 @@ fn stamp_session_id(message: &mut Value, session_id: &str) {
 /// tasks submitted over it are bound to it and can be cancelled on disconnect.
 /// When the client disconnects the session is removed from the registry and its
 /// consumer task exits, so no zombie consumer is left behind to swallow a later
-/// message.
+/// message. Removal is [`SseSessionGuard`]'s `Drop`, so it survives a panic in
+/// the handler as well as an ordinary exit.
 async fn sse_stream_handler(
     axum::extract::State(state): axum::extract::State<SseState>,
 ) -> axum::response::Response {
@@ -789,18 +856,21 @@ async fn sse_stream_handler(
     // Outbound: the SSE frames this connection — and only this one — receives.
     let (event_tx, event_rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(256);
 
-    state
-        .sessions
-        .lock()
-        .await
-        .insert(session_id.clone(), inbound_tx);
+    // Moved into the consumer task below: whichever way that task ends —
+    // client disconnect, channel close, or a panic in the handler — dropping
+    // the guard deregisters the session and fires the cancellation handler.
+    let guard = SseSessionGuard::register(
+        session_id.clone(),
+        state.sessions.clone(),
+        state.manager.clone(),
+        inbound_tx,
+    );
 
     let handler = state.handler.clone();
-    let sessions = state.sessions.clone();
-    let manager = state.manager.clone();
     let owned_session_id = session_id.clone();
 
     tokio::spawn(async move {
+        let _session_guard = guard;
         let endpoint = Event::default()
             .event("endpoint")
             .data(format!("/messages/?sessionId={owned_session_id}"));
@@ -824,13 +894,6 @@ async fn sse_stream_handler(
                 }
             }
         }
-        sessions.lock().await.remove(&owned_session_id);
-        // [TM-4] Cancel any async tasks bound to the disconnecting session,
-        // matching the TypeScript `transport.onclose` handler. The id matches
-        // because every dispatched message was stamped with it — see
-        // [`stamp_session_id`].
-        manager.notify_cancel(&owned_session_id);
-        tracing::debug!(session_id = %owned_session_id, "sse session closed");
     });
 
     Sse::new(tokio_stream::wrappers::ReceiverStream::new(event_rx))
@@ -867,7 +930,7 @@ async fn sse_messages_handler(
             .into_response();
     };
 
-    let sender = state.sessions.lock().await.get(&session_id).cloned();
+    let sender = lock_sessions(&state.sessions).get(&session_id).cloned();
     let Some(sender) = sender else {
         return (StatusCode::BAD_REQUEST, "unknown session").into_response();
     };
@@ -1690,7 +1753,7 @@ mod tests {
     async fn await_session_removal(sessions: &SseSessions, session_id: &str) {
         for _ in 0..1000 {
             tokio::task::yield_now().await;
-            if !sessions.lock().await.contains_key(session_id) {
+            if !lock_sessions(sessions).contains_key(session_id) {
                 return;
             }
         }
@@ -1703,8 +1766,14 @@ mod tests {
 
     /// An SSE test app plus its live-session registry.
     fn sse_test_app_parts() -> (Router, SseSessions) {
-        let tm = Arc::new(TransportManager::new(None));
-        let handler: Arc<dyn McpHandler> = Arc::new(EchoHandler);
+        sse_test_app_parts_with(Arc::new(TransportManager::new(None)), Arc::new(EchoHandler))
+    }
+
+    /// As [`sse_test_app_parts`], with a caller-supplied manager and handler.
+    fn sse_test_app_parts_with(
+        tm: Arc<TransportManager>,
+        handler: Arc<dyn McpHandler>,
+    ) -> (Router, SseSessions) {
         #[allow(deprecated)]
         tm.build_sse_app_parts(handler, None)
     }
@@ -1974,14 +2043,14 @@ mod tests {
 
         let (body, session_id) = open_sse_session(&app).await;
         assert!(
-            sessions.lock().await.contains_key(&session_id),
+            lock_sessions(&sessions).contains_key(&session_id),
             "an open stream must be registered"
         );
 
         drop(body);
         await_session_removal(&sessions, &session_id).await;
         assert!(
-            sessions.lock().await.is_empty(),
+            lock_sessions(&sessions).is_empty(),
             "the closed session leaked into the registry"
         );
 
@@ -1992,6 +2061,55 @@ mod tests {
             message, "unknown session",
             "the rejection must come from the registry miss, not from a send \
              onto a dropped receiver of a still-registered session"
+        );
+    }
+
+    /// A handler that panics on every message, standing in for any bug in
+    /// real tool dispatch.
+    struct PanickingHandler;
+
+    #[async_trait::async_trait]
+    impl McpHandler for PanickingHandler {
+        async fn handle_message(&self, _message: Value) -> Option<Value> {
+            panic!("deliberate handler panic");
+        }
+    }
+
+    #[tokio::test]
+    async fn sse_session_teardown_survives_a_handler_panic() {
+        // Teardown used to be two statements after the dispatch loop, which
+        // an unwind walks straight past: the registry entry leaked for the
+        // lifetime of the process and TM-4 cancellation never ran for the
+        // tasks that session had launched. `SseSessionGuard`'s Drop runs
+        // during the unwind instead.
+        //
+        // The panic backtrace this prints to stderr is expected.
+        let cancelled: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(vec![]));
+        let recorder = Arc::clone(&cancelled);
+        let mut tm = TransportManager::new(None);
+        tm.set_cancel_handler(Some(Arc::new(move |session_id: &str| {
+            recorder
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(session_id.to_string());
+        })));
+        let (app, sessions) = sse_test_app_parts_with(Arc::new(tm), Arc::new(PanickingHandler));
+
+        let (_body, session_id) = open_sse_session(&app).await;
+        assert_eq!(
+            post_sse_message(&app, &session_id, 1).await,
+            StatusCode::ACCEPTED
+        );
+
+        await_session_removal(&sessions, &session_id).await;
+        assert!(
+            lock_sessions(&sessions).is_empty(),
+            "a panicking handler leaked its session into the registry"
+        );
+        assert_eq!(
+            *cancelled.lock().unwrap_or_else(|p| p.into_inner()),
+            vec![session_id],
+            "TM-4 cancellation must still fire when the handler panics"
         );
     }
 
