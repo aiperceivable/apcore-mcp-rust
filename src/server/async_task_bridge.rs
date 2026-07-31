@@ -67,6 +67,14 @@ pub const META_TOOL_PREVIEW: &str = "__apcore_module_preview";
 
 /// Name of the preflight check carrying the ACL verdict. apcore's
 /// `step_to_check_name` maps the `acl_check` pipeline step onto it.
+///
+/// **Not exported by apcore**: `step_to_check_name` is a private function in
+/// `apcore::executor`, so this literal cannot be bound to the source of truth
+/// the way [`INTROSPECTION_CHECK_NAMES`]'s second entry is. A rename upstream
+/// would silently stop this filter matching — no compile error, argv back in
+/// the envelope for a denied caller. `preflight_check_names_match_the_filter_constants`
+/// is the guard: it asks a real `Executor` for a real `PreflightResult` and
+/// fails if any of these three names is no longer emitted.
 const ACL_CHECK_NAME: &str = "acl";
 
 /// Preflight checks that are module-level introspection. apcore runs them
@@ -74,7 +82,16 @@ const ACL_CHECK_NAME: &str = "acl";
 /// failed, and for a CLI-wrapping module their output names the resolved
 /// binary and the argv that would be executed. They are withheld from a
 /// preview the ACL denied.
-const INTROSPECTION_CHECK_NAMES: [&str; 2] = ["module_preflight", "module_preview"];
+///
+/// `module_preview` is bound to apcore's exported constant, whose own docs ask
+/// callers to use it "instead of the literal string to avoid drift with other
+/// SDKs". `module_preflight` has no such constant — it is a bare literal in
+/// `Executor::validate` — and carries the same drift risk as
+/// [`ACL_CHECK_NAME`], with the same test as its guard.
+const INTROSPECTION_CHECK_NAMES: [&str; 2] = [
+    "module_preflight",
+    apcore::module::MODULE_PREVIEW_CHECK_NAME,
+];
 
 /// Default `AsyncTaskManager` configuration.
 pub const DEFAULT_MAX_CONCURRENT: usize = 10;
@@ -1349,52 +1366,51 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn preview_meta_tool_withholds_predicted_changes_when_acl_denies() {
-        use apcore::module::{Change, PreviewResult};
-        use async_trait::async_trait;
+    /// Stands in for a CLI-wrapping module: both its preflight warning
+    /// and its predicted change name the resolved binary and the argv.
+    #[derive(Debug)]
+    struct DestructiveModule;
 
-        /// Stands in for a CLI-wrapping module: both its preflight warning
-        /// and its predicted change name the resolved binary and the argv.
-        #[derive(Debug)]
-        struct DestructiveModule;
-
-        #[async_trait]
-        impl apcore::module::Module for DestructiveModule {
-            fn input_schema(&self) -> Value {
-                json!({"type": "object"})
-            }
-            fn output_schema(&self) -> Value {
-                json!({"type": "object"})
-            }
-            fn description(&self) -> &str {
-                "destructive demo"
-            }
-            async fn execute(
-                &self,
-                _inputs: Value,
-                _ctx: &Context<Value>,
-            ) -> Result<Value, apcore::errors::ModuleError> {
-                Ok(json!({}))
-            }
-            fn preflight(&self, _inputs: &Value, _ctx: Option<&Context<Value>>) -> Vec<String> {
-                vec!["This will run: /bin/cp src dst".to_string()]
-            }
-            fn preview(
-                &self,
-                _inputs: &Value,
-                _ctx: Option<&Context<Value>>,
-            ) -> Option<PreviewResult> {
-                let mut change = Change::default();
-                change.action = "overwrite".to_string();
-                change.target = "/bin/cp src dst".to_string();
-                change.summary = "This will run: /bin/cp src dst".to_string();
-                let mut result = PreviewResult::default();
-                result.changes = vec![change];
-                Some(result)
-            }
+    #[async_trait::async_trait]
+    impl apcore::module::Module for DestructiveModule {
+        fn input_schema(&self) -> Value {
+            json!({"type": "object"})
         }
+        fn output_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+        fn description(&self) -> &str {
+            "destructive demo"
+        }
+        async fn execute(
+            &self,
+            _inputs: Value,
+            _ctx: &Context<Value>,
+        ) -> Result<Value, apcore::errors::ModuleError> {
+            Ok(json!({}))
+        }
+        fn preflight(&self, _inputs: &Value, _ctx: Option<&Context<Value>>) -> Vec<String> {
+            vec!["This will run: /bin/cp src dst".to_string()]
+        }
+        fn preview(
+            &self,
+            _inputs: &Value,
+            _ctx: Option<&Context<Value>>,
+        ) -> Option<apcore::module::PreviewResult> {
+            let mut change = apcore::module::Change::default();
+            change.action = "overwrite".to_string();
+            change.target = "/bin/cp src dst".to_string();
+            change.summary = "This will run: /bin/cp src dst".to_string();
+            let mut result = apcore::module::PreviewResult::default();
+            result.changes = vec![change];
+            Some(result)
+        }
+    }
 
+    /// An executor holding `demo.destructive`, with an ACL that denies every
+    /// caller. Shared by the disclosure test and the check-name drift test so
+    /// both observe the same real `PreflightResult`.
+    fn destructive_module_executor_denying_all() -> apcore::executor::Executor {
         let registry = Arc::new(Registry::default());
         let descriptor = apcore::registry::ModuleDescriptor {
             module_id: "demo.destructive".to_string(),
@@ -1434,7 +1450,41 @@ mod tests {
         let mut executor =
             apcore::executor::Executor::new(registry, Arc::new(apcore::config::Config::default()));
         executor.set_acl(acl);
+        executor
+    }
 
+    #[tokio::test]
+    async fn preflight_check_names_match_the_filter_constants() {
+        // The ACL disclosure filter matches three check names by string.
+        // Only `module_preview` has an exported constant in apcore;
+        // `acl` comes from a private `step_to_check_name` and
+        // `module_preflight` is a bare literal in `Executor::validate`. A
+        // rename upstream produces no compile error and no failure in the
+        // disclosure test — the filter would simply stop matching and argv
+        // would flow back to a denied caller. This test asks a real
+        // executor what it actually emits, so drift fails loudly here.
+        let executor = destructive_module_executor_denying_all();
+        let preflight = executor
+            .validate("demo.destructive", &json!({}), None)
+            .await
+            .expect("validate must return a structured result");
+
+        let emitted: Vec<&str> = preflight.checks.iter().map(|c| c.check.as_str()).collect();
+        for expected in std::iter::once(ACL_CHECK_NAME).chain(INTROSPECTION_CHECK_NAMES) {
+            assert!(
+                emitted.contains(&expected),
+                "apcore no longer emits a preflight check named '{expected}'. The \
+                 __apcore_module_preview ACL disclosure filter matches on it by \
+                 string; update ACL_CHECK_NAME / INTROSPECTION_CHECK_NAMES to the \
+                 new name, or the filter silently stops withholding argv from a \
+                 denied caller. Emitted: {emitted:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn preview_meta_tool_withholds_predicted_changes_when_acl_denies() {
+        let executor = destructive_module_executor_denying_all();
         let bridge = AsyncTaskBridge::new(Arc::new(executor));
         let result = bridge
             .handle_meta_tool(
@@ -1476,6 +1526,20 @@ mod tests {
             Some(0),
             "predicted_changes must be withheld from a denied caller"
         );
+        // Assert on the filter's actual effect, not only on the absence of a
+        // string: `!contains("/bin/cp")` also holds when a check survives
+        // with `passed: true, warnings: []`, so on its own it cannot tell a
+        // working filter from one whose names have drifted out of match.
+        let surviving: Vec<&str> = checks
+            .iter()
+            .filter_map(|c| c.get("check").and_then(Value::as_str))
+            .collect();
+        for withheld in INTROSPECTION_CHECK_NAMES {
+            assert!(
+                !surviving.contains(&withheld),
+                "'{withheld}' must be withheld from a denied preview: {surviving:?}"
+            );
+        }
         let rendered = serde_json::to_string(&result).expect("envelope serialises");
         assert!(
             !rendered.contains("/bin/cp"),
