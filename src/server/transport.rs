@@ -479,11 +479,29 @@ impl TransportManager {
         handler: Arc<dyn McpHandler>,
         extra_routes: Option<Router>,
     ) -> Router {
+        #[allow(deprecated)]
+        self.build_sse_app_parts(handler, extra_routes).0
+    }
+
+    /// Build the SSE router and hand back the live-session registry alongside
+    /// it.
+    ///
+    /// Deregistration is otherwise unobservable from outside: a leaked entry
+    /// still answers `400` once its inbound receiver is dropped, so status
+    /// codes alone cannot tell a removed session from a leaked one. Tests
+    /// assert on the registry directly.
+    #[deprecated(note = "SSE transport is deprecated. Use streamable-HTTP instead.")]
+    fn build_sse_app_parts(
+        self: &Arc<Self>,
+        handler: Arc<dyn McpHandler>,
+        extra_routes: Option<Router>,
+    ) -> (Router, SseSessions) {
         let sse_state = SseState {
             handler,
             sessions: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             manager: Arc::clone(self),
         };
+        let sessions = Arc::clone(&sse_state.sessions);
 
         let sse_router = Router::new()
             .route("/sse", get(sse_stream_handler))
@@ -496,7 +514,7 @@ impl TransportManager {
             app = app.merge(extra);
         }
 
-        app
+        (app, sessions)
     }
 
     /// Run the MCP server over SSE transport (deprecated).
@@ -830,6 +848,12 @@ async fn sse_stream_handler(
 /// response; it is the value advertised by that stream's `endpoint` event.
 /// Returns 202 Accepted once queued, or 400 when the session is missing or
 /// unknown — a message with nowhere to go must not be silently absorbed.
+///
+/// The two rejection bodies are deliberately distinct. `unknown session` means
+/// the registry had no entry; `session closed` means the entry was there but
+/// its stream went away between lookup and send. Collapsing them into one
+/// string makes a registry leak untestable, because a leaked entry keeps
+/// answering 400 through the second branch.
 async fn sse_messages_handler(
     axum::extract::State(state): axum::extract::State<SseState>,
     axum::extract::Query(query): axum::extract::Query<SseMessageQuery>,
@@ -851,7 +875,7 @@ async fn sse_messages_handler(
     match sender.send(body).await {
         Ok(()) => StatusCode::ACCEPTED.into_response(),
         // The stream closed between lookup and send.
-        Err(_) => (StatusCode::BAD_REQUEST, "unknown session").into_response(),
+        Err(_) => (StatusCode::BAD_REQUEST, "session closed").into_response(),
     }
 }
 
@@ -1617,19 +1641,24 @@ mod tests {
 
     /// POST a JSON-RPC request bound to a specific SSE session.
     async fn post_sse_message(app: &Router, session_id: &str, id: i64) -> StatusCode {
-        post_sse_message_with_params(app, session_id, id, Value::Null).await
+        post_sse_message_with_params(app, session_id, id, Value::Null)
+            .await
+            .0
     }
 
     /// POST a JSON-RPC request carrying explicit `params` to a specific
-    /// SSE session. `Value::Null` omits the member entirely.
+    /// SSE session. `Value::Null` omits the member entirely. Returns the
+    /// status and the response body — the two 400 branches of
+    /// `sse_messages_handler` are distinguishable only by their body.
     async fn post_sse_message_with_params(
         app: &Router,
         session_id: &str,
         id: i64,
         params: Value,
-    ) -> StatusCode {
+    ) -> (StatusCode, String) {
         use axum::body::Body;
         use axum::http::Request;
+        use http_body_util::BodyExt;
         use tower::ServiceExt;
 
         let mut body = serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": "test" });
@@ -1642,14 +1671,42 @@ mod tests {
             .header("content-type", "application/json")
             .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap();
-        app.clone().oneshot(req).await.unwrap().status()
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    /// Wait for the consumer task to notice its client left and deregister.
+    ///
+    /// Polls the registry rather than probing `POST /messages/`: a probe is
+    /// itself a message, and the zombie-consumer regression only tears down
+    /// *after* pulling one more message off the queue, so a probing wait
+    /// would feed the zombie and then report success.
+    ///
+    /// Panics if the session outlives its stream — that is the registry leak
+    /// this suite exists to catch, so it must fail loudly rather than fall
+    /// through unasserted.
+    async fn await_session_removal(sessions: &SseSessions, session_id: &str) {
+        for _ in 0..1000 {
+            tokio::task::yield_now().await;
+            if !sessions.lock().await.contains_key(session_id) {
+                return;
+            }
+        }
+        panic!("session {session_id} was still registered after its stream closed");
     }
 
     fn sse_test_app() -> Router {
+        sse_test_app_parts().0
+    }
+
+    /// An SSE test app plus its live-session registry.
+    fn sse_test_app_parts() -> (Router, SseSessions) {
         let tm = Arc::new(TransportManager::new(None));
         let handler: Arc<dyn McpHandler> = Arc::new(EchoHandler);
         #[allow(deprecated)]
-        tm.build_sse_app(handler, None)
+        tm.build_sse_app_parts(handler, None)
     }
 
     #[tokio::test]
@@ -1727,7 +1784,9 @@ mod tests {
         let app = sse_test_app();
         let (mut body, session_id) = open_sse_session(&app).await;
         assert_eq!(
-            post_sse_message_with_params(&app, &session_id, 1, serde_json::json!({})).await,
+            post_sse_message_with_params(&app, &session_id, 1, serde_json::json!({}))
+                .await
+                .0,
             StatusCode::ACCEPTED
         );
 
@@ -1751,7 +1810,9 @@ mod tests {
             "_meta": { "sessionId": "victim-session", "progressToken": 7 }
         });
         assert_eq!(
-            post_sse_message_with_params(&app, &session_id, 1, params).await,
+            post_sse_message_with_params(&app, &session_id, 1, params)
+                .await
+                .0,
             StatusCode::ACCEPTED
         );
 
@@ -1833,17 +1894,21 @@ mod tests {
     async fn sse_disconnect_does_not_swallow_later_messages() {
         // Every past disconnect used to leave a zombie consumer that ate
         // exactly one subsequent message while POST still answered 202.
-        let app = sse_test_app();
+        let (app, sessions) = sse_test_app_parts();
         for _ in 0..3 {
             let (body, session_id) = open_sse_session(&app).await;
             drop(body);
-            // Let the consumer task observe the closed stream and deregister.
-            for _ in 0..50 {
-                tokio::task::yield_now().await;
-                if post_sse_message(&app, &session_id, 0).await == StatusCode::BAD_REQUEST {
-                    break;
-                }
-            }
+            // The consumer must notice the closed stream on its own, without
+            // being handed a message to trip over.
+            await_session_removal(&sessions, &session_id).await;
+            let (status, message) =
+                post_sse_message_with_params(&app, &session_id, 0, Value::Null).await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "the first message after a disconnect was consumed, not rejected"
+            );
+            assert_eq!(message, "unknown session");
         }
 
         let (mut body, session_id) = open_sse_session(&app).await;
@@ -1858,6 +1923,40 @@ mod tests {
             ids,
             vec![1, 2, 3],
             "messages were swallowed after disconnect"
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_disconnect_deregisters_the_session() {
+        // Status codes alone cannot certify deregistration: drop the
+        // `sessions.remove(..)` call and a post to a dead session still
+        // answers 400, just via the "the stream closed between lookup and
+        // send" arm instead of the registry miss. The two are told apart
+        // only by their body, and only the registry itself can show that
+        // the entry is gone rather than merely inert — an unbounded leak
+        // otherwise goes undetected for the lifetime of the process.
+        let (app, sessions) = sse_test_app_parts();
+
+        let (body, session_id) = open_sse_session(&app).await;
+        assert!(
+            sessions.lock().await.contains_key(&session_id),
+            "an open stream must be registered"
+        );
+
+        drop(body);
+        await_session_removal(&sessions, &session_id).await;
+        assert!(
+            sessions.lock().await.is_empty(),
+            "the closed session leaked into the registry"
+        );
+
+        let (status, message) =
+            post_sse_message_with_params(&app, &session_id, 1, Value::Null).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            message, "unknown session",
+            "the rejection must come from the registry miss, not from a send \
+             onto a dropped receiver of a still-registered session"
         );
     }
 
