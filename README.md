@@ -219,6 +219,34 @@ apcore-mcp --extensions-dir ./extensions \
 
 Connect any MCP client to `http://your-host:9000/mcp`.
 
+### SSE transport (deprecated)
+
+`--transport sse` mounts `GET /sse` and `POST /messages/`. Prefer
+streamable HTTP; SSE remains for older clients.
+
+Each `GET /sse` opens an **independent session**. The stream's first frame is
+the MCP `endpoint` event, which carries the URL to post to:
+
+```
+event: endpoint
+data: /messages/?sessionId=1f8c...  <- server-minted, per connection
+```
+
+`POST /messages/` **requires** that `sessionId` query parameter. It names the
+stream that receives the response, so a client must read the `endpoint` event
+before posting; posting to the bare `/messages/` URL returns `400`, as does
+naming a session that is not open. A spec-compliant SSE client already does
+this, and the TypeScript SDK behaves the same way.
+
+Two consequences worth knowing:
+
+- `params._meta.sessionId` is **overwritten** with the connection's own session
+  id on every message. Any value a client sends there is ignored. This is what
+  binds async tasks to the connection, so closing the stream cancels the tasks
+  it launched — and what stops a client naming someone else's session.
+- Closing the stream deregisters the session immediately. A message posted
+  afterwards is rejected rather than silently absorbed.
+
 ## CLI Reference
 
 ```

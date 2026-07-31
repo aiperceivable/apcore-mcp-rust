@@ -113,6 +113,20 @@ async fn explorer_mount_lists_tools_as_json() {
         .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
         .collect();
     assert_eq!(names, vec!["math.add", "text.upper"]);
+
+    // The destructive badge renders from *this* payload, not the detail one:
+    // the explorer page calls `hintsHtml(t.annotations)` while building each
+    // list row. Asserting only the detail endpoint leaves the badge that
+    // warns about a directly-executable destructive tool uncovered.
+    assert_eq!(
+        tools[0]
+            .get("annotations")
+            .and_then(|a| a.get("destructiveHint"))
+            .and_then(Value::as_bool),
+        Some(true),
+        "the tool list must carry annotations; got {:?}",
+        tools[0]
+    );
 }
 
 #[tokio::test]
