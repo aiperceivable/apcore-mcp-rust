@@ -246,6 +246,9 @@ Two consequences worth knowing:
   it launched — and what stops a client naming someone else's session.
 - Closing the stream deregisters the session immediately. A message posted
   afterwards is rejected rather than silently absorbed.
+- Messages on one session are handled concurrently (up to 16 in flight), so a
+  cheap request is not stuck behind an expensive one. **Responses are not
+  guaranteed to arrive in the order posted** — correlate them by JSON-RPC `id`.
 
 ## CLI Reference
 

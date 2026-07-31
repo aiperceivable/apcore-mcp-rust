@@ -782,6 +782,15 @@ struct SseState {
     manager: Arc<TransportManager>,
 }
 
+/// How many messages one SSE session may have in a handler at the same time.
+///
+/// Dispatch is concurrent so a cheap request cannot be stuck behind an
+/// expensive one, but unbounded spawning would let a single connection turn
+/// its 256-message inbound queue into 256 simultaneous handler invocations.
+/// Messages past the limit stay queued; the inbound channel's own capacity
+/// applies backpressure to `POST /messages/` beyond that.
+const MAX_CONCURRENT_SESSION_DISPATCHES: usize = 16;
+
 /// Query parameters accepted by `POST /messages/`.
 #[derive(serde::Deserialize)]
 struct SseMessageQuery {
@@ -839,6 +848,9 @@ fn stamp_session_id(message: &mut Value, session_id: &str) {
 /// intermediaries do not close an idle connection. Every dispatched message is
 /// stamped with this connection's session id (see [`stamp_session_id`]) so
 /// tasks submitted over it are bound to it and can be cancelled on disconnect.
+/// Messages are dispatched concurrently, up to
+/// [`MAX_CONCURRENT_SESSION_DISPATCHES`], so responses may arrive in an order
+/// other than the one the client posted in — JSON-RPC correlates by `id`.
 /// When the client disconnects the session is removed from the registry and its
 /// consumer task exits, so no zombie consumer is left behind to swallow a later
 /// message. Removal is [`SseSessionGuard`]'s `Drop`, so it survives a panic in
@@ -868,6 +880,9 @@ async fn sse_stream_handler(
 
     let handler = state.handler.clone();
     let owned_session_id = session_id.clone();
+    let dispatch_slots = Arc::new(tokio::sync::Semaphore::new(
+        MAX_CONCURRENT_SESSION_DISPATCHES,
+    ));
 
     tokio::spawn(async move {
         let _session_guard = guard;
@@ -883,13 +898,28 @@ async fn sse_stream_handler(
                     inbound = inbound_rx.recv() => {
                         let Some(mut message) = inbound else { break };
                         stamp_session_id(&mut message, &owned_session_id);
-                        if let Some(response) = handler.handle_message(message).await {
-                            let data = serde_json::to_string(&response).unwrap_or_default();
-                            let event = Event::default().event("message").data(data);
-                            if event_tx.send(Ok(event)).await.is_err() {
-                                break;
+                        // Dispatch off the receive loop. Awaiting the handler
+                        // here made the session strictly serial: a pipelined
+                        // `ping` sat behind a 30-second `tools/call`, and so
+                        // did disconnect detection, which delayed TM-4
+                        // cancellation by the same 30 seconds. TypeScript
+                        // dispatches concurrently.
+                        let handler = Arc::clone(&handler);
+                        let event_tx = event_tx.clone();
+                        let slots = Arc::clone(&dispatch_slots);
+                        tokio::spawn(async move {
+                            // Taken inside the task, not in the loop: taking
+                            // it above would put the loop right back to
+                            // waiting on handlers once the session saturates.
+                            let Ok(_permit) = slots.acquire().await else {
+                                return;
+                            };
+                            if let Some(response) = handler.handle_message(message).await {
+                                let data = serde_json::to_string(&response).unwrap_or_default();
+                                let event = Event::default().event("message").data(data);
+                                let _ = event_tx.send(Ok(event)).await;
                             }
-                        }
+                        });
                     }
                 }
             }
@@ -1987,18 +2017,16 @@ mod tests {
             );
         }
 
-        let ids_a = collect_sse_response_ids(&mut body_a, 3).await;
-        let ids_b = collect_sse_response_ids(&mut body_b, 3).await;
-        assert_eq!(
-            ids_a,
-            vec![1, 2, 3],
-            "stream A leaked, lost or reordered responses"
-        );
-        assert_eq!(
-            ids_b,
-            vec![4, 5, 6],
-            "stream B leaked, lost or reordered responses"
-        );
+        // Sorted, because dispatch within a session is concurrent and
+        // responses may complete out of order. Sorting is safe here in a way
+        // it was not before: the round-robin split is {1,3,5}/{2,4,6}, which
+        // does not become {1,2,3}/{4,5,6} under any ordering.
+        let mut ids_a = collect_sse_response_ids(&mut body_a, 3).await;
+        let mut ids_b = collect_sse_response_ids(&mut body_b, 3).await;
+        ids_a.sort_unstable();
+        ids_b.sort_unstable();
+        assert_eq!(ids_a, vec![1, 2, 3], "stream A leaked or lost responses");
+        assert_eq!(ids_b, vec![4, 5, 6], "stream B leaked or lost responses");
 
         // Partial regression guard: isolation restored but the zombie
         // consumer reintroduced. A leaves; its consumer must go with it
@@ -2051,7 +2079,8 @@ mod tests {
                 StatusCode::ACCEPTED
             );
         }
-        let ids = collect_sse_response_ids(&mut body, 3).await;
+        let mut ids = collect_sse_response_ids(&mut body, 3).await;
+        ids.sort_unstable();
         assert_eq!(
             ids,
             vec![1, 2, 3],
@@ -2093,26 +2122,77 @@ mod tests {
         );
     }
 
-    /// A handler that panics on every message, standing in for any bug in
-    /// real tool dispatch.
-    struct PanickingHandler;
+    /// A handler that holds message id 1 until released and answers every
+    /// other id immediately. Stands in for a slow `tools/call` with a cheap
+    /// `ping` pipelined behind it.
+    struct GatedHandler {
+        release: Arc<tokio::sync::Notify>,
+    }
 
     #[async_trait::async_trait]
-    impl McpHandler for PanickingHandler {
-        async fn handle_message(&self, _message: Value) -> Option<Value> {
-            panic!("deliberate handler panic");
+    impl McpHandler for GatedHandler {
+        async fn handle_message(&self, message: Value) -> Option<Value> {
+            let id = message.get("id").cloned().unwrap_or(Value::Null);
+            if id == 1 {
+                self.release.notified().await;
+            }
+            Some(serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": null }))
         }
     }
 
     #[tokio::test]
-    async fn sse_session_teardown_survives_a_handler_panic() {
-        // Teardown used to be two statements after the dispatch loop, which
-        // an unwind walks straight past: the registry entry leaked for the
-        // lifetime of the process and TM-4 cancellation never ran for the
-        // tasks that session had launched. `SseSessionGuard`'s Drop runs
-        // during the unwind instead.
-        //
-        // The panic backtrace this prints to stderr is expected.
+    async fn sse_dispatch_does_not_head_of_line_block_a_session() {
+        // `handle_message` used to be awaited inside the select arm, so one
+        // slow call stalled every later message on that connection — and
+        // stalled disconnect detection with it, delaying TM-4 cancellation
+        // by the full duration of the slow call.
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (app, _sessions) = sse_test_app_parts_with(
+            Arc::new(TransportManager::new(None)),
+            Arc::new(GatedHandler {
+                release: Arc::clone(&release),
+            }),
+        );
+        let (mut body, session_id) = open_sse_session(&app).await;
+
+        // 1 blocks; 2 is posted behind it and must not wait for it.
+        assert_eq!(
+            post_sse_message(&app, &session_id, 1).await,
+            StatusCode::ACCEPTED
+        );
+        assert_eq!(
+            post_sse_message(&app, &session_id, 2).await,
+            StatusCode::ACCEPTED
+        );
+        assert_eq!(
+            collect_sse_response_ids(&mut body, 1).await,
+            vec![2],
+            "a cheap message must overtake a blocked one"
+        );
+
+        // `notify_one` stores a permit, so it cannot be missed if the waiter
+        // has not reached `notified()` yet.
+        release.notify_one();
+        assert_eq!(collect_sse_response_ids(&mut body, 1).await, vec![1]);
+    }
+
+    /// A handler that panics on message id 1 and echoes anything else.
+    struct PanickingHandler;
+
+    #[async_trait::async_trait]
+    impl McpHandler for PanickingHandler {
+        async fn handle_message(&self, message: Value) -> Option<Value> {
+            let id = message.get("id").cloned().unwrap_or(Value::Null);
+            assert_ne!(id, 1, "deliberate handler panic");
+            Some(serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": null }))
+        }
+    }
+
+    /// A `TransportManager` whose cancel handler records the session ids it
+    /// is called with, plus that record.
+    #[allow(clippy::type_complexity)]
+    fn recording_transport_manager() -> (Arc<TransportManager>, Arc<std::sync::Mutex<Vec<String>>>)
+    {
         let cancelled: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(vec![]));
         let recorder = Arc::clone(&cancelled);
         let mut tm = TransportManager::new(None);
@@ -2122,23 +2202,76 @@ mod tests {
                 .unwrap_or_else(|p| p.into_inner())
                 .push(session_id.to_string());
         })));
-        let (app, sessions) = sse_test_app_parts_with(Arc::new(tm), Arc::new(PanickingHandler));
+        (Arc::new(tm), cancelled)
+    }
 
-        let (_body, session_id) = open_sse_session(&app).await;
+    #[test]
+    fn sse_session_guard_deregisters_during_a_panic_unwind() {
+        // Teardown used to be two statements after the dispatch loop, which
+        // an unwind walks straight past: the registry entry would leak for
+        // the lifetime of the process and TM-4 cancellation would never run
+        // for the tasks that session had launched. Drop runs on the unwind
+        // path; straight-line code does not.
+        //
+        // The panic message this prints to stderr is expected.
+        let sessions: SseSessions = Arc::new(std::sync::Mutex::new(Default::default()));
+        let (tm, cancelled) = recording_transport_manager();
+        let (inbound_tx, _inbound_rx) = tokio::sync::mpsc::channel::<Value>(1);
+
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = SseSessionGuard::register(
+                "sess-1".to_string(),
+                Arc::clone(&sessions),
+                Arc::clone(&tm),
+                inbound_tx,
+            );
+            assert!(lock_sessions(&sessions).contains_key("sess-1"));
+            panic!("deliberate panic while the session is registered");
+        }));
+
+        assert!(unwound.is_err(), "the panic must have propagated");
+        assert!(
+            lock_sessions(&sessions).is_empty(),
+            "the session leaked into the registry across an unwind"
+        );
+        assert_eq!(
+            *cancelled.lock().unwrap_or_else(|p| p.into_inner()),
+            vec!["sess-1".to_string()],
+            "TM-4 cancellation must run on the unwind path too"
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_handler_panic_does_not_kill_the_session() {
+        // Concurrent dispatch confines a panicking handler to its own task,
+        // so one bad message no longer takes the whole connection with it —
+        // and teardown still happens, on the guard, when the client leaves.
+        //
+        // The panic message this prints to stderr is expected.
+        let (tm, cancelled) = recording_transport_manager();
+        let (app, sessions) = sse_test_app_parts_with(tm, Arc::new(PanickingHandler));
+
+        let (mut body, session_id) = open_sse_session(&app).await;
         assert_eq!(
             post_sse_message(&app, &session_id, 1).await,
             StatusCode::ACCEPTED
         );
-
-        await_session_removal(&sessions, &session_id).await;
-        assert!(
-            lock_sessions(&sessions).is_empty(),
-            "a panicking handler leaked its session into the registry"
+        assert_eq!(
+            post_sse_message(&app, &session_id, 2).await,
+            StatusCode::ACCEPTED
         );
         assert_eq!(
+            collect_sse_response_ids(&mut body, 1).await,
+            vec![2],
+            "a panic in one dispatch must not stop the session serving others"
+        );
+
+        drop(body);
+        await_session_removal(&sessions, &session_id).await;
+        assert!(lock_sessions(&sessions).is_empty());
+        assert_eq!(
             *cancelled.lock().unwrap_or_else(|p| p.into_inner()),
-            vec![session_id],
-            "TM-4 cancellation must still fire when the handler panics"
+            vec![session_id]
         );
     }
 
