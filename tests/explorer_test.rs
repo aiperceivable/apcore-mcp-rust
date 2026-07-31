@@ -28,27 +28,26 @@ use apcore_mcp::{Authenticator, Identity};
 
 fn sample_tools() -> Vec<ToolInfo> {
     vec![
-        ToolInfo {
-            name: "math.add".to_string(),
-            description: "Add two numbers".to_string(),
-            input_schema: json!({
+        ToolInfo::new(
+            "math.add",
+            "Add two numbers",
+            json!({
                 "type": "object",
                 "properties": {
                     "a": { "type": "number" },
                     "b": { "type": "number" }
                 }
             }),
-            annotations: Some(json!({"destructiveHint": true})),
-        },
-        ToolInfo {
-            name: "text.upper".to_string(),
-            description: "Uppercase a string".to_string(),
-            input_schema: json!({
+        )
+        .with_annotations(json!({"destructiveHint": true})),
+        ToolInfo::new(
+            "text.upper",
+            "Uppercase a string",
+            json!({
                 "type": "object",
                 "properties": { "s": { "type": "string" } }
             }),
-            annotations: None,
-        },
+        ),
     ]
 }
 

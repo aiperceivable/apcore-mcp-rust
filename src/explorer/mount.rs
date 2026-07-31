@@ -21,7 +21,14 @@ use crate::auth::Authenticator;
 // ---------------------------------------------------------------------------
 
 /// Metadata about a single MCP tool, suitable for display in the explorer UI.
+///
+/// Construct one with [`ToolInfo::new`]. The struct is `#[non_exhaustive]`
+/// because it has been extended once already: `annotations` arrived as a
+/// fourth all-`pub` field and, with no constructor, a struct literal was the
+/// only way to build one — so every downstream literal stopped compiling.
+/// Behind `non_exhaustive` plus a constructor, the next field is additive.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct ToolInfo {
     /// The tool's unique name.
     pub name: String,
@@ -37,6 +44,35 @@ pub struct ToolInfo {
     /// direct execution. Left `None`, that warning can never appear.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub annotations: Option<serde_json::Value>,
+}
+
+impl ToolInfo {
+    /// Build the display metadata for one tool, without annotations.
+    ///
+    /// Attach annotations with [`ToolInfo::with_annotations`]; a tool built
+    /// here renders no hint badges, including no destructive-tool warning.
+    pub fn new(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        input_schema: serde_json::Value,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            input_schema,
+            annotations: None,
+        }
+    }
+
+    /// Attach MCP tool annotations (`destructiveHint`, `readOnlyHint`, ...).
+    ///
+    /// These drive the explorer's hint badges, so a destructive tool that is
+    /// also executable from the UI must carry them.
+    #[must_use]
+    pub fn with_annotations(mut self, annotations: serde_json::Value) -> Self {
+        self.annotations = Some(annotations);
+        self
+    }
 }
 
 impl mcp_embedded_ui::Tool for ToolInfo {
@@ -356,19 +392,45 @@ mod tests {
     // -- ToolInfo serialization --------------------------------------------
 
     #[test]
+    fn tool_info_new_leaves_annotations_unset() {
+        // `new` is the constructor `#[non_exhaustive]` makes mandatory for
+        // downstream crates; a tool built without annotations must render no
+        // hint badges rather than fail to build.
+        let tool = ToolInfo::new("add", "Add two numbers", json!({"type": "object"}));
+        assert_eq!(tool.name, "add");
+        assert_eq!(tool.description, "Add two numbers");
+        assert!(tool.annotations.is_none());
+        let serialized = serde_json::to_value(&tool).unwrap();
+        assert!(
+            serialized.get("annotations").is_none(),
+            "an unset annotations field must be omitted from the wire form"
+        );
+    }
+
+    #[test]
+    fn tool_info_with_annotations_attaches_them() {
+        let tool = ToolInfo::new("rm", "Remove a file", json!({"type": "object"}))
+            .with_annotations(json!({"destructiveHint": true}));
+        assert_eq!(
+            tool.annotations,
+            Some(json!({"destructiveHint": true})),
+            "the destructive hint must survive to the explorer UI"
+        );
+    }
+
+    #[test]
     fn tool_info_serializes_with_correct_field_names() {
-        let tool = ToolInfo {
-            name: "add".to_string(),
-            description: "Add two numbers".to_string(),
-            input_schema: json!({
+        let tool = ToolInfo::new(
+            "add",
+            "Add two numbers",
+            json!({
                 "type": "object",
                 "properties": {
                     "a": { "type": "number" },
                     "b": { "type": "number" }
                 }
             }),
-            annotations: None,
-        };
+        );
 
         let serialized = serde_json::to_value(&tool).unwrap();
         assert_eq!(serialized["name"], "add");
@@ -379,12 +441,7 @@ mod tests {
 
     #[test]
     fn tool_info_round_trip() {
-        let tool = ToolInfo {
-            name: "search".to_string(),
-            description: "Search documents".to_string(),
-            input_schema: json!({"type": "object"}),
-            annotations: None,
-        };
+        let tool = ToolInfo::new("search", "Search documents", json!({"type": "object"}));
 
         let json_str = serde_json::to_string(&tool).unwrap();
         let deserialized: ToolInfo = serde_json::from_str(&json_str).unwrap();
@@ -403,18 +460,9 @@ mod tests {
 
     fn sample_tools() -> Vec<ToolInfo> {
         vec![
-            ToolInfo {
-                name: "tool_one".to_string(),
-                description: "First tool".to_string(),
-                input_schema: json!({"type": "object"}),
-                annotations: Some(json!({"destructiveHint": true})),
-            },
-            ToolInfo {
-                name: "tool_two".to_string(),
-                description: "Second tool".to_string(),
-                input_schema: json!({"type": "object"}),
-                annotations: None,
-            },
+            ToolInfo::new("tool_one", "First tool", json!({"type": "object"}))
+                .with_annotations(json!({"destructiveHint": true})),
+            ToolInfo::new("tool_two", "Second tool", json!({"type": "object"})),
         ]
     }
 
