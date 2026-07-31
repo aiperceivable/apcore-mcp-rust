@@ -894,8 +894,17 @@ async fn sse_stream_handler(
                 }
             }
         }
+        // Stop accepting before deregistering. A POST that cloned this
+        // session's sender while it was still registered has not necessarily
+        // run its `send` yet; closing the receiver first makes that send fail
+        // — and the POST answer 400 — instead of queueing a message onto a
+        // consumer that has already stopped. See `sse_messages_handler` for
+        // the window this cannot close.
+        inbound_rx.close();
+        drop(_session_guard);
     });
 
+    tracing::debug!(session_id = %session_id, "sse session opened");
     Sse::new(tokio_stream::wrappers::ReceiverStream::new(event_rx))
         .keep_alive(
             KeepAlive::new()
@@ -917,12 +926,28 @@ async fn sse_stream_handler(
 /// its stream went away between lookup and send. Collapsing them into one
 /// string makes a registry leak untestable, because a leaked entry keeps
 /// answering 400 through the second branch.
+///
+/// # What 202 does and does not promise
+///
+/// 202 means the message was queued to a session that was registered and
+/// still consuming at lookup time. It is not a promise of execution. Lookup
+/// and send cannot be made atomic with the consumer's teardown without holding
+/// the registry lock across `send().await`, which would let one slow session
+/// block every other session's POSTs. The consumer therefore closes its
+/// receiver as its first teardown step, which collapses the window to a
+/// message that lands in the queue in the instant between the consumer leaving
+/// its dispatch loop and that close. Such a message is dropped after a 202.
+///
+/// The exposure is bounded to the disconnecting client's own last message: its
+/// stream is already gone, so there was nowhere to deliver the response
+/// either. The case is logged at `debug` rather than left silent.
 async fn sse_messages_handler(
     axum::extract::State(state): axum::extract::State<SseState>,
     axum::extract::Query(query): axum::extract::Query<SseMessageQuery>,
     axum::Json(body): axum::Json<Value>,
 ) -> axum::response::Response {
     let Some(session_id) = query.session_id else {
+        tracing::debug!("rejected sse message: no sessionId query parameter");
         return (
             StatusCode::BAD_REQUEST,
             "missing sessionId query parameter; use the URL from the endpoint event",
@@ -932,13 +957,17 @@ async fn sse_messages_handler(
 
     let sender = lock_sessions(&state.sessions).get(&session_id).cloned();
     let Some(sender) = sender else {
+        tracing::debug!(session_id = %session_id, "rejected sse message: unknown session");
         return (StatusCode::BAD_REQUEST, "unknown session").into_response();
     };
 
     match sender.send(body).await {
         Ok(()) => StatusCode::ACCEPTED.into_response(),
         // The stream closed between lookup and send.
-        Err(_) => (StatusCode::BAD_REQUEST, "session closed").into_response(),
+        Err(_) => {
+            tracing::debug!(session_id = %session_id, "rejected sse message: session closed mid-send");
+            (StatusCode::BAD_REQUEST, "session closed").into_response()
+        }
     }
 }
 
