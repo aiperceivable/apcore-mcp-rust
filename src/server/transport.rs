@@ -1856,11 +1856,18 @@ mod tests {
 
     #[tokio::test]
     async fn sse_concurrent_sessions_receive_only_their_own_responses() {
-        // Two simultaneous streams, messages interleaved across both: each
-        // stream must see exactly its own ids. The previous implementation
-        // shared one process-global receiver, so responses were handed out
-        // round-robin and one client received another client's tool output.
-        let app = sse_test_app();
+        // Two simultaneous streams. The pre-fix implementation shared one
+        // process-global receiver behind an `Arc<Mutex<..>>` whose guard was
+        // held across `recv().await`; tokio's Mutex is FIFO-fair, so the two
+        // consumers alternated strictly and handed out responses round-robin.
+        //
+        // The ids are therefore posted in *runs* — 1,2,3 to A then 4,5,6 to B
+        // — and asserted unsorted. Round-robin over a shared queue can only
+        // produce the alternating split {1,3,5}/{2,4,6}, so it cannot satisfy
+        // these assertions no matter how the streams are scheduled. (An
+        // interleaved post order plus `sort_unstable()` is satisfied *by* the
+        // bug, which is what the previous version of this test did.)
+        let (app, sessions) = sse_test_app_parts();
         let (mut body_a, session_a) = open_sse_session(&app).await;
         let (mut body_b, session_b) = open_sse_session(&app).await;
         assert_ne!(
@@ -1870,10 +1877,10 @@ mod tests {
 
         for (session, id) in [
             (&session_a, 1),
-            (&session_b, 2),
+            (&session_a, 2),
             (&session_a, 3),
             (&session_b, 4),
-            (&session_a, 5),
+            (&session_b, 5),
             (&session_b, 6),
         ] {
             assert_eq!(
@@ -1882,12 +1889,40 @@ mod tests {
             );
         }
 
-        let mut ids_a = collect_sse_response_ids(&mut body_a, 3).await;
-        let mut ids_b = collect_sse_response_ids(&mut body_b, 3).await;
-        ids_a.sort_unstable();
-        ids_b.sort_unstable();
-        assert_eq!(ids_a, vec![1, 3, 5], "stream A leaked or lost responses");
-        assert_eq!(ids_b, vec![2, 4, 6], "stream B leaked or lost responses");
+        let ids_a = collect_sse_response_ids(&mut body_a, 3).await;
+        let ids_b = collect_sse_response_ids(&mut body_b, 3).await;
+        assert_eq!(
+            ids_a,
+            vec![1, 2, 3],
+            "stream A leaked, lost or reordered responses"
+        );
+        assert_eq!(
+            ids_b,
+            vec![4, 5, 6],
+            "stream B leaked, lost or reordered responses"
+        );
+
+        // Partial regression guard: isolation restored but the zombie
+        // consumer reintroduced. A leaves; its consumer must go with it
+        // unprompted (so the very next post to A is rejected rather than
+        // silently eaten), while B — untouched by A's departure — keeps
+        // working.
+        drop(body_a);
+        await_session_removal(&sessions, &session_a).await;
+        let (status, message) =
+            post_sse_message_with_params(&app, &session_a, 99, Value::Null).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a departed session must stop accepting messages"
+        );
+        assert_eq!(message, "unknown session");
+        assert_eq!(
+            post_sse_message(&app, &session_b, 7).await,
+            StatusCode::ACCEPTED,
+            "one client leaving must not disturb another's session"
+        );
+        assert_eq!(collect_sse_response_ids(&mut body_b, 1).await, vec![7]);
     }
 
     #[tokio::test]
