@@ -65,34 +65,6 @@ pub const META_TOOL_LIST: &str = "__apcore_task_list";
 /// in the world if I called this module?" before executing.
 pub const META_TOOL_PREVIEW: &str = "__apcore_module_preview";
 
-/// Name of the preflight check carrying the ACL verdict. apcore's
-/// `step_to_check_name` maps the `acl_check` pipeline step onto it.
-///
-/// **Not exported by apcore**: `step_to_check_name` is a private function in
-/// `apcore::executor`, so this literal cannot be bound to the source of truth
-/// the way [`INTROSPECTION_CHECK_NAMES`]'s second entry is. A rename upstream
-/// would silently stop this filter matching — no compile error, argv back in
-/// the envelope for a denied caller. `preflight_check_names_match_the_filter_constants`
-/// is the guard: it asks a real `Executor` for a real `PreflightResult` and
-/// fails if any of these three names is no longer emitted.
-const ACL_CHECK_NAME: &str = "acl";
-
-/// Preflight checks that are module-level introspection. apcore runs them
-/// whenever module lookup succeeded, regardless of whether an earlier check
-/// failed, and for a CLI-wrapping module their output names the resolved
-/// binary and the argv that would be executed. They are withheld from a
-/// preview the ACL denied.
-///
-/// `module_preview` is bound to apcore's exported constant, whose own docs ask
-/// callers to use it "instead of the literal string to avoid drift with other
-/// SDKs". `module_preflight` has no such constant — it is a bare literal in
-/// `Executor::validate` — and carries the same drift risk as
-/// [`ACL_CHECK_NAME`], with the same test as its guard.
-const INTROSPECTION_CHECK_NAMES: [&str; 2] = [
-    "module_preflight",
-    apcore::module::MODULE_PREVIEW_CHECK_NAME,
-];
-
 /// Default `AsyncTaskManager` configuration.
 pub const DEFAULT_MAX_CONCURRENT: usize = 10;
 pub const DEFAULT_MAX_TASKS: usize = 1000;
@@ -797,42 +769,62 @@ impl AsyncTaskBridge {
         // returns a structured PreflightResult with valid=false instead.
         let preflight = self.executor.validate(module_id, &inputs, ctx_ref).await?;
 
-        // An ACL denial must short-circuit the envelope. `Executor::validate`
-        // runs the module-level preflight and preview steps "whenever module
-        // lookup succeeded, regardless of whether earlier checks passed", so a
-        // denied caller still got back `predicted_changes` naming the resolved
-        // binary and the full argv. A denial that discloses what was denied is
-        // not a denial, so the disclosing parts are withheld here; the failed
-        // check itself is kept so the caller still learns why.
-        let acl_denied = preflight
+        // PROTOCOL_SPEC §12.8.5.1, implemented upstream in apcore 0.27:
+        // `Executor::validate` MUST NOT invoke the module preflight/preview
+        // hooks when the `acl` check failed, MUST NOT emit their checks, and
+        // MUST leave `predicted_changes` empty. Before 0.27 it ran both hooks
+        // on the strength of module lookup alone, so this bridge filtered the
+        // two introspection checks out of the envelope by string to keep a
+        // denied caller from reading the resolved binary and argv back out of
+        // a preview.
+        //
+        // That filter is deleted rather than kept as a second line of defence.
+        // With the gate upstream it can never be observed to act: no mutation
+        // of it fails a test, which by this branch's own standard makes it
+        // indistinguishable from dead code, and two guards where nobody can
+        // tell which is load-bearing is worse than one that is pinned. What it
+        // protected is asserted directly instead —
+        // `upstream_withholds_module_introspection_from_a_denied_caller` pins
+        // §12.8.5.1 against a real `Executor` (with
+        // `upstream_still_introspects_for_an_allowed_caller` as its control, so
+        // an apcore that stopped introspecting entirely cannot satisfy it for
+        // the wrong reason), and
+        // `preview_meta_tool_withholds_predicted_changes_when_acl_denies` pins
+        // the same property end to end on this envelope.
+        if preflight
             .checks
             .iter()
-            .any(|c| c.check == ACL_CHECK_NAME && !c.passed);
-        if acl_denied {
+            .any(|c| c.check == apcore::module::ACL_CHECK_NAME && !c.passed)
+        {
+            // Operator signal, not a guard: apcore has already emptied the
+            // envelope by this point. Bound to apcore's own constant so a
+            // rename upstream is a compile error rather than a log line that
+            // quietly stops firing.
             tracing::warn!(
                 module_id = %module_id,
-                "module preview denied by ACL; predicted changes withheld"
+                "module preview denied by ACL; apcore withheld module introspection"
             );
         }
 
         let checks: Vec<Value> = preflight
             .checks
             .iter()
-            .filter(|c| !acl_denied || !INTROSPECTION_CHECK_NAMES.contains(&c.check.as_str()))
             .map(preflight_check_to_json)
             .collect();
-        let predicted: Vec<Value> = if acl_denied {
-            Vec::new()
-        } else {
-            preflight
-                .predicted_changes
-                .iter()
-                .map(|c| serde_json::to_value(c).unwrap_or(Value::Null))
-                .collect()
-        };
+        let predicted: Vec<Value> = preflight
+            .predicted_changes
+            .iter()
+            .map(|c| serde_json::to_value(c).unwrap_or(Value::Null))
+            .collect();
         Ok(json!({
-            "valid": preflight.valid && !acl_denied,
-            "requires_approval": preflight.requires_approval && !acl_denied,
+            "valid": preflight.valid,
+            // Reported verbatim, as apcore-python's and apcore-typescript's
+            // bridges both do. It is a property of the module's annotations
+            // rather than of the caller's authorization, and apcore resolves it
+            // *before* the §12.8.5.1 gate — so masking it on a denial made this
+            // the one SDK of three answering `false` where the others answer
+            // `true`, for a bit that discloses nothing about the call.
+            "requires_approval": preflight.requires_approval,
             "predicted_changes": predicted,
             "checks": checks,
         }))
@@ -1408,9 +1400,15 @@ mod tests {
     }
 
     /// An executor holding `demo.destructive`, with an ACL that denies every
-    /// caller. Shared by the disclosure test and the check-name drift test so
-    /// both observe the same real `PreflightResult`.
+    /// caller.
     fn destructive_module_executor_denying_all() -> apcore::executor::Executor {
+        destructive_module_executor("deny")
+    }
+
+    /// An executor holding `demo.destructive` behind a single ACL rule that
+    /// applies `effect` to every caller. Shared by the denial tests and their
+    /// allow-control so all of them observe the same real `PreflightResult`.
+    fn destructive_module_executor(effect: &str) -> apcore::executor::Executor {
         let registry = Arc::new(Registry::default());
         let descriptor = apcore::registry::ModuleDescriptor {
             module_id: "demo.destructive".to_string(),
@@ -1440,8 +1438,8 @@ mod tests {
             vec![apcore::ACLRule {
                 callers: vec!["*".to_string()],
                 targets: vec!["demo.destructive".to_string()],
-                effect: "deny".to_string(),
-                description: Some("deny the destructive demo".to_string()),
+                effect: effect.to_string(),
+                description: Some(format!("{effect} the destructive demo")),
                 conditions: None,
             }],
             "allow",
@@ -1454,15 +1452,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn preflight_check_names_match_the_filter_constants() {
-        // The ACL disclosure filter matches three check names by string.
-        // Only `module_preview` has an exported constant in apcore;
-        // `acl` comes from a private `step_to_check_name` and
-        // `module_preflight` is a bare literal in `Executor::validate`. A
-        // rename upstream produces no compile error and no failure in the
-        // disclosure test — the filter would simply stop matching and argv
-        // would flow back to a denied caller. This test asks a real
-        // executor what it actually emits, so drift fails loudly here.
+    async fn upstream_withholds_module_introspection_from_a_denied_caller() {
+        // PROTOCOL_SPEC §12.8.5.1, implemented in apcore 0.27. This bridge no
+        // longer filters its own envelope, so the security property is
+        // upstream's to keep and this is the test that notices if it stops.
+        // The check names are read from apcore's own `pub const`s, so a rename
+        // upstream is a compile error here instead of a literal that quietly
+        // stops matching — the failure mode the deleted runtime guard existed
+        // to catch, now caught by the compiler.
         let executor = destructive_module_executor_denying_all();
         let preflight = executor
             .validate("demo.destructive", &json!({}), None)
@@ -1470,16 +1467,71 @@ mod tests {
             .expect("validate must return a structured result");
 
         let emitted: Vec<&str> = preflight.checks.iter().map(|c| c.check.as_str()).collect();
-        for expected in std::iter::once(ACL_CHECK_NAME).chain(INTROSPECTION_CHECK_NAMES) {
+
+        // The denial itself still comes back, so a denied caller learns why.
+        assert!(
+            preflight
+                .checks
+                .iter()
+                .any(|c| c.check == apcore::module::ACL_CHECK_NAME && !c.passed),
+            "the failed acl check must survive the gate: {emitted:?}"
+        );
+        // Neither module-authored hook may have run, nor been reported.
+        for withheld in [
+            apcore::module::MODULE_PREFLIGHT_CHECK_NAME,
+            apcore::module::MODULE_PREVIEW_CHECK_NAME,
+        ] {
             assert!(
-                emitted.contains(&expected),
-                "apcore no longer emits a preflight check named '{expected}'. The \
-                 __apcore_module_preview ACL disclosure filter matches on it by \
-                 string; update ACL_CHECK_NAME / INTROSPECTION_CHECK_NAMES to the \
-                 new name, or the filter silently stops withholding argv from a \
-                 denied caller. Emitted: {emitted:?}"
+                !emitted.contains(&withheld),
+                "§12.8.5.1: '{withheld}' must not be emitted for an ACL-denied \
+                 caller — apcore ran module-authored introspection for a caller \
+                 it had just denied, and this bridge no longer filters it out. \
+                 Emitted: {emitted:?}"
             );
         }
+        assert!(
+            preflight.predicted_changes.is_empty(),
+            "§12.8.5.1: predicted_changes must be empty for an ACL-denied caller"
+        );
+        // Control on the other half of the envelope decision: the gate does
+        // NOT suppress `requires_approval`, because apcore resolves it from the
+        // descriptor's annotations before the ACL check runs. `handle_preview`
+        // reports it verbatim for exactly that reason.
+        assert!(
+            preflight.requires_approval,
+            "requires_approval is a module property and survives a denial"
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_still_introspects_for_an_allowed_caller() {
+        // Control for the test above. Without it, an apcore that stopped
+        // running preflight()/preview() altogether would satisfy every denial
+        // assertion for entirely the wrong reason, and this bridge would serve
+        // an empty preview envelope to every caller with its suite still green.
+        // Mirrors the control case in apcore's own
+        // `conformance/fixtures/preflight_disclosure.json`, which exists for
+        // this reason.
+        let executor = destructive_module_executor("allow");
+        let preflight = executor
+            .validate("demo.destructive", &json!({}), None)
+            .await
+            .expect("validate must return a structured result");
+
+        let emitted: Vec<&str> = preflight.checks.iter().map(|c| c.check.as_str()).collect();
+        for expected in [
+            apcore::module::MODULE_PREFLIGHT_CHECK_NAME,
+            apcore::module::MODULE_PREVIEW_CHECK_NAME,
+        ] {
+            assert!(
+                emitted.contains(&expected),
+                "an allowed caller must still receive '{expected}': {emitted:?}"
+            );
+        }
+        assert!(
+            !preflight.predicted_changes.is_empty(),
+            "an allowed caller must still receive predicted_changes"
+        );
     }
 
     #[tokio::test]
@@ -1514,9 +1566,14 @@ mod tests {
 
         // Nothing that names the resolved binary or the argv may survive it.
         assert_eq!(result.get("valid").and_then(Value::as_bool), Some(false));
+        // `requires_approval` is deliberately NOT masked. It reports a property
+        // of the module's annotations, not a fact about the denied call, and
+        // apcore-python and apcore-typescript both pass it through — masking it
+        // here made Rust the only SDK of three answering `false`.
         assert_eq!(
             result.get("requires_approval").and_then(Value::as_bool),
-            Some(false)
+            Some(true),
+            "requires_approval must pass through a denial, matching the peer SDKs"
         );
         assert_eq!(
             result
@@ -1534,7 +1591,10 @@ mod tests {
             .iter()
             .filter_map(|c| c.get("check").and_then(Value::as_str))
             .collect();
-        for withheld in INTROSPECTION_CHECK_NAMES {
+        for withheld in [
+            apcore::module::MODULE_PREFLIGHT_CHECK_NAME,
+            apcore::module::MODULE_PREVIEW_CHECK_NAME,
+        ] {
             assert!(
                 !surviving.contains(&withheld),
                 "'{withheld}' must be withheld from a denied preview: {surviving:?}"
