@@ -3875,4 +3875,197 @@ mod tests {
             "the rejection must say why: {rendered}"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Reaching elicitation the way a transport does (apexe#29)
+    // -----------------------------------------------------------------------
+
+    /// Stands in for the transport's outbound half.
+    ///
+    /// Records the prompt and answers it as a user would. Answering from
+    /// inside `send` keeps the test free of polling without weakening it: the
+    /// pending entry is registered before the write, so a reply this prompt
+    /// must still find its waiter.
+    struct ScriptedSink {
+        prompts: Arc<std::sync::Mutex<Vec<String>>>,
+        session: std::sync::Mutex<std::sync::Weak<crate::server::session::McpSession>>,
+        action: &'static str,
+    }
+
+    impl ScriptedSink {
+        fn new(prompts: Arc<std::sync::Mutex<Vec<String>>>, action: &'static str) -> Arc<Self> {
+            Arc::new(Self {
+                prompts,
+                session: std::sync::Mutex::new(std::sync::Weak::new()),
+                action,
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::server::session::OutboundSink for ScriptedSink {
+        async fn send(&self, message: Value) -> Result<(), crate::server::session::SessionError> {
+            self.prompts.lock().expect("prompt sink").push(
+                message["params"]["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+            let session = self.session.lock().expect("session slot").upgrade();
+            if let Some(session) = session {
+                session.try_take_response(&json!({
+                    "jsonrpc": "2.0",
+                    "id": message["id"],
+                    "result": { "action": self.action },
+                }));
+            }
+            Ok(())
+        }
+    }
+
+    /// Register a capability-declaring session under `id` on `router`.
+    fn register_session(
+        router: &crate::server::router::ExecutionRouter,
+        id: &str,
+        action: &'static str,
+    ) -> Arc<std::sync::Mutex<Vec<String>>> {
+        let prompts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = ScriptedSink::new(Arc::clone(&prompts), action);
+        let session = Arc::new(crate::server::session::McpSession::new(
+            id,
+            Arc::clone(&sink) as Arc<dyn crate::server::session::OutboundSink>,
+        ));
+        *sink.session.lock().expect("session slot") = Arc::downgrade(&session);
+        session.set_client_capabilities(json!({ "elicitation": {} }));
+        router.session_registry().insert(session);
+        prompts
+    }
+
+    #[tokio::test]
+    async fn test_elicitation_is_reachable_from_a_transport_dispatched_call() {
+        // The tests above hand the router a session directly, which only an
+        // SDK caller can do. A transport cannot: `handle_call` receives a
+        // plain JSON `_meta` and nothing else, and a `Value` cannot carry a
+        // trait object — so the session slot was hard-coded `None` and
+        // `apcore-mcp serve` could not prompt however well the library half
+        // worked. This drives the same shipping stack through that path.
+        let executed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let router = gated_router(Arc::clone(&executed));
+        let prompts = register_session(&router, "sess-1", "accept");
+
+        let extra = json!({ "sessionId": "sess-1" });
+        let (content, is_error, _) = router
+            .handle_call("demo.gated", &json!({}), Some(&extra))
+            .await;
+
+        let rendered = rendered(&content);
+        assert!(!is_error, "an approved call must succeed, got: {rendered}");
+        let recorded = prompts.lock().expect("prompt sink").clone();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "the session id alone must be enough to reach the client: {recorded:?}"
+        );
+        assert!(
+            recorded[0].contains("demo.gated"),
+            "the prompt must name the module: {}",
+            recorded[0]
+        );
+        assert!(
+            executed.load(std::sync::atomic::Ordering::SeqCst),
+            "the module body must run once approval was granted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_transport_dispatched_decline_blocks_the_module() {
+        // The accept test alone would pass against a stub that approved
+        // everything without reading the answer.
+        let executed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let router = gated_router(Arc::clone(&executed));
+        let prompts = register_session(&router, "sess-1", "decline");
+
+        let extra = json!({ "sessionId": "sess-1" });
+        let (content, is_error, _) = router
+            .handle_call("demo.gated", &json!({}), Some(&extra))
+            .await;
+
+        assert!(is_error, "a declined approval must fail the call");
+        assert_eq!(prompts.lock().expect("prompt sink").len(), 1);
+        assert!(
+            !executed.load(std::sync::atomic::Ordering::SeqCst),
+            "the module body must NOT run when the user declined"
+        );
+        assert!(
+            rendered(&content).contains("decline"),
+            "the denial must carry the user's action: {}",
+            rendered(&content)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_the_nested_meta_shape_resolves_the_same_session() {
+        // `handle_call` sees two extra shapes in practice: the `params._meta`
+        // object the transport passes straight through, and an SDK wrapper
+        // with `_meta` nested inside. Both must resolve, or elicitation works
+        // on one caller and silently does not on the other.
+        let executed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let router = gated_router(Arc::clone(&executed));
+        let prompts = register_session(&router, "sess-1", "accept");
+
+        let extra = json!({ "_meta": { "sessionId": "sess-1" } });
+        let (_content, is_error, _) = router
+            .handle_call("demo.gated", &json!({}), Some(&extra))
+            .await;
+
+        assert!(!is_error);
+        assert_eq!(prompts.lock().expect("prompt sink").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_a_call_reaches_only_its_own_session() {
+        // Two live connections. A prompt raised by one must not be delivered
+        // to the other — the same confidentiality property the SSE session
+        // isolation work established, now for the server-to-client direction.
+        let executed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let router = gated_router(Arc::clone(&executed));
+        let prompts_a = register_session(&router, "sess-a", "accept");
+        let prompts_b = register_session(&router, "sess-b", "accept");
+
+        let extra = json!({ "sessionId": "sess-a" });
+        let (_content, is_error, _) = router
+            .handle_call("demo.gated", &json!({}), Some(&extra))
+            .await;
+
+        assert!(!is_error);
+        assert_eq!(prompts_a.lock().expect("prompt sink").len(), 1);
+        assert!(
+            prompts_b.lock().expect("prompt sink").is_empty(),
+            "another connection was prompted for a call it never made"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_an_unknown_session_id_still_rejects_cleanly() {
+        // A stale or forged id must fail closed, exactly as no session does.
+        let executed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let router = gated_router(Arc::clone(&executed));
+        register_session(&router, "sess-1", "accept");
+
+        let extra = json!({ "sessionId": "no-such-session" });
+        let (content, is_error, _) = router
+            .handle_call("demo.gated", &json!({}), Some(&extra))
+            .await;
+
+        assert!(is_error, "an unresolvable session must not approve a call");
+        assert!(
+            !executed.load(std::sync::atomic::Ordering::SeqCst),
+            "the module body must NOT run"
+        );
+        assert!(
+            rendered(&content).contains("No elicitation callback available"),
+            "the rejection must say why: {}",
+            rendered(&content)
+        );
+    }
 }

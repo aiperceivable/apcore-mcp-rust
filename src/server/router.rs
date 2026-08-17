@@ -23,6 +23,7 @@ use crate::helpers::{ElicitResult, MCP_ELICIT_CALL_ID_KEY, MCP_ELICIT_KEY, MCP_P
 use crate::server::approval_bridge::ApprovalBridge;
 use crate::server::async_task_bridge::AsyncTaskBridge;
 use crate::server::elicit_registry::ElicitGuard;
+use crate::server::session::SessionRegistry;
 
 /// A boxed stream of result chunks from a streaming executor.
 pub type StreamResult = Pin<Box<dyn Stream<Item = Result<Value, ExecutorError>> + Send>>;
@@ -407,6 +408,15 @@ pub struct ExecutionRouter {
     /// Transport layer should forward inbound MCP
     /// `notifications/cancelled` to `router.cancel(call_id, reason)`.
     cancel_tokens: std::sync::Arc<std::sync::Mutex<HashMap<String, std::sync::Arc<CancelToken>>>>,
+    /// Live MCP sessions, shared with the transport layer.
+    ///
+    /// [`extract_extra`](Self::extract_extra) consults it to turn the session
+    /// id stamped onto an inbound message back into the connection that
+    /// message arrived on. That lookup is what makes elicitation reachable
+    /// from a transport-dispatched tool call: `CallExtra.session` used to be
+    /// unconditionally `None` because a plain JSON `_meta` cannot carry a
+    /// trait object, so no server-initiated request could ever be addressed.
+    session_registry: Arc<SessionRegistry>,
 }
 
 /// [B-002] Maximum number of cancel-token entries (active + tombstones)
@@ -456,6 +466,7 @@ impl ExecutionRouter {
             async_bridge: None,
             approval_bridge: None,
             cancel_tokens: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            session_registry: Arc::new(SessionRegistry::new()),
         }
     }
 
@@ -479,6 +490,7 @@ impl ExecutionRouter {
             async_bridge: None,
             approval_bridge: None,
             cancel_tokens: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            session_registry: Arc::new(SessionRegistry::new()),
         }
     }
 
@@ -505,6 +517,7 @@ impl ExecutionRouter {
             async_bridge: None,
             approval_bridge: None,
             cancel_tokens: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            session_registry: Arc::new(SessionRegistry::new()),
         }
     }
 
@@ -924,7 +937,7 @@ impl ExecutionRouter {
         );
 
         // Extract streaming helpers and identity from extra
-        let (progress_token, send_notification, session, identity) = Self::extract_extra(extra);
+        let (progress_token, send_notification, session, identity) = self.extract_extra(extra);
 
         // Resolve version_hint via the spec's 3-source cascade: [A-D-006]
         //   1. extras.version_hint  (SDK caller-supplied, highest priority)
@@ -1060,7 +1073,7 @@ impl ExecutionRouter {
         }
 
         // Re-extract after building context (we moved them into CallExtra)
-        let (progress_token, send_notification, _, _) = Self::extract_extra(extra);
+        let (progress_token, send_notification, _, _) = self.extract_extra(extra);
 
         // Pre-execution validation. catch_unwind guards against panics from
         // third-party executor implementations (symmetric with validate_tool's
@@ -1126,11 +1139,37 @@ impl ExecutionRouter {
         }
     }
 
+    /// Read the session id the transport stamped onto an inbound message.
+    ///
+    /// Accepts both shapes the extra `Value` takes in practice: the
+    /// `params._meta` object the transport dispatch path passes straight
+    /// through, and the wrapper object an SDK caller builds with `_meta`
+    /// nested inside it.
+    fn session_id_from_extra(extra: Option<&Value>) -> Option<&str> {
+        let extra = extra?;
+        extra
+            .get("sessionId")
+            .or_else(|| extra.get("_meta").and_then(|meta| meta.get("sessionId")))
+            .and_then(Value::as_str)
+    }
+
     /// Extract progress_token, send_notification, session, and identity from
     /// the extra `Value`. Returns `(None, None, None, None)` when extra is
     /// `None`.
+    ///
+    /// `send_notification` stays `None`: it is a closure, and a plain JSON
+    /// `Value` cannot carry one. `session` no longer does. The transport
+    /// stamps its session id onto every inbound message
+    /// ([`stamp_session_id`]), and the live connection behind that id lives in
+    /// [`SessionRegistry`] — so the trait object is recovered by lookup rather
+    /// than by deserialization. Without this the `session` slot was
+    /// hard-coded `None`, which is why an interactive approval prompt could
+    /// never reach a client (apexe#29).
+    ///
+    /// [`stamp_session_id`]: crate::server::transport
     #[allow(clippy::type_complexity)]
     fn extract_extra(
+        &self,
         extra: Option<&Value>,
     ) -> (
         Option<ProgressToken>,
@@ -1151,8 +1190,20 @@ impl ExecutionRouter {
             }
         });
 
-        // send_notification and session cannot be extracted from plain JSON
-        (progress_token, None, None, identity)
+        let session = Self::session_id_from_extra(extra)
+            .and_then(|id| self.session_registry.get(id))
+            .map(|session| -> Arc<dyn SessionHandle> { session });
+
+        (progress_token, None, session, identity)
+    }
+
+    /// The registry of live sessions this router resolves elicitation through.
+    ///
+    /// The transport layer registers each connection here; handing out the
+    /// `Arc` is how the two sides come to share one map without the transport
+    /// needing a reference to the router.
+    pub fn session_registry(&self) -> Arc<SessionRegistry> {
+        Arc::clone(&self.session_registry)
     }
 
     /// Handle an MCP tool call with a typed `CallExtra`.
@@ -2206,6 +2257,7 @@ mod tests {
             async_bridge: None,
             approval_bridge: None,
             cancel_tokens: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            session_registry: Arc::new(SessionRegistry::new()),
         };
         let result = router.format_result(&json!({"a": 1, "b": 2}));
         assert_eq!(result, "custom: 2 keys");
@@ -2226,6 +2278,7 @@ mod tests {
             async_bridge: None,
             approval_bridge: None,
             cancel_tokens: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            session_registry: Arc::new(SessionRegistry::new()),
         };
         // Non-object values should fall back to JSON
         assert_eq!(router.format_result(&json!("string")), r#""string""#);
@@ -2248,6 +2301,7 @@ mod tests {
             async_bridge: None,
             approval_bridge: None,
             cancel_tokens: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            session_registry: Arc::new(SessionRegistry::new()),
         };
         // Should fall back to JSON when formatter returns an error
         let result = router.format_result(&json!({"key": "value"}));

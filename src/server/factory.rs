@@ -507,6 +507,12 @@ impl MCPServerFactory {
     ) {
         let tools = Arc::new(tools);
 
+        // Share the router's session registry with the transport layer. The
+        // transport registers each connection into it; the router resolves a
+        // connection back out of it when a tool call needs to elicit. Without
+        // this the two halves hold separate empty maps and every lookup misses.
+        server.session_registry = Some(router.session_registry());
+
         // list_tools handler: returns a clone of the tools list
         let tools_clone = Arc::clone(&tools);
         server.list_tools_handler = Some(Arc::new(move || tools_clone.as_ref().clone()));

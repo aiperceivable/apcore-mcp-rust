@@ -279,6 +279,15 @@ pub struct MCPServer {
     pub(crate) list_resources_handler: Option<Arc<dyn Fn() -> Vec<Resource> + Send + Sync>>,
     /// Handler for `read_resource` requests.
     pub(crate) read_resource_handler: Option<ReadResourceHandler>,
+    /// Registry of live sessions, shared with the [`ExecutionRouter`] that
+    /// backs `call_tool_handler`. Populated by
+    /// [`MCPServerFactory::register_handlers`]; handed to [`ServerHandler`] so
+    /// the transport can register each connection and the router can resolve
+    /// it again when a tool call needs to elicit.
+    ///
+    /// [`ExecutionRouter`]: crate::server::router::ExecutionRouter
+    /// [`MCPServerFactory::register_handlers`]: crate::server::factory::MCPServerFactory::register_handlers
+    pub(crate) session_registry: Option<Arc<crate::server::session::SessionRegistry>>,
 
     // --- Lifecycle state ---
     /// Handle for the spawned server task.
@@ -297,6 +306,7 @@ impl MCPServer {
             call_tool_handler: None,
             list_resources_handler: None,
             read_resource_handler: None,
+            session_registry: None,
             join_handle: None,
             shutdown_tx: None,
         }
@@ -314,6 +324,7 @@ impl MCPServer {
             call_tool_handler: None,
             list_resources_handler: None,
             read_resource_handler: None,
+            session_registry: None,
             join_handle: None,
             shutdown_tx: None,
         }
@@ -571,6 +582,11 @@ pub struct ServerHandler {
     /// cancellation to the [`AsyncTaskBridge`].
     #[allow(clippy::type_complexity)]
     cancel_handler: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+    /// Live sessions, shared with the router behind `call_tool`. Surfaced to
+    /// the transport via [`McpHandler::session_registry`].
+    ///
+    /// [`McpHandler::session_registry`]: crate::server::transport::McpHandler::session_registry
+    session_registry: Option<Arc<crate::server::session::SessionRegistry>>,
 }
 
 impl ServerHandler {
@@ -587,6 +603,7 @@ impl ServerHandler {
             read_resource: server.read_resource_handler.clone(),
             init_options,
             cancel_handler: None,
+            session_registry: server.session_registry.clone(),
         })
     }
 
@@ -616,10 +633,53 @@ impl ServerHandler {
             message: message.into(),
         }
     }
+
+    /// Record the client's advertised capabilities against the session the
+    /// `initialize` request arrived on.
+    ///
+    /// MCP declares client capabilities exactly once, in `initialize`, and a
+    /// server must not send `elicitation/create` to a client that never
+    /// advertised `elicitation`. The declaration is therefore remembered per
+    /// connection, keyed by the session id the transport stamped onto the
+    /// message. A session that is never told stays at "unsupported", which is
+    /// the safe direction: an approval that cannot be prompted for is denied
+    /// rather than left hanging on an answer that will not come.
+    ///
+    /// Silently a no-op when any link is missing — no registry (a handler
+    /// without a server-to-client half), no session id (a transport that does
+    /// not stamp one), or no live session under that id.
+    fn record_client_capabilities(&self, message: &Value) {
+        let Some(registry) = self.session_registry.as_ref() else {
+            return;
+        };
+        let Some(params) = message.get("params") else {
+            return;
+        };
+        let Some(session_id) = params
+            .get("_meta")
+            .and_then(|meta| meta.get("sessionId"))
+            .and_then(|v| v.as_str())
+        else {
+            return;
+        };
+        let Some(session) = registry.get(session_id) else {
+            return;
+        };
+        session.set_client_capabilities(
+            params
+                .get("capabilities")
+                .cloned()
+                .unwrap_or_else(|| Value::Object(Default::default())),
+        );
+    }
 }
 
 #[async_trait::async_trait]
 impl crate::server::transport::McpHandler for ServerHandler {
+    fn session_registry(&self) -> Option<Arc<crate::server::session::SessionRegistry>> {
+        self.session_registry.clone()
+    }
+
     async fn handle_message(&self, message: Value) -> Option<Value> {
         let id = message.get("id").cloned();
 
@@ -639,7 +699,9 @@ impl crate::server::transport::McpHandler for ServerHandler {
             };
 
         let result = match method.as_str() {
-            "initialize" => RpcResult::Success(serde_json::json!({
+            "initialize" => {
+                self.record_client_capabilities(&message);
+                RpcResult::Success(serde_json::json!({
                 "capabilities": {
                     "tools": { "listChanged": true },
                     "resources": { "listChanged": false }
@@ -649,7 +711,8 @@ impl crate::server::transport::McpHandler for ServerHandler {
                     "version": self.init_options.server_version
                 },
                 "protocolVersion": "2025-03-26"
-            })),
+                }))
+            }
             "tools/list" => {
                 let tools = (self.list_tools)();
                 let tools_json: Vec<Value> = tools
@@ -1389,6 +1452,7 @@ mod tests {
             }) as Pin<Box<dyn std::future::Future<Output = CallToolResult> + Send>>
         });
         ServerHandler {
+            session_registry: None,
             list_tools,
             call_tool,
             list_resources: None,

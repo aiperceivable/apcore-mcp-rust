@@ -41,10 +41,15 @@ regex = "1"
 strum = "0.26"
 strum_macros = "0.26"
 uuid = { version = "1", features = ["v4", "serde"] }
-tokio-stream = "0.1"
+# `io-util` supplies `wrappers::LinesStream`, whose `next()` is
+# cancellation-safe — the stdio transport reads through it inside a `select!`.
+tokio-stream = { version = "0.1", features = ["io-util"] }
 futures = "0.3"
 
 [dev-dependencies]
+# `test-util` supplies the paused clock, so a timeout test asserts the
+# timeout rather than sleeping for it.
+tokio = { version = "1", features = ["full", "test-util"] }
 chrono = { version = "0.4", features = ["serde"] }
 tower = { version = "0.5", features = ["util"] }
 tempfile = "3"
