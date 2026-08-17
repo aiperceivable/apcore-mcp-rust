@@ -496,9 +496,15 @@ impl MCPServerFactory {
     /// The `call_tool` handler delegates to the router's `handle_call` method,
     /// extracting progress token and identity from the extra context.
     ///
-    /// Since there is no Rust MCP SDK yet, handlers are stored as closures
-    /// on the `MCPServer` struct. The transport layer will invoke these
-    /// when processing MCP protocol messages.
+    /// Handlers are stored as closures on the `MCPServer` struct and invoked by
+    /// this crate's own transport layer when processing MCP protocol messages.
+    ///
+    /// This arrangement dates from a time when no Rust MCP SDK existed. One
+    /// does now — `rmcp`, from the same organisation that publishes the Python
+    /// and TypeScript SDKs the sibling bridges use — and the plan is to move
+    /// onto it. See "Planned: migration to rmcp" in
+    /// `docs/features/transport.md` for what migrates, what stays hand-rolled,
+    /// and the prerequisites.
     pub fn register_handlers(
         &self,
         server: &mut MCPServer,
@@ -612,8 +618,9 @@ impl MCPServerFactory {
     /// availability while still preferring the dedicated field. Python and
     /// TypeScript both use `descriptor.documentation`. [A-D-013]
     ///
-    /// Since there is no Rust MCP SDK yet, handlers are stored as closures
-    /// on the `MCPServer` struct.
+    /// Handlers are stored as closures on the `MCPServer` struct; see
+    /// [`register_handlers`](Self::register_handlers) for why, and for the
+    /// planned move onto `rmcp`.
     pub fn register_resource_handlers(&self, server: &mut MCPServer, registry: &Registry) {
         // Build docs map: module_id -> documentation (preferred) or description (fallback)
         let mut docs_map: HashMap<String, String> = HashMap::new();
