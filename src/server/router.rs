@@ -19,9 +19,10 @@ use apcore::trace_context::{TraceContext, TraceParent};
 use apcore::CancelToken;
 
 use crate::auth::middleware::AUTH_IDENTITY;
-use crate::helpers::{ElicitResult, MCP_ELICIT_KEY, MCP_PROGRESS_KEY};
+use crate::helpers::{ElicitResult, MCP_ELICIT_CALL_ID_KEY, MCP_ELICIT_KEY, MCP_PROGRESS_KEY};
 use crate::server::approval_bridge::ApprovalBridge;
 use crate::server::async_task_bridge::AsyncTaskBridge;
+use crate::server::elicit_registry::ElicitGuard;
 
 /// A boxed stream of result chunks from a streaming executor.
 pub type StreamResult = Pin<Box<dyn Stream<Item = Result<Value, ExecutorError>> + Send>>;
@@ -143,6 +144,41 @@ pub trait Executor: Send + Sync {
         None
     }
 
+    /// Execute a module with the caller's typed apcore [`Context`], returning
+    /// `None` when this executor cannot accept one.
+    ///
+    /// # Why a typed context is needed at all
+    ///
+    /// The rest of this trait is deliberately apcore-agnostic: it passes the
+    /// context as JSON so a non-apcore executor can implement it. But JSON is
+    /// a copy. apcore's `Context.data` is an `Arc<RwLock<..>>` shared by
+    /// `clone()` and `child()` all the way down to the `ApprovalRequest` an
+    /// `ApprovalHandler` receives, and that sharing is the only channel by
+    /// which a per-call value written by the router can reach the handler.
+    /// Serializing the context loses it — apcore's own docs note that
+    /// deserialization creates a fresh `Arc`.
+    ///
+    /// Without this, `ApcoreExecutorAdapter` passed `None` for the context and
+    /// apcore fabricated an anonymous one, so everything the router wrote (the
+    /// elicit call id, and the resolved identity with it) was discarded before
+    /// the approval gate ran. See [`crate::server::elicit_registry`].
+    ///
+    /// `want_trace` folds the traced and untraced paths into one method rather
+    /// than doubling the trait. The returned trace is `Some` only when it was
+    /// asked for and the executor produced one.
+    ///
+    /// [`Context`]: apcore::Context
+    async fn call_typed(
+        &self,
+        _module_id: &str,
+        _inputs: &Value,
+        _context: &apcore::Context<Value>,
+        _version_hint: Option<&str>,
+        _want_trace: bool,
+    ) -> Option<Result<(Value, Option<Value>), ExecutorError>> {
+        None
+    }
+
     /// Return the descriptor-default version hint for `module_id`, if any.
     ///
     /// Used by [`ExecutionRouter::handle_call`] as the lowest-priority
@@ -159,6 +195,40 @@ pub trait Executor: Send + Sync {
 // ---------------------------------------------------------------------------
 // Task 2: deep_merge
 // ---------------------------------------------------------------------------
+
+/// Everything [`ExecutionRouter::build_context`] produces for one call.
+///
+/// `.3` is the elicit guard and MUST be bound for the life of the dispatch;
+/// see [`ExecutionRouter::build_context`] for why a bare `_` reintroduces the
+/// bug it exists to prevent.
+type BuiltContext = (
+    Value,
+    HashMap<String, Box<dyn std::any::Any + Send + Sync>>,
+    apcore::Context<Value>,
+    Option<ElicitGuard>,
+);
+
+/// Build the per-call [`ElicitCallback`] that forwards to the MCP session.
+///
+/// Extracted because the callback is needed twice per call — once for the
+/// legacy side-channel map and once for the registry an `ApprovalHandler`
+/// reads — and the two must behave identically. A closure is not `Clone`, so
+/// sharing one instance is not an option; sharing the constructor is.
+fn make_elicit_callback(session: Arc<dyn SessionHandle>) -> crate::helpers::ElicitCallback {
+    Box::new(move |message, requested_schema| {
+        let session = Arc::clone(&session);
+        Box::pin(async move {
+            let schema = requested_schema.unwrap_or(serde_json::json!({}));
+            match session.elicit_form(&message, &schema).await {
+                Ok(result) => Some(result),
+                Err(e) => {
+                    tracing::warn!("Elicitation request failed: {e}");
+                    None
+                }
+            }
+        })
+    })
+}
 
 /// Maximum recursion depth for [`deep_merge`].
 const DEEP_MERGE_MAX_DEPTH: usize = 32;
@@ -898,7 +968,10 @@ impl ExecutionRouter {
             identity,
             typed_identity: None,
         };
-        let (context_value, _context_data, apcore_ctx) =
+        // `_elicit_guard` keeps the registered elicit callback alive for the
+        // whole dispatch below. Binding it to a bare `_` would drop it here and
+        // deregister the callback before the approval gate ever runs.
+        let (context_value, _context_data, apcore_ctx, _elicit_guard) =
             Self::build_context_with_trace(&call_extra, trace_parent.clone(), Some(cancel_token));
 
         // Short-circuit the `__apcore_approval_check` meta-tool via the
@@ -1038,6 +1111,7 @@ impl ExecutionRouter {
                 sn,
                 Some(&context_value),
                 version_hint.as_deref(),
+                Some(&apcore_ctx),
             )
             .await
         } else {
@@ -1046,6 +1120,7 @@ impl ExecutionRouter {
                 arguments,
                 Some(&context_value),
                 version_hint.as_deref(),
+                Some(&apcore_ctx),
             )
             .await
         }
@@ -1106,7 +1181,8 @@ impl ExecutionRouter {
         });
 
         // Build per-call context
-        let (context_value, _context_data, _apcore_ctx) = Self::build_context(&extra);
+        let (context_value, _context_data, _apcore_ctx, _elicit_guard) =
+            Self::build_context(&extra);
 
         // Pre-execution validation. catch_unwind guards against panics from
         // third-party executor implementations (symmetric with validate_tool's
@@ -1150,8 +1226,16 @@ impl ExecutionRouter {
         // handle_stream will fall back to non-streaming if executor doesn't
         // support streaming.
         if let (Some(ref pt), Some(ref sn)) = (extra.progress_token, extra.send_notification) {
-            self.handle_stream(tool_name, arguments, pt, sn, Some(&context_value), None)
-                .await
+            self.handle_stream(
+                tool_name,
+                arguments,
+                pt,
+                sn,
+                Some(&context_value),
+                None,
+                None,
+            )
+            .await
         } else {
             self.handle_call_async(tool_name, arguments, Some(&context_value))
                 .await
@@ -1232,16 +1316,21 @@ impl ExecutionRouter {
     /// callback objects) and in `apcore_ctx.data` (as marker values so
     /// modules can detect availability).
     ///
-    /// Returns `(context_value, context_data, apcore_context)` where
-    /// `context_data` holds the callback objects that cannot be serialized
-    /// into JSON, and `apcore_context` is the proper apcore `Context`.
-    fn build_context(
-        extra: &CallExtra,
-    ) -> (
-        Value,
-        HashMap<String, Box<dyn std::any::Any + Send + Sync>>,
-        apcore::Context<Value>,
-    ) {
+    /// Returns `(context_value, context_data, apcore_context, elicit_guard)`
+    /// where `context_data` holds the callback objects that cannot be
+    /// serialized into JSON, and `apcore_context` is the proper apcore
+    /// `Context`.
+    ///
+    /// # The elicit guard MUST outlive the call
+    ///
+    /// `elicit_guard` owns the registry entry that
+    /// [`MCP_ELICIT_CALL_ID_KEY`] in `apcore_context.data` points at. Dropping
+    /// it deregisters the callback, so an approval handler running after that
+    /// point resolves the id to nothing and rejects. Bind it for the whole
+    /// dispatch (`let (.., _elicit_guard) = ...`) — never to a bare `_`, which
+    /// drops immediately and reinstates exactly the bug this returns it to
+    /// prevent.
+    fn build_context(extra: &CallExtra) -> BuiltContext {
         Self::build_context_with_trace(extra, None, None)
     }
 
@@ -1253,11 +1342,7 @@ impl ExecutionRouter {
         extra: &CallExtra,
         trace_parent: Option<TraceParent>,
         cancel_token: Option<CancelToken>,
-    ) -> (
-        Value,
-        HashMap<String, Box<dyn std::any::Any + Send + Sync>>,
-        apcore::Context<Value>,
-    ) {
+    ) -> BuiltContext {
         let mut data: HashMap<String, Box<dyn std::any::Any + Send + Sync>> = HashMap::new();
         let mut context_obj = serde_json::Map::new();
 
@@ -1338,24 +1423,23 @@ impl ExecutionRouter {
             data.insert(MCP_PROGRESS_KEY.to_string(), Box::new(progress_cb));
         }
 
-        // Inject elicit callback
+        // Inject elicit callback.
+        //
+        // Two copies, because they serve two different consumers. The
+        // side-channel `data` map is the historical home and is typed
+        // `Box<dyn Any>`, which no apcore surface can read. The registry copy
+        // is the one an `ApprovalHandler` can actually reach: it is addressed
+        // by the id written into `apcore_ctx.data` below, and the returned
+        // guard keeps it alive for exactly this call.
+        let mut elicit_guard: Option<ElicitGuard> = None;
         if let Some(ref session) = extra.session {
-            let session = Arc::clone(session);
-            let elicit_cb: crate::helpers::ElicitCallback =
-                Box::new(move |message, requested_schema| {
-                    let session = Arc::clone(&session);
-                    Box::pin(async move {
-                        let schema = requested_schema.unwrap_or(serde_json::json!({}));
-                        match session.elicit_form(&message, &schema).await {
-                            Ok(result) => Some(result),
-                            Err(e) => {
-                                tracing::warn!("Elicitation request failed: {e}");
-                                None
-                            }
-                        }
-                    })
-                });
-            data.insert(MCP_ELICIT_KEY.to_string(), Box::new(elicit_cb));
+            data.insert(
+                MCP_ELICIT_KEY.to_string(),
+                Box::new(make_elicit_callback(Arc::clone(session))),
+            );
+            elicit_guard = Some(crate::server::elicit_registry::register(
+                make_elicit_callback(Arc::clone(session)),
+            ));
         }
 
         // Write marker values into apcore Context.data so modules can
@@ -1369,6 +1453,17 @@ impl ExecutionRouter {
             }
             if has_elicit {
                 shared.insert(MCP_ELICIT_KEY.to_string(), serde_json::json!("available"));
+            }
+            // The handle an ApprovalHandler exchanges for the real callback.
+            // `"available"` above says elicitation exists; this says how to
+            // perform one. Written only when a callback was actually
+            // registered, so a stale id can never be present without a live
+            // entry behind it.
+            if let Some(ref guard) = elicit_guard {
+                shared.insert(
+                    MCP_ELICIT_CALL_ID_KEY.to_string(),
+                    Value::String(guard.id().to_string()),
+                );
             }
         }
 
@@ -1388,7 +1483,7 @@ impl ExecutionRouter {
             Value::String(apcore_ctx.trace_id.clone()),
         );
 
-        (Value::Object(context_obj), data, apcore_ctx)
+        (Value::Object(context_obj), data, apcore_ctx, elicit_guard)
     }
 
     // -----------------------------------------------------------------------
@@ -1426,6 +1521,52 @@ impl ExecutionRouter {
         }
     }
 
+    /// Render a [`Executor::call_typed`] outcome into the MCP content shape.
+    ///
+    /// Mirrors the two render blocks of the untyped paths: success formats and
+    /// redacts the result, a trace (when one was produced) is appended as a
+    /// `trace` content item, and an error becomes an `is_error` text item.
+    fn render_call_outcome(
+        &self,
+        tool_name: &str,
+        outcome: Result<(Value, Option<Value>), ExecutorError>,
+        context: Option<&Value>,
+    ) -> (Vec<ContentItem>, bool, Option<String>) {
+        match outcome {
+            Ok((result, trace)) => {
+                let redacted_result = self.redact_output(tool_name, &result);
+                let text = self.format_result(&redacted_result);
+                let mut content = vec![ContentItem {
+                    content_type: "text".into(),
+                    data: Value::String(text),
+                }];
+                if let Some(trace) = trace {
+                    content.push(ContentItem {
+                        content_type: "trace".into(),
+                        data: trace,
+                    });
+                }
+                let trace_id = context
+                    .and_then(|c| c.get("trace_id"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                (content, false, trace_id)
+            }
+            Err(error) => {
+                tracing::error!("handle_call typed error for {tool_name}: {error}");
+                let text = Self::build_error_text(&error);
+                (
+                    vec![ContentItem {
+                        content_type: "text".into(),
+                        data: Value::String(text),
+                    }],
+                    true,
+                    None,
+                )
+            }
+        }
+    }
+
     /// Non-streaming execution via executor.call_async().
     ///
     /// When `self.trace` is true and the executor supports `call_with_trace`,
@@ -1436,16 +1577,22 @@ impl ExecutionRouter {
         arguments: &Value,
         context: Option<&Value>,
     ) -> (Vec<ContentItem>, bool, Option<String>) {
-        self.handle_call_async_with_hint(tool_name, arguments, context, None)
+        self.handle_call_async_with_hint(tool_name, arguments, context, None, None)
             .await
     }
 
+    /// `apcore_ctx` carries the typed context to [`Executor::call_typed`]. It
+    /// is `None` only on paths that have no apcore context to give (the
+    /// convenience `handle_call_async` wrapper and its tests); the real
+    /// `tools/call` dispatch always supplies one, because the elicit call id
+    /// and the resolved identity live in it and nowhere else.
     async fn handle_call_async_with_hint(
         &self,
         tool_name: &str,
         arguments: &Value,
         context: Option<&Value>,
         version_hint: Option<&str>,
+        apcore_ctx: Option<&apcore::Context<Value>>,
     ) -> (Vec<ContentItem>, bool, Option<String>) {
         let executor = match &self.executor {
             Some(e) => e,
@@ -1460,6 +1607,18 @@ impl ExecutionRouter {
                 );
             }
         };
+
+        // Typed-context path. Preferred whenever the caller has an apcore
+        // Context, because it is the only dispatch that preserves the shared
+        // `data` map the approval gate reads.
+        if let Some(ctx) = apcore_ctx {
+            if let Some(typed_result) = executor
+                .call_typed(tool_name, arguments, ctx, version_hint, self.trace)
+                .await
+            {
+                return self.render_call_outcome(tool_name, typed_result, context);
+            }
+        }
 
         // When trace mode is enabled, attempt call_with_trace first.
         if self.trace {
@@ -1577,6 +1736,12 @@ impl ExecutionRouter {
     /// Iterates the async stream, sends progress notifications for each
     /// chunk, accumulates results via deep merge, and returns the final
     /// result. Falls back to non-streaming if the executor returns `None`.
+    // Eight parameters, one over clippy's threshold. The alternative is a
+    // parameter struct whose only purpose is to satisfy the lint: every
+    // argument here is genuinely independent, and the file already carries the
+    // same judgement on `extract_extra`. `apcore_ctx` is the newest and the
+    // one that must not be dropped — see `handle_call_async_with_hint`.
+    #[allow(clippy::too_many_arguments)]
     async fn handle_stream(
         &self,
         tool_name: &str,
@@ -1585,6 +1750,7 @@ impl ExecutionRouter {
         send_notification: &SendNotificationFn,
         context: Option<&Value>,
         version_hint: Option<&str>,
+        apcore_ctx: Option<&apcore::Context<Value>>,
     ) -> (Vec<ContentItem>, bool, Option<String>) {
         use tokio_stream::StreamExt;
 
@@ -1606,8 +1772,17 @@ impl ExecutionRouter {
             Some(s) => s,
             None => {
                 // Fallback to non-streaming
+                // `ApcoreExecutorAdapter` does not implement `stream`, so the
+                // real server always lands here — which is why the typed
+                // context has to be forwarded rather than dropped.
                 return self
-                    .handle_call_async_with_hint(tool_name, arguments, context, version_hint)
+                    .handle_call_async_with_hint(
+                        tool_name,
+                        arguments,
+                        context,
+                        version_hint,
+                        apcore_ctx,
+                    )
                     .await;
             }
         };
@@ -2116,7 +2291,7 @@ mod tests {
             identity: None,
             typed_identity: None,
         };
-        let (_, data, _) = ExecutionRouter::build_context(&extra);
+        let (_, data, _, _elicit_guard) = ExecutionRouter::build_context(&extra);
         assert!(data.contains_key(MCP_PROGRESS_KEY));
     }
 
@@ -2129,7 +2304,7 @@ mod tests {
             identity: None,
             typed_identity: None,
         };
-        let (_, data, _) = ExecutionRouter::build_context(&extra);
+        let (_, data, _, _elicit_guard) = ExecutionRouter::build_context(&extra);
         assert!(!data.contains_key(MCP_PROGRESS_KEY));
     }
 
@@ -2148,7 +2323,7 @@ mod tests {
             identity: None,
             typed_identity: None,
         };
-        let (_, data, _) = ExecutionRouter::build_context(&extra);
+        let (_, data, _, _elicit_guard) = ExecutionRouter::build_context(&extra);
         assert!(data.contains_key(MCP_ELICIT_KEY));
     }
 
@@ -2161,7 +2336,7 @@ mod tests {
             identity: None,
             typed_identity: None,
         };
-        let (_, data, _) = ExecutionRouter::build_context(&extra);
+        let (_, data, _, _elicit_guard) = ExecutionRouter::build_context(&extra);
         assert!(!data.contains_key(MCP_ELICIT_KEY));
     }
 
@@ -2175,7 +2350,7 @@ mod tests {
             identity: Some(identity.clone()),
             typed_identity: None,
         };
-        let (ctx, _, _) = ExecutionRouter::build_context(&extra);
+        let (ctx, _, _, _elicit_guard) = ExecutionRouter::build_context(&extra);
         assert_eq!(ctx["identity"], identity);
     }
 
@@ -2188,7 +2363,7 @@ mod tests {
             identity: None,
             typed_identity: None,
         };
-        let (ctx, _, _) = ExecutionRouter::build_context(&extra);
+        let (ctx, _, _, _elicit_guard) = ExecutionRouter::build_context(&extra);
         assert!(ctx.get("identity").is_none());
     }
 
@@ -2205,7 +2380,7 @@ mod tests {
             identity: None,
             typed_identity: None,
         };
-        let (_, _, apcore_ctx) = ExecutionRouter::build_context(&extra);
+        let (_, _, apcore_ctx, _elicit_guard) = ExecutionRouter::build_context(&extra);
         assert!(apcore_ctx.identity.is_none());
         assert!(!apcore_ctx.trace_id.is_empty());
     }
@@ -2225,7 +2400,7 @@ mod tests {
             identity: None,
             typed_identity: Some(identity.clone()),
         };
-        let (_, _, apcore_ctx) = ExecutionRouter::build_context(&extra);
+        let (_, _, apcore_ctx, _elicit_guard) = ExecutionRouter::build_context(&extra);
         let ctx_id = apcore_ctx
             .identity
             .as_ref()
@@ -2249,7 +2424,7 @@ mod tests {
             identity: Some(identity_json),
             typed_identity: None,
         };
-        let (_, _, apcore_ctx) = ExecutionRouter::build_context(&extra);
+        let (_, _, apcore_ctx, _elicit_guard) = ExecutionRouter::build_context(&extra);
         let ctx_id = apcore_ctx
             .identity
             .as_ref()
@@ -2278,7 +2453,7 @@ mod tests {
             identity: Some(json_identity),
             typed_identity: Some(typed),
         };
-        let (_, _, apcore_ctx) = ExecutionRouter::build_context(&extra);
+        let (_, _, apcore_ctx, _elicit_guard) = ExecutionRouter::build_context(&extra);
         let ctx_id = apcore_ctx.identity.as_ref().unwrap();
         assert_eq!(
             ctx_id.id(),
@@ -2297,7 +2472,7 @@ mod tests {
             identity: None,
             typed_identity: None,
         };
-        let (_, _, apcore_ctx) = ExecutionRouter::build_context(&extra);
+        let (_, _, apcore_ctx, _elicit_guard) = ExecutionRouter::build_context(&extra);
         let data = apcore_ctx.data.read();
         assert_eq!(data.get(MCP_PROGRESS_KEY), Some(&json!("available")));
         assert!(!data.contains_key(MCP_ELICIT_KEY));
@@ -2318,7 +2493,7 @@ mod tests {
             identity: None,
             typed_identity: None,
         };
-        let (_, _, apcore_ctx) = ExecutionRouter::build_context(&extra);
+        let (_, _, apcore_ctx, _elicit_guard) = ExecutionRouter::build_context(&extra);
         let data = apcore_ctx.data.read();
         assert_eq!(data.get(MCP_ELICIT_KEY), Some(&json!("available")));
         assert!(!data.contains_key(MCP_PROGRESS_KEY));
@@ -2333,7 +2508,7 @@ mod tests {
             identity: None,
             typed_identity: None,
         };
-        let (_, _, apcore_ctx) = ExecutionRouter::build_context(&extra);
+        let (_, _, apcore_ctx, _elicit_guard) = ExecutionRouter::build_context(&extra);
         let data = apcore_ctx.data.read();
         assert!(data.is_empty());
     }
@@ -2347,7 +2522,7 @@ mod tests {
             identity: None,
             typed_identity: None,
         };
-        let (ctx_value, _, apcore_ctx) = ExecutionRouter::build_context(&extra);
+        let (ctx_value, _, apcore_ctx, _elicit_guard) = ExecutionRouter::build_context(&extra);
         let json_trace = ctx_value["trace_id"].as_str().unwrap();
         assert_eq!(json_trace, &apcore_ctx.trace_id);
     }
@@ -2417,7 +2592,7 @@ mod tests {
             identity: None,
             typed_identity: None,
         };
-        let (_, data, _) = ExecutionRouter::build_context(&extra);
+        let (_, data, _, _elicit_guard) = ExecutionRouter::build_context(&extra);
         let cb = data
             .get(MCP_PROGRESS_KEY)
             .unwrap()
@@ -2443,7 +2618,7 @@ mod tests {
             identity: None,
             typed_identity: None,
         };
-        let (_, data, _) = ExecutionRouter::build_context(&extra);
+        let (_, data, _, _elicit_guard) = ExecutionRouter::build_context(&extra);
         let cb = data
             .get(MCP_PROGRESS_KEY)
             .unwrap()
@@ -2465,7 +2640,7 @@ mod tests {
             identity: None,
             typed_identity: None,
         };
-        let (_, data, _) = ExecutionRouter::build_context(&extra);
+        let (_, data, _, _elicit_guard) = ExecutionRouter::build_context(&extra);
         let cb = data
             .get(MCP_PROGRESS_KEY)
             .unwrap()
@@ -2493,7 +2668,7 @@ mod tests {
             identity: None,
             typed_identity: None,
         };
-        let (_, data, _) = ExecutionRouter::build_context(&extra);
+        let (_, data, _, _elicit_guard) = ExecutionRouter::build_context(&extra);
         let cb = data
             .get(MCP_ELICIT_KEY)
             .unwrap()
@@ -2787,7 +2962,7 @@ mod tests {
         let router = ExecutionRouter::new(Box::new(executor), false, None);
         let token = ProgressToken::String("tok-1".into());
         let (content, is_error, _) = router
-            .handle_stream("mod", &json!({}), &token, &sn, None, None)
+            .handle_stream("mod", &json!({}), &token, &sn, None, None, None)
             .await;
         assert!(!is_error);
         let text = content[0].data.as_str().unwrap();
@@ -2811,7 +2986,7 @@ mod tests {
         let router = ExecutionRouter::new(Box::new(executor), false, None);
         let token = ProgressToken::String("tok".into());
         let (content, is_error, _) = router
-            .handle_stream("mod", &json!({}), &token, &sn, None, None)
+            .handle_stream("mod", &json!({}), &token, &sn, None, None, None)
             .await;
         assert!(!is_error);
         let text = content[0].data.as_str().unwrap();
@@ -2831,7 +3006,7 @@ mod tests {
         let router = ExecutionRouter::new(Box::new(executor), false, None);
         let token = ProgressToken::String("tok".into());
         let (content, is_error, _) = router
-            .handle_stream("mod", &json!({}), &token, &sn, None, None)
+            .handle_stream("mod", &json!({}), &token, &sn, None, None, None)
             .await;
         assert!(!is_error);
         let text = content[0].data.as_str().unwrap();
@@ -2851,7 +3026,7 @@ mod tests {
         let router = ExecutionRouter::new(Box::new(executor), false, None);
         let token = ProgressToken::String("my-token".into());
         router
-            .handle_stream("mod", &json!({}), &token, &sn, None, None)
+            .handle_stream("mod", &json!({}), &token, &sn, None, None, None)
             .await;
 
         let notifications = captured.lock().unwrap();
@@ -2875,7 +3050,7 @@ mod tests {
         let router = ExecutionRouter::new(Box::new(executor), false, None);
         let token = ProgressToken::String("str-tok".into());
         router
-            .handle_stream("mod", &json!({}), &token, &sn, None, None)
+            .handle_stream("mod", &json!({}), &token, &sn, None, None, None)
             .await;
 
         let notifications = captured.lock().unwrap();
@@ -2891,7 +3066,7 @@ mod tests {
         let router = ExecutionRouter::new(Box::new(executor), false, None);
         let token = ProgressToken::Integer(99);
         router
-            .handle_stream("mod", &json!({}), &token, &sn, None, None)
+            .handle_stream("mod", &json!({}), &token, &sn, None, None, None)
             .await;
 
         let notifications = captured.lock().unwrap();
@@ -2907,7 +3082,7 @@ mod tests {
         let router = ExecutionRouter::new(Box::new(executor), false, None);
         let token = ProgressToken::String("tok".into());
         let (content, is_error, _) = router
-            .handle_stream("mod", &json!({}), &token, &sn, None, None)
+            .handle_stream("mod", &json!({}), &token, &sn, None, None, None)
             .await;
         assert!(!is_error);
         let text = content[0].data.as_str().unwrap();
@@ -2933,7 +3108,7 @@ mod tests {
         let router = ExecutionRouter::new(Box::new(executor), false, None);
         let token = ProgressToken::String("tok".into());
         let (content, is_error, _) = router
-            .handle_stream("mod", &json!({}), &token, &sn, None, None)
+            .handle_stream("mod", &json!({}), &token, &sn, None, None, None)
             .await;
         assert!(is_error);
         let text = content[0].data.as_str().unwrap();
@@ -2953,7 +3128,7 @@ mod tests {
         let router = ExecutionRouter::new(Box::new(executor), false, None);
         let token = ProgressToken::String("tok".into());
         let (_, is_error, _) = router
-            .handle_stream("mod", &json!({}), &token, &sn, None, None)
+            .handle_stream("mod", &json!({}), &token, &sn, None, None, None)
             .await;
         assert!(is_error);
     }
@@ -2971,7 +3146,7 @@ mod tests {
         let router = ExecutionRouter::new(Box::new(executor), false, Some(formatter));
         let token = ProgressToken::String("tok".into());
         let (content, is_error, _) = router
-            .handle_stream("mod", &json!({}), &token, &sn, None, None)
+            .handle_stream("mod", &json!({}), &token, &sn, None, None, None)
             .await;
         assert!(!is_error);
         let text = content[0].data.as_str().unwrap();
@@ -2988,7 +3163,7 @@ mod tests {
         let token = ProgressToken::String("tok".into());
         let ctx = json!({"trace_id": "trace-xyz"});
         let (_, is_error, trace_id) = router
-            .handle_stream("mod", &json!({}), &token, &sn, Some(&ctx), None)
+            .handle_stream("mod", &json!({}), &token, &sn, Some(&ctx), None, None)
             .await;
         assert!(!is_error);
         assert_eq!(trace_id, Some("trace-xyz".to_string()));
@@ -3000,7 +3175,7 @@ mod tests {
         let router = ExecutionRouter::new(Box::new(NonStreamingExecutor), false, None);
         let token = ProgressToken::String("tok".into());
         let (content, is_error, _) = router
-            .handle_stream("mod", &json!({}), &token, &sn, None, None)
+            .handle_stream("mod", &json!({}), &token, &sn, None, None, None)
             .await;
         assert!(!is_error);
         let text = content[0].data.as_str().unwrap();
@@ -3771,7 +3946,7 @@ mod tests {
             identity: None,
             typed_identity: None,
         };
-        let (_, data, _) = ExecutionRouter::build_context(&extra);
+        let (_, data, _, _elicit_guard) = ExecutionRouter::build_context(&extra);
         assert!(data.contains_key(MCP_PROGRESS_KEY));
     }
 
@@ -3790,7 +3965,7 @@ mod tests {
             identity: None,
             typed_identity: None,
         };
-        let (_, data, _) = ExecutionRouter::build_context(&extra);
+        let (_, data, _, _elicit_guard) = ExecutionRouter::build_context(&extra);
         assert!(data.contains_key(MCP_ELICIT_KEY));
     }
 
@@ -3965,7 +4140,8 @@ mod tests {
             identity: None,
             typed_identity: None,
         };
-        let (_, _, apcore_ctx) = ExecutionRouter::build_context_with_trace(&extra, tp, None);
+        let (_, _, apcore_ctx, _elicit_guard) =
+            ExecutionRouter::build_context_with_trace(&extra, tp, None);
         assert_eq!(apcore_ctx.trace_id, "4bf92f3577b34da6a3ce929d0e0e4736");
     }
 
@@ -3982,7 +4158,7 @@ mod tests {
             typed_identity: None,
         };
         let token = CancelToken::new();
-        let (_, _, apcore_ctx) =
+        let (_, _, apcore_ctx, _elicit_guard) =
             ExecutionRouter::build_context_with_trace(&extra, None, Some(token.clone()));
         let ctx_token = apcore_ctx
             .cancel_token

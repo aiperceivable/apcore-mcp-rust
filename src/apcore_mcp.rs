@@ -297,6 +297,62 @@ impl crate::server::router::Executor for ApcoreExecutorAdapter {
         })
     }
 
+    /// Forward the caller's typed apcore `Context` into the executor.
+    ///
+    /// `call_async` and `call_with_trace` above pass `None` for the context,
+    /// which makes apcore fabricate an anonymous `@external` one. Everything
+    /// the router put in the real context was therefore discarded before the
+    /// pipeline ran — including the elicit call id the approval gate needs to
+    /// prompt a human, which is why interactive approval could never work on a
+    /// CLI-launched server (apexe#29).
+    ///
+    /// Passing the context through is what preserves the shared `Context.data`
+    /// map: apcore clones the context into the `PipelineContext` and on into
+    /// the `ApprovalRequest`, and `Context`'s `Clone`/`child` both `Arc::clone`
+    /// that map rather than copying it.
+    async fn call_typed(
+        &self,
+        module_id: &str,
+        inputs: &Value,
+        context: &apcore::Context<Value>,
+        version_hint: Option<&str>,
+        want_trace: bool,
+    ) -> Option<Result<(Value, Option<Value>), ExecutorError>> {
+        let to_executor_error = |e: apcore::errors::ModuleError| ExecutorError::Execution {
+            code: format!("{:?}", e.code),
+            message: e.to_string(),
+            details: None,
+        };
+        if want_trace {
+            let strategy_ref = self.strategy.as_deref();
+            return Some(
+                self.inner
+                    .call_with_trace(
+                        module_id,
+                        inputs.clone(),
+                        Some(context),
+                        version_hint,
+                        strategy_ref,
+                    )
+                    .await
+                    .map(|(out, trace)| {
+                        (
+                            out,
+                            Some(serde_json::to_value(&trace).unwrap_or(Value::Null)),
+                        )
+                    })
+                    .map_err(to_executor_error),
+            );
+        }
+        Some(
+            self.inner
+                .call(module_id, inputs.clone(), Some(context), version_hint)
+                .await
+                .map(|out| (out, None))
+                .map_err(to_executor_error),
+        )
+    }
+
     /// Look up the descriptor-default `version_hint` for the spec's
     /// 3-source cascade. [A-D-006]
     fn version_hint_default(&self, module_id: &str) -> Option<String> {

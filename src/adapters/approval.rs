@@ -13,7 +13,8 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::approval_store::ApprovalStore;
-use crate::helpers::{ElicitAction, ElicitCallback};
+use crate::helpers::{ElicitAction, ElicitCallback, MCP_ELICIT_CALL_ID_KEY};
+use crate::server::elicit_registry::{self, SharedElicitCallback};
 
 /// Handles user approval requests via MCP elicitation.
 ///
@@ -23,8 +24,25 @@ use crate::helpers::{ElicitAction, ElicitCallback};
 /// # Lifecycle
 ///
 /// - `request_approval` — formats a human-readable message from the
-///   [`ApprovalRequest`], invokes the injected [`ElicitCallback`], and maps the
+///   [`ApprovalRequest`], invokes the resolved [`ElicitCallback`], and maps the
 ///   elicit response to an [`ApprovalResult`].
+///
+/// # Where the callback comes from
+///
+/// Two sources, tried in order:
+///
+/// 1. **The live request.** The router registers the connection's callback per
+///    tool call and writes its id into `Context.data` under
+///    [`MCP_ELICIT_CALL_ID_KEY`]; this handler exchanges the id for the
+///    callback. This is the path that makes a handler constructed *outside*
+///    the router — by a CLI entry point that never sees a session — able to
+///    prompt a real client (apexe#29).
+/// 2. **The constructor.** An [`ElicitCallback`] passed to [`Self::new`] is
+///    used when the request carries no id, which keeps every embedding that
+///    injected its own callback working unchanged.
+///
+/// With neither, the request is rejected — the correct fail-closed outcome for
+/// a client that never declared elicitation support.
 /// - `check_approval` — always returns "rejected" because Phase B (async
 ///   polling of pending approvals) is not supported via stateless MCP
 ///   elicitation.
@@ -35,8 +53,11 @@ pub struct ElicitationApprovalHandler {
 impl ElicitationApprovalHandler {
     /// Create a new approval handler with an optional elicit callback.
     ///
-    /// When `elicit` is `None`, all approval requests will be rejected with a
-    /// descriptive reason indicating no callback is available.
+    /// `None` is the normal construction for a server whose callback is only
+    /// known per request: the handler then resolves the live one from
+    /// [`MCP_ELICIT_CALL_ID_KEY`] in the request context. It rejects only when
+    /// that lookup also comes up empty, which means the connected client
+    /// declared no elicitation support.
     pub fn new(elicit: Option<ElicitCallback>) -> Self {
         Self { elicit }
     }
@@ -92,16 +113,6 @@ impl ApprovalHandler for ElicitationApprovalHandler {
         &self,
         request: &ApprovalRequest,
     ) -> Result<ApprovalResult, ModuleError> {
-        // [D10-001] Python+TS extract the elicit callback per-call from
-        // `request.context.data[MCP_ELICIT_KEY]`. In Rust, `ElicitCallback`
-        // is a `Box<dyn Fn...>` which cannot be serialized into the
-        // `Context<Value>` data map (typed as `HashMap<String, serde_json::Value>`).
-        // Therefore we follow the closest possible approximation: if the request
-        // has a context, surface a "No context available for elicitation" rejection
-        // when no constructor-injected callback is provided, mirroring the Python
-        // branch. The constructor-injected `self.elicit` acts as the pre-resolved
-        // callback that Python would extract at request time. [D10-001]
-        //
         // [D10-002] Return type kept as `Result<ApprovalResult, ModuleError>` for
         // idiomatic Rust. All error paths return `Ok(rejected(...))` so callers
         // always receive an `ApprovalResult` for the elicitation surface; no `Err`
@@ -117,17 +128,54 @@ impl ApprovalHandler for ElicitationApprovalHandler {
         // surface is security-gated and the calling identity is carried
         // by `request.context`. Reject unconditionally whenever context
         // is None.
-        if request.context.is_none() {
+        let Some(context) = request.context.as_ref() else {
             tracing::debug!("no context attached to approval request, rejecting");
             return Ok(rejected("No context available for elicitation"));
-        }
+        };
 
-        let elicit = match &self.elicit {
-            Some(cb) => cb,
-            None => {
-                tracing::debug!("no elicitation callback available, rejecting approval");
-                return Ok(rejected("No elicitation callback available"));
+        // [D10-001] apcore-python and apcore-typescript extract the callback
+        // per call from `request.context.data[MCP_ELICIT_KEY]`, which they can
+        // do because their context data holds arbitrary objects. Rust's is
+        // `HashMap<String, serde_json::Value>` and no closure is a `Value`, so
+        // this SDK used to be able to read only the marker string
+        // `"available"` — it knew elicitation existed and had no way to
+        // perform one, and rejected every gated call on any server whose
+        // handler was built outside the router (apexe#29).
+        //
+        // The id under `MCP_ELICIT_CALL_ID_KEY` closes that gap: it IS a
+        // `Value`, and the registry exchanges it for the live callback the
+        // router registered for this very call. Same per-request resolution as
+        // the peer SDKs, one indirection wider. [D10-001]
+        let resolved: Option<SharedElicitCallback> = {
+            // Scoped so the read guard is released before the `.await` below —
+            // apcore's `Context.data` lock must never be held across one.
+            let data = context.data.read();
+            data.get(MCP_ELICIT_CALL_ID_KEY)
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+        }
+        .and_then(|call_id| {
+            let found = elicit_registry::lookup(&call_id);
+            if found.is_none() {
+                // The id outlived its guard: the tool call that registered it
+                // has already returned. Fall through to `self.elicit` rather
+                // than failing outright.
+                tracing::debug!(%call_id, "elicit call id no longer registered");
             }
+            found
+        });
+
+        // Live request first, constructor-injected fallback second, reject
+        // third.
+        let elicit: &ElicitCallback = match resolved.as_deref() {
+            Some(cb) => cb,
+            None => match &self.elicit {
+                Some(cb) => cb,
+                None => {
+                    tracing::debug!("no elicitation callback available, rejecting approval");
+                    return Ok(rejected("No elicitation callback available"));
+                }
+            },
         };
 
         let message = format!(

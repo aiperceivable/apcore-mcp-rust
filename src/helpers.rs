@@ -102,6 +102,22 @@ pub const MCP_PROGRESS_KEY: &str = "_mcp_progress";
 /// Key for the elicitation callback in context data.
 pub const MCP_ELICIT_KEY: &str = "_mcp_elicit";
 
+/// Key under which the router writes the id of the live [`ElicitCallback`]
+/// into `apcore::Context.data`, so an `ApprovalHandler` can reach it.
+///
+/// A closure is not a `serde_json::Value`, so [`MCP_ELICIT_KEY`] can only ever
+/// carry the marker string `"available"` — enough to advertise that
+/// elicitation exists, not enough to perform one. The id written here is
+/// exchanged for the callback itself through the crate-local registry that
+/// owns it for the duration of the tool call.
+///
+/// A separate key rather than a widening of [`MCP_ELICIT_KEY`]: modules
+/// already test that one against `"available"`, and changing its type would
+/// break them for no gain. Both are `_`-prefixed, which apcore's
+/// `Context::serialize` filters out of the wire shape, so neither reaches a
+/// client.
+pub const MCP_ELICIT_CALL_ID_KEY: &str = "_mcp_elicit_call_id";
+
 // ---------------------------------------------------------------------------
 // Helper functions
 // ---------------------------------------------------------------------------

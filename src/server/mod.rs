@@ -6,6 +6,7 @@
 
 pub mod approval_bridge;
 pub mod async_task_bridge;
+pub(crate) mod elicit_registry;
 pub mod factory;
 pub mod listener;
 pub mod router;
