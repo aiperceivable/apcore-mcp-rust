@@ -973,7 +973,13 @@ impl APCoreMCP {
 
         for module_id in module_ids {
             if let Ok(Some(descriptor)) = self.reg().get_definition(&module_id) {
-                let description = self.reg().describe(&module_id);
+                // apcore 0.27: `describe()` is now fallible and returns a
+                // markdown envelope (see `factory.rs`). `ModuleError` derives
+                // `Serialize`, so leaving the call here would still have
+                // compiled and silently written `{"Ok": "..."}` into the
+                // converter's registry JSON. Read the descriptor's own
+                // summary, which is what this map documented all along.
+                let description = descriptor.description.clone();
                 let annotations_json =
                     serde_json::to_value(&descriptor.annotations).unwrap_or(Value::Null);
                 let tags_json: Vec<Value> = descriptor

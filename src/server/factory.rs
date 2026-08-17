@@ -407,7 +407,16 @@ impl MCPServerFactory {
                 }
             };
 
-            let base_description = registry.describe(&module_id);
+            // apcore 0.27 changed `Registry::describe` in two ways: it became
+            // fallible, and it now returns the full generated markdown
+            // envelope (heading, tags, parameter table) rather than the
+            // module's one-line summary. This slot is the NON-rich fallback of
+            // the chain below, so adopting the new text would make
+            // `rich_description: false` emit a rich document and collapse the
+            // flag. `descriptor.description` is the exact value 0.26's
+            // `describe()` returned for a registered module
+            // (`module.description()`), so reading it preserves that text.
+            let base_description = descriptor.description.clone();
 
             // Resolve display overlay. apcore 0.19.0 introduced a top-level
             // `ModuleDescriptor.display` field; when present, it takes
