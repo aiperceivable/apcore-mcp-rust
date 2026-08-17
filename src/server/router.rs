@@ -1602,12 +1602,41 @@ impl ExecutionRouter {
         // Typed-context path. Preferred whenever the caller has an apcore
         // Context, because it is the only dispatch that preserves the shared
         // `data` map the approval gate reads.
+        //
+        // Wrapped in the same panic guard as `call_async` below [A-D-029]:
+        // this is now the primary production dispatch, so a panicking executor
+        // impl reaching the caller as a lost connection instead of an
+        // `is_error` result would be a regression in exactly the path that
+        // matters most.
+        use futures::FutureExt;
         if let Some(ctx) = apcore_ctx {
-            if let Some(typed_result) = executor
-                .call_typed(tool_name, arguments, ctx, version_hint, self.trace)
-                .await
-            {
-                return self.render_call_outcome(tool_name, typed_result, context);
+            let typed_future = std::panic::AssertUnwindSafe(executor.call_typed(
+                tool_name,
+                arguments,
+                ctx,
+                version_hint,
+                self.trace,
+            ));
+            match typed_future.catch_unwind().await {
+                Ok(Some(typed_result)) => {
+                    return self.render_call_outcome(tool_name, typed_result, context)
+                }
+                // `None` means this executor cannot take a typed context; fall
+                // through to the untyped paths below.
+                Ok(None) => {}
+                Err(_panic) => {
+                    tracing::error!("handle_call: executor panicked for {tool_name}");
+                    return (
+                        vec![ContentItem {
+                            content_type: "text".into(),
+                            data: Value::String(format!(
+                                "Internal error: executor panicked while invoking {tool_name}"
+                            )),
+                        }],
+                        true,
+                        None,
+                    );
+                }
             }
         }
 
@@ -1665,7 +1694,6 @@ impl ExecutionRouter {
         // Uses futures::FutureExt::catch_unwind to catch panics across
         // .await points — std::panic::catch_unwind cannot catch async
         // panics on its own. [A-D-029]
-        use futures::FutureExt;
         let call_future = std::panic::AssertUnwindSafe(executor.call_async(
             tool_name,
             arguments,
@@ -4460,5 +4488,93 @@ mod tests {
         let ok = router.cancel_call("call-1", None);
         assert!(ok, "active token must return true");
         assert!(token.is_cancelled(), "token must be cancelled");
+    }
+
+    // ── panic safety on the typed-context dispatch ───────────────────────────
+
+    /// An executor whose typed dispatch panics, standing in for a buggy
+    /// third-party implementation.
+    struct PanickingTypedExecutor;
+
+    #[async_trait]
+    impl Executor for PanickingTypedExecutor {
+        async fn call_async(
+            &self,
+            _module_id: &str,
+            _inputs: &Value,
+            _context: Option<&Value>,
+            _version_hint: Option<&str>,
+        ) -> Result<Value, ExecutorError> {
+            Ok(json!({"untyped": true}))
+        }
+
+        async fn call_typed(
+            &self,
+            _module_id: &str,
+            _inputs: &Value,
+            _context: &apcore::Context<Value>,
+            _version_hint: Option<&str>,
+            _want_trace: bool,
+        ) -> Option<Result<(Value, Option<Value>), ExecutorError>> {
+            panic!("buggy executor");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_typed_dispatch_panic_becomes_an_error_result() {
+        // `call_typed` is the primary production dispatch, so it carries the
+        // same [A-D-029] guard as `call_async`: a panicking executor must come
+        // back as an `is_error` result, not take the connection down. Without
+        // the guard this test unwinds instead of asserting.
+        let router = ExecutionRouter::new(Box::new(PanickingTypedExecutor), false, None);
+        let ctx = apcore::Context::<Value>::anonymous();
+        let (content, is_error, _) = router
+            .handle_call_async_with_hint("mod", &json!({}), None, None, Some(&ctx))
+            .await;
+
+        assert!(is_error, "a panicking executor must yield an error result");
+        let text = content[0].data.as_str().unwrap_or_default();
+        assert!(
+            text.contains("executor panicked"),
+            "the caller must be told the executor panicked: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_typed_dispatch_declining_falls_back_to_call_async() {
+        // The default `call_typed` returns `None`, meaning "this executor
+        // cannot take a typed context". That must fall through to the untyped
+        // path rather than failing the call — it is what keeps every existing
+        // Executor implementation working.
+        struct DecliningExecutor;
+
+        #[async_trait]
+        impl Executor for DecliningExecutor {
+            async fn call_async(
+                &self,
+                _module_id: &str,
+                _inputs: &Value,
+                _context: Option<&Value>,
+                _version_hint: Option<&str>,
+            ) -> Result<Value, ExecutorError> {
+                Ok(json!({"untyped": true}))
+            }
+        }
+
+        let router = ExecutionRouter::new(Box::new(DecliningExecutor), false, None);
+        let ctx = apcore::Context::<Value>::anonymous();
+        let (content, is_error, _) = router
+            .handle_call_async_with_hint("mod", &json!({}), None, None, Some(&ctx))
+            .await;
+
+        assert!(
+            !is_error,
+            "declining a typed context must not fail the call"
+        );
+        let text = content[0].data.as_str().unwrap_or_default();
+        assert!(
+            text.contains("untyped"),
+            "the untyped path must have produced the result: {text}"
+        );
     }
 }
