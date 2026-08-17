@@ -4631,4 +4631,133 @@ mod tests {
             "the untyped path must have produced the result: {text}"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Cross-language conformance: F-038 output redaction
+    // -----------------------------------------------------------------------
+    //
+    // Lives here rather than under `tests/` because `redact_output` is
+    // private, and widening it to `pub(crate)` purely so an integration test
+    // could reach it would relax the production surface for a test's
+    // convenience. The cost is that `tests/common`'s fixture locator cannot be
+    // reused — a `#[cfg(test)]` item is not part of the compiled crate an
+    // integration test links against — so the lookup is repeated in miniature
+    // below.
+
+    /// Locate the shared conformance fixtures, mirroring `tests/common`.
+    ///
+    /// Honours `APCORE_CONFORMANCE_FIXTURES`, otherwise walks up looking for
+    /// `apcore-mcp/conformance/fixtures`, which covers both the sibling
+    /// checkout developers use and the CI layout where the spec repo is
+    /// checked out inside the workspace.
+    fn conformance_fixture(name: &str) -> Option<Value> {
+        let dir = match std::env::var("APCORE_CONFORMANCE_FIXTURES") {
+            Ok(explicit) => {
+                let candidate = std::path::PathBuf::from(explicit);
+                candidate.is_dir().then_some(candidate)
+            }
+            Err(_) => {
+                let mut dir: std::path::PathBuf = env!("CARGO_MANIFEST_DIR").into();
+                let mut found = None;
+                for _ in 0..=4 {
+                    let candidate = dir.join("apcore-mcp").join("conformance").join("fixtures");
+                    if candidate.is_dir() {
+                        found = Some(candidate);
+                        break;
+                    }
+                    if !dir.pop() {
+                        break;
+                    }
+                }
+                found
+            }
+        };
+
+        if let Some(dir) = dir {
+            let path = dir.join(name);
+            if path.is_file() {
+                let raw = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|e| panic!("fixture {} unreadable: {e}", path.display()));
+                return Some(
+                    serde_json::from_str(&raw)
+                        .unwrap_or_else(|e| panic!("fixture {} is malformed: {e}", path.display())),
+                );
+            }
+        }
+
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "conformance fixture {name:?} not found. In CI this is a failure \
+             rather than a skip: the cross-language conformance suite exists to \
+             catch divergence between the three bridges, and skipping it \
+             silently reports success while proving nothing."
+        );
+        eprintln!("skipping: conformance fixture {name:?} not found");
+        None
+    }
+
+    #[test]
+    fn conformance_output_redaction() {
+        // Pins the Rust half of a divergence the fixture records under
+        // `known_gaps#upstream_key_name_heuristic`: the three upstream apcore
+        // libraries disagree about masking a secret-sounding key the schema
+        // never marked. Python and TypeScript were measured when that gap was
+        // written; Rust's behaviour was only read off `redact_secret_prefix`.
+        // This measures it, so the claim has a test behind it.
+        let Some(fixture) = conformance_fixture("output_redaction.json") else {
+            return;
+        };
+        let tool = "conformance.subject";
+
+        for case in fixture["test_cases"].as_array().expect("test_cases") {
+            let id = case["id"].as_str().expect("case id");
+            let mut schemas = HashMap::new();
+            schemas.insert(tool.to_string(), case["output_schema"].clone());
+
+            let router = ExecutionRouter::stub().with_output_schemas(schemas);
+            let redacted = router.redact_output(tool, &case["output"]);
+
+            assert_eq!(
+                redacted, case["expected_redacted_output"],
+                "case {id}: redaction mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn upstream_redaction_key_name_behaviour_is_measured_not_assumed() {
+        // The fixture's `known_gaps#upstream_key_name_heuristic` claims the
+        // three upstream apcore libraries disagree about masking a
+        // secret-sounding key that the schema never marked. Python and
+        // TypeScript were measured directly. This measures Rust, so no leg of
+        // that claim rests on reading the upstream source.
+        //
+        // Deliberately not a shared-fixture case: pinning it there would
+        // declare one language's behaviour to be the correct one, and the
+        // divergence has to be settled in apcore before that can be said.
+        let empty = serde_json::json!({});
+
+        let by_name = apcore::redact_sensitive(&serde_json::json!({"token": "v"}), &empty);
+        let by_prefix = apcore::redact_sensitive(&serde_json::json!({"_secret_x": "v"}), &empty);
+        let untouched = apcore::redact_sensitive(&serde_json::json!({"harmless": "v"}), &empty);
+
+        assert_eq!(
+            by_prefix["_secret_x"],
+            apcore::REDACTED_VALUE,
+            "apcore-rust masks the _secret_ prefix with no schema"
+        );
+        assert_eq!(
+            untouched["harmless"], "v",
+            "an unmarked, unsuggestive key is never masked"
+        );
+        assert_eq!(
+            by_name["token"], "v",
+            "apcore-rust does NOT mask a secret-sounding key name without a \
+             schema, where apcore (Python) does. If this assertion starts \
+             failing, upstream has converged and \
+             output_redaction.json#known_gaps#upstream_key_name_heuristic \
+             should be revisited — the fixture case narrowed for this reason \
+             can then widen again."
+        );
+    }
 }
