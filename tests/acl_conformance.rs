@@ -6,7 +6,7 @@
 //! three implementations must agree on (rule_count, default_effect) and on
 //! which inputs are rejected.
 
-use std::path::{Path, PathBuf};
+mod common;
 
 use apcore_mcp::acl_builder::build_acl_from_config;
 use serde::Deserialize;
@@ -38,34 +38,9 @@ struct ErrorCase {
     expected_error_substring: String,
 }
 
-fn fixture_path() -> Option<PathBuf> {
-    let mut dir: PathBuf = env!("CARGO_MANIFEST_DIR").into();
-    for _ in 0..4 {
-        let candidate = dir
-            .join("apcore-mcp")
-            .join("conformance")
-            .join("fixtures")
-            .join("acl_config.json");
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-        if !dir.pop() {
-            break;
-        }
-    }
-    None
-}
-
-fn load_fixture() -> Option<Fixture> {
-    let path: &Path = &fixture_path()?;
-    let raw = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&raw).ok()
-}
-
 #[test]
 fn conformance_success_cases() {
-    let Some(fixture) = load_fixture() else {
-        eprintln!("skipping: conformance fixture not found");
+    let Some(fixture) = common::load_fixture::<Fixture>("acl_config.json") else {
         return;
     };
 
@@ -104,8 +79,7 @@ fn conformance_success_cases() {
 
 #[test]
 fn conformance_error_cases() {
-    let Some(fixture) = load_fixture() else {
-        eprintln!("skipping: conformance fixture not found");
+    let Some(fixture) = common::load_fixture::<Fixture>("acl_config.json") else {
         return;
     };
 
