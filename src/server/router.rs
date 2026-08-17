@@ -1181,8 +1181,7 @@ impl ExecutionRouter {
         });
 
         // Build per-call context
-        let (context_value, _context_data, _apcore_ctx, _elicit_guard) =
-            Self::build_context(&extra);
+        let (context_value, _context_data, apcore_ctx, _elicit_guard) = Self::build_context(&extra);
 
         // Pre-execution validation. catch_unwind guards against panics from
         // third-party executor implementations (symmetric with validate_tool's
@@ -1233,12 +1232,18 @@ impl ExecutionRouter {
                 sn,
                 Some(&context_value),
                 None,
-                None,
+                Some(&apcore_ctx),
             )
             .await
         } else {
-            self.handle_call_async(tool_name, arguments, Some(&context_value))
-                .await
+            self.handle_call_async_with_hint(
+                tool_name,
+                arguments,
+                Some(&context_value),
+                None,
+                Some(&apcore_ctx),
+            )
+            .await
         }
     }
 
@@ -1565,20 +1570,6 @@ impl ExecutionRouter {
                 )
             }
         }
-    }
-
-    /// Non-streaming execution via executor.call_async().
-    ///
-    /// When `self.trace` is true and the executor supports `call_with_trace`,
-    /// the pipeline trace is included as an additional content item.
-    async fn handle_call_async(
-        &self,
-        tool_name: &str,
-        arguments: &Value,
-        context: Option<&Value>,
-    ) -> (Vec<ContentItem>, bool, Option<String>) {
-        self.handle_call_async_with_hint(tool_name, arguments, context, None, None)
-            .await
     }
 
     /// `apcore_ctx` carries the typed context to [`Executor::call_typed`]. It
@@ -2739,7 +2730,7 @@ mod tests {
     async fn test_call_async_success() {
         let router = ExecutionRouter::new(Box::new(MockExecutor), false, None);
         let (content, is_error, _trace_id) = router
-            .handle_call_async("test.module", &json!({"key": "value"}), None)
+            .handle_call_async_with_hint("test.module", &json!({"key": "value"}), None, None, None)
             .await;
         assert!(!is_error);
         assert_eq!(content.len(), 1);
@@ -2756,7 +2747,7 @@ mod tests {
         let router = ExecutionRouter::new(Box::new(MockExecutor), false, None);
         let ctx = json!({"trace_id": "trace-abc-123"});
         let (_content, is_error, trace_id) = router
-            .handle_call_async("test.module", &json!({}), Some(&ctx))
+            .handle_call_async_with_hint("test.module", &json!({}), Some(&ctx), None, None)
             .await;
         assert!(!is_error);
         assert_eq!(trace_id, Some("trace-abc-123".to_string()));
@@ -2770,7 +2761,7 @@ mod tests {
         });
         let router = ExecutionRouter::new(Box::new(MockExecutor), false, Some(formatter));
         let (content, is_error, _) = router
-            .handle_call_async("test.module", &json!({"a": 1}), None)
+            .handle_call_async_with_hint("test.module", &json!({"a": 1}), None, None, None)
             .await;
         assert!(!is_error);
         let text = content[0].data.as_str().unwrap();
@@ -2788,7 +2779,7 @@ mod tests {
             None,
         );
         let (content, is_error, _) = router
-            .handle_call_async("test.module", &json!({}), None)
+            .handle_call_async_with_hint("test.module", &json!({}), None, None, None)
             .await;
         assert!(is_error);
         let text = content[0].data.as_str().unwrap();
@@ -2802,7 +2793,9 @@ mod tests {
             false,
             None,
         );
-        let (content, is_error, _) = router.handle_call_async("mod", &json!({}), None).await;
+        let (content, is_error, _) = router
+            .handle_call_async_with_hint("mod", &json!({}), None, None, None)
+            .await;
         assert!(is_error);
         let text = content[0].data.as_str().unwrap();
         assert!(text.contains("something went wrong"));
@@ -2812,7 +2805,9 @@ mod tests {
     async fn test_call_async_error_is_error_true() {
         let router =
             ExecutionRouter::new(Box::new(FailingExecutor::new("ERR", "fail")), false, None);
-        let (_, is_error, _) = router.handle_call_async("mod", &json!({}), None).await;
+        let (_, is_error, _) = router
+            .handle_call_async_with_hint("mod", &json!({}), None, None, None)
+            .await;
         assert!(is_error);
     }
 
@@ -2820,7 +2815,9 @@ mod tests {
     async fn test_call_async_error_no_trace_id() {
         let router =
             ExecutionRouter::new(Box::new(FailingExecutor::new("ERR", "fail")), false, None);
-        let (_, _, trace_id) = router.handle_call_async("mod", &json!({}), None).await;
+        let (_, _, trace_id) = router
+            .handle_call_async_with_hint("mod", &json!({}), None, None, None)
+            .await;
         assert!(trace_id.is_none());
     }
 
@@ -2835,7 +2832,9 @@ mod tests {
             false,
             None,
         );
-        let (content, is_error, _) = router.handle_call_async("mod", &json!({}), None).await;
+        let (content, is_error, _) = router
+            .handle_call_async_with_hint("mod", &json!({}), None, None, None)
+            .await;
         assert!(is_error);
         let text = content[0].data.as_str().unwrap();
         assert!(text.contains("too large"));

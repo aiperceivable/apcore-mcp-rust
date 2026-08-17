@@ -3631,4 +3631,248 @@ mod tests {
             "approval_handler must be wired when both store and notify are configured"
         );
     }
+
+    // ── apexe#29: interactive approval end to end ────────────────────────────
+    //
+    // These drive the REAL shipped path: `ApcoreExecutorAdapter` ->
+    // `apcore::Executor` -> apcore's own approval gate ->
+    // `ElicitationApprovalHandler`. Nothing about the elicitation resolution is
+    // stubbed; only the MCP session at the far edge is a mock, standing in for
+    // the client that would answer the prompt.
+
+    /// A module marked `requires_approval` that records whether it ran.
+    ///
+    /// Execution is the assertion that matters: a gate that "approves" without
+    /// the body running, or a rejection that lets it run anyway, both show up
+    /// here and in neither the status string nor the returned text.
+    #[derive(Debug)]
+    struct GatedModule {
+        executed: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Module for GatedModule {
+        fn input_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+        fn output_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+        fn description(&self) -> &str {
+            "deletes something important"
+        }
+        async fn execute(
+            &self,
+            _inputs: Value,
+            _ctx: &apcore::Context<Value>,
+        ) -> Result<Value, apcore::errors::ModuleError> {
+            self.executed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(json!({"deleted": true}))
+        }
+    }
+
+    /// Stands in for an MCP client that declared elicitation support.
+    ///
+    /// Records the prompt so the test can prove a real round trip happened
+    /// rather than inferring one from an "approved" verdict that a broken
+    /// handler could also produce by defaulting open.
+    struct RecordingSession {
+        prompts: Arc<std::sync::Mutex<Vec<String>>>,
+        action: crate::helpers::ElicitAction,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::server::router::SessionHandle for RecordingSession {
+        async fn elicit_form(
+            &self,
+            message: &str,
+            requested_schema: &Value,
+        ) -> Result<crate::helpers::ElicitResult, Box<dyn std::error::Error + Send + Sync>>
+        {
+            assert!(
+                requested_schema.get("properties").is_some(),
+                "the approval prompt must carry a non-empty schema: {requested_schema}"
+            );
+            self.prompts
+                .lock()
+                .expect("prompt sink")
+                .push(message.to_string());
+            Ok(crate::helpers::ElicitResult {
+                action: self.action.clone(),
+                content: None,
+            })
+        }
+    }
+
+    /// Flatten the router's content items into one searchable string.
+    fn rendered(content: &[crate::server::router::ContentItem]) -> String {
+        content
+            .iter()
+            .map(|item| item.data.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Wire the real stack: gated module, real executor, an
+    /// `ElicitationApprovalHandler` constructed with `None` exactly as a CLI
+    /// entry point must (it never sees a session), and the shipped adapter.
+    fn gated_router(
+        executed: Arc<std::sync::atomic::AtomicBool>,
+    ) -> crate::server::router::ExecutionRouter {
+        let registry = Arc::new(apcore::registry::registry::Registry::default());
+        let descriptor = ModuleDescriptor {
+            module_id: "demo.gated".to_string(),
+            name: None,
+            description: "deletes something important".to_string(),
+            documentation: None,
+            input_schema: json!({"type": "object"}),
+            output_schema: json!({"type": "object"}),
+            version: "1.0.0".to_string(),
+            tags: vec![],
+            annotations: Some(ModuleAnnotations {
+                requires_approval: true,
+                ..Default::default()
+            }),
+            examples: vec![],
+            metadata: std::collections::HashMap::new(),
+            display: None,
+            sunset_date: None,
+            dependencies: vec![],
+            enabled: true,
+        };
+        registry
+            .register("demo.gated", Box::new(GatedModule { executed }), descriptor)
+            .expect("register gated module");
+
+        let mut executor = Executor::new(registry, Arc::new(Config::default()));
+        // `None`: the handler is built outside the router and never sees a
+        // session. This is precisely the construction that used to reject
+        // every call, and it must now resolve the live callback per request.
+        executor.set_approval_handler(Box::new(crate::adapters::ElicitationApprovalHandler::new(
+            None,
+        )));
+
+        let adapter = ApcoreExecutorAdapter {
+            inner: Arc::new(executor),
+            strategy: None,
+        };
+        crate::server::router::ExecutionRouter::new(Box::new(adapter), false, None)
+    }
+
+    #[tokio::test]
+    async fn test_elicitation_approval_prompts_the_client_and_runs_the_module() {
+        let executed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let router = gated_router(Arc::clone(&executed));
+        let prompts = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let extra = crate::server::router::CallExtra {
+            progress_token: None,
+            send_notification: None,
+            session: Some(Arc::new(RecordingSession {
+                prompts: Arc::clone(&prompts),
+                action: crate::helpers::ElicitAction::Accept,
+            })),
+            identity: None,
+            typed_identity: None,
+        };
+
+        let (content, is_error, _) = router
+            .handle_call_with_extra("demo.gated", &json!({}), Some(extra))
+            .await;
+
+        let rendered = rendered(&content);
+        assert!(!is_error, "an approved call must succeed, got: {rendered}");
+        let recorded = prompts.lock().expect("prompt sink").clone();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "the client must have been prompted exactly once: {recorded:?}"
+        );
+        assert!(
+            recorded[0].contains("demo.gated"),
+            "the prompt must name the module being approved: {}",
+            recorded[0]
+        );
+        assert!(
+            executed.load(std::sync::atomic::Ordering::SeqCst),
+            "the module body must run once approval was granted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_elicitation_approval_declined_blocks_the_module() {
+        // The round trip must be able to say no. Without this, a handler that
+        // ignored the response and always approved would pass the accept test.
+        let executed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let router = gated_router(Arc::clone(&executed));
+        let prompts = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let extra = crate::server::router::CallExtra {
+            progress_token: None,
+            send_notification: None,
+            session: Some(Arc::new(RecordingSession {
+                prompts: Arc::clone(&prompts),
+                action: crate::helpers::ElicitAction::Decline,
+            })),
+            identity: None,
+            typed_identity: None,
+        };
+
+        let (content, is_error, _) = router
+            .handle_call_with_extra("demo.gated", &json!({}), Some(extra))
+            .await;
+
+        assert!(is_error, "a declined approval must fail the call");
+        assert_eq!(
+            prompts.lock().expect("prompt sink").len(),
+            1,
+            "the client must still have been prompted"
+        );
+        assert!(
+            !executed.load(std::sync::atomic::Ordering::SeqCst),
+            "the module body must NOT run when the user declined"
+        );
+        let rendered = rendered(&content);
+        assert!(
+            rendered.contains("decline"),
+            "the denial must carry the user's action: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_no_session_still_rejects_cleanly() {
+        // A client that never declared elicitation support gets the
+        // fail-closed rejection, unchanged. This is the control that keeps the
+        // two tests above honest: if approval had simply stopped being
+        // enforced, they would pass and this one would not.
+        let executed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let router = gated_router(Arc::clone(&executed));
+
+        let extra = crate::server::router::CallExtra {
+            progress_token: None,
+            send_notification: None,
+            session: None,
+            identity: None,
+            typed_identity: None,
+        };
+
+        let (content, is_error, _) = router
+            .handle_call_with_extra("demo.gated", &json!({}), Some(extra))
+            .await;
+
+        assert!(
+            is_error,
+            "no elicitation path means the call must be denied"
+        );
+        assert!(
+            !executed.load(std::sync::atomic::Ordering::SeqCst),
+            "the module body must NOT run without approval"
+        );
+        let rendered = rendered(&content);
+        assert!(
+            rendered.contains("No elicitation callback available"),
+            "the rejection must say why: {rendered}"
+        );
+    }
 }
