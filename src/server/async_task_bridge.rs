@@ -564,13 +564,19 @@ impl AsyncTaskBridge {
         send_notification: Option<SendNotificationFn>,
         session_key: Option<&str>,
     ) -> Result<Value, apcore::errors::ModuleError> {
+        // [A-D-AT-3] `as_str()` yields Some("") for an empty string, so the
+        // emptiness check has to be explicit. Python
+        // (`not isinstance(x, str) or not x`) and TypeScript
+        // (`typeof x !== "string" || x.length === 0`) both reject, and the
+        // spec Contracts pin `validates[non-empty string]`.
         let module_id = arguments
             .get("module_id")
             .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
             .ok_or_else(|| {
                 apcore::errors::ModuleError::new(
                     apcore::errors::ErrorCode::GeneralInvalidInput,
-                    "__apcore_task_submit requires 'module_id'",
+                    "__apcore_task_submit requires a non-empty 'module_id'",
                 )
             })?;
 
@@ -633,13 +639,17 @@ impl AsyncTaskBridge {
     }
 
     fn handle_status(&self, arguments: &Value) -> Result<Value, apcore::errors::ModuleError> {
+        // [A-D-AT-3] Reject an empty task_id up front; without this it
+        // reached the registry and came back as ASYNC_TASK_NOT_FOUND instead of
+        // an invalid-argument error, unlike Python and TypeScript.
         let task_id = arguments
             .get("task_id")
             .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
             .ok_or_else(|| {
                 apcore::errors::ModuleError::new(
                     apcore::errors::ErrorCode::GeneralInvalidInput,
-                    "__apcore_task_status requires 'task_id'",
+                    "__apcore_task_status requires a non-empty 'task_id'",
                 )
             })?;
         match self.get_status(task_id) {
@@ -658,13 +668,15 @@ impl AsyncTaskBridge {
     }
 
     async fn handle_cancel(&self, arguments: &Value) -> Result<Value, apcore::errors::ModuleError> {
+        // [A-D-AT-3] Same non-empty requirement as handle_status.
         let task_id = arguments
             .get("task_id")
             .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
             .ok_or_else(|| {
                 apcore::errors::ModuleError::new(
                     apcore::errors::ErrorCode::GeneralInvalidInput,
-                    "__apcore_task_cancel requires 'task_id'",
+                    "__apcore_task_cancel requires a non-empty 'task_id'",
                 )
             })?;
         // [D10-004] Pre-check task existence (matching Python `_handle_cancel_tool`).
@@ -724,13 +736,17 @@ impl AsyncTaskBridge {
         arguments: &Value,
         identity: Option<Identity>,
     ) -> Result<Value, apcore::errors::ModuleError> {
+        // [A-D-AT-3] An empty module_id used to reach
+        // `executor.validate("", ..)` — an actual executor call the peers never
+        // make.
         let module_id = arguments
             .get("module_id")
             .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
             .ok_or_else(|| {
                 apcore::errors::ModuleError::new(
                     apcore::errors::ErrorCode::GeneralInvalidInput,
-                    "__apcore_module_preview requires 'module_id'",
+                    "__apcore_module_preview requires a non-empty 'module_id'",
                 )
             })?;
         // Reject reserved-prefix module ids the same way the submit branch
@@ -1191,6 +1207,35 @@ mod tests {
             .handle_meta_tool("math.add", &json!({}), None, None, None, None)
             .await;
         assert!(res.is_none());
+    }
+
+    // -- [A-D-AT-3] empty-string ids are invalid input, not "not found" -----
+
+    /// `as_str()` returns Some("") for an empty string, and no length check
+    /// followed. Python and TypeScript both reject; on Rust an empty task_id
+    /// returned ASYNC_TASK_NOT_FOUND and an empty module_id reached
+    /// `executor.validate("", ..)` — an executor call the peers never make.
+    #[tokio::test]
+    async fn meta_tools_reject_empty_string_ids() {
+        let bridge = AsyncTaskBridge::new(make_executor());
+        let cases = [
+            (META_TOOL_SUBMIT, json!({"module_id": "", "arguments": {}})),
+            (META_TOOL_STATUS, json!({"task_id": ""})),
+            (META_TOOL_CANCEL, json!({"task_id": ""})),
+            (META_TOOL_PREVIEW, json!({"module_id": "", "arguments": {}})),
+        ];
+        for (tool, args) in cases {
+            let result = bridge
+                .handle_meta_tool(tool, &args, None, None, None, None)
+                .await
+                .expect("meta-tool must be routed");
+            let err = result.expect_err(&format!("{tool} must reject an empty id"));
+            assert_eq!(
+                err.code,
+                apcore::errors::ErrorCode::GeneralInvalidInput,
+                "{tool} must report invalid input, not not-found"
+            );
+        }
     }
 
     // -- Issue D10-004: meta-tool handler still rejects __apcore_* ids -------
