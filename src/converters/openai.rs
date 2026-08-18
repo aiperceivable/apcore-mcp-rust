@@ -167,7 +167,10 @@ impl OpenAIConverter {
             // richer than the JSON-projection path. Otherwise fall back
             // to the descriptor's plain `description` field.
             let description = if options.rich_description {
+                // [A-D-MD-3] The helper reports a render failure as None; the
+                // plain description is the caller's fallback.
                 markdown::render_module_markdown(&descriptor, true)
+                    .unwrap_or_else(|| descriptor.description.clone())
             } else {
                 descriptor.description.clone()
             };

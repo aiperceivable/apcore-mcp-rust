@@ -444,8 +444,11 @@ impl MCPServerFactory {
                 .and_then(|v| v.as_str())
             {
                 Some(desc) => desc.to_string(),
+                // [A-D-MD-3] None from the helper means the render failed;
+                // fall back to the plain describe() text.
                 None if self.rich_description => {
                     crate::markdown::render_module_markdown(&descriptor, true)
+                        .unwrap_or(base_description)
                 }
                 None => base_description,
             };
