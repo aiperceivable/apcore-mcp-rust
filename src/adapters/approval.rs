@@ -79,6 +79,27 @@ fn rejected(reason: &str) -> ApprovalResult {
     result
 }
 
+/// Coerce an elicitation `approve` value to a decision.
+///
+/// [A-D-AP-5] The previous `as_bool().unwrap_or(true)` GRANTED approval for
+/// any non-boolean — `null` from a blank boolean control, `0`, `""` — which is
+/// the wrong direction on a fail-closed safety gate. Python coerces with
+/// `bool(...)` and TypeScript with `Boolean(...)`, so this reproduces their
+/// truthiness for every scalar shape where the two agree.
+///
+/// Arrays and objects are the one shape where the peers disagree
+/// (`bool([]) is False` in Python, `Boolean([])` is `true` in JS), so they are
+/// declined — the safe side of a divergence that cannot be matched either way.
+fn approve_truthiness(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Bool(b) => *b,
+        serde_json::Value::Null => false,
+        serde_json::Value::Number(n) => n.as_f64().is_some_and(|f| f != 0.0),
+        serde_json::Value::String(s) => !s.is_empty(),
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => false,
+    }
+}
+
 /// Build an approved [`ApprovalResult`].
 fn approved() -> ApprovalResult {
     let mut result = ApprovalResult::default();
@@ -217,7 +238,7 @@ impl ApprovalHandler for ElicitationApprovalHandler {
                     .content
                     .as_ref()
                     .and_then(|c| c.get("approve"))
-                    .map(|v| v.as_bool().unwrap_or(true))
+                    .map(approve_truthiness)
                     .unwrap_or(true);
                 if approve {
                     Ok(approved())
@@ -468,6 +489,74 @@ mod tests {
                 Some(ElicitResult {
                     action: ElicitAction::Accept,
                     content: Some(json!({"approve": true})),
+                })
+            })
+        });
+        let handler = ElicitationApprovalHandler::new(Some(cb));
+        let result = handler.request_approval(&test_request()).await.unwrap();
+        assert_eq!(result.status, "approved");
+    }
+
+    /// [A-D-AP-5] A present-but-unparseable `approve` must fail closed.
+    ///
+    /// `as_bool().unwrap_or(true)` used to GRANT approval for `null`, `0` and
+    /// `""` — the wrong direction on a safety gate, and the opposite of
+    /// Python's `bool(...)` and TypeScript's `Boolean(...)`.
+    #[tokio::test]
+    async fn test_request_approval_accept_with_falsy_approve_is_rejected() {
+        for falsy in [json!(null), json!(0), json!(""), json!([]), json!({})] {
+            let value = falsy.clone();
+            let cb: ElicitCallback = Box::new(move |_msg, _schema| {
+                let value = value.clone();
+                Box::pin(async move {
+                    Some(ElicitResult {
+                        action: ElicitAction::Accept,
+                        content: Some(json!({"approve": value})),
+                    })
+                })
+            });
+            let handler = ElicitationApprovalHandler::new(Some(cb));
+            let result = handler.request_approval(&test_request()).await.unwrap();
+            assert_eq!(
+                result.status, "rejected",
+                "approve={falsy} must be rejected, not approved"
+            );
+        }
+    }
+
+    /// Truthy non-bools stay approved, matching Python's `bool(1)` /
+    /// `bool("yes")` and TypeScript's `Boolean(..)`.
+    #[tokio::test]
+    async fn test_request_approval_accept_with_truthy_approve_is_approved() {
+        for truthy in [json!(1), json!("yes")] {
+            let value = truthy.clone();
+            let cb: ElicitCallback = Box::new(move |_msg, _schema| {
+                let value = value.clone();
+                Box::pin(async move {
+                    Some(ElicitResult {
+                        action: ElicitAction::Accept,
+                        content: Some(json!({"approve": value})),
+                    })
+                })
+            });
+            let handler = ElicitationApprovalHandler::new(Some(cb));
+            let result = handler.request_approval(&test_request()).await.unwrap();
+            assert_eq!(
+                result.status, "approved",
+                "approve={truthy} must be approved"
+            );
+        }
+    }
+
+    /// An absent `approve` field still means approval — accept alone approves
+    /// in all three SDKs.
+    #[tokio::test]
+    async fn test_request_approval_accept_without_approve_field_is_approved() {
+        let cb: ElicitCallback = Box::new(move |_msg, _schema| {
+            Box::pin(async move {
+                Some(ElicitResult {
+                    action: ElicitAction::Accept,
+                    content: Some(json!({"other": 1})),
                 })
             })
         });
