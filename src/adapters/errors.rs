@@ -22,14 +22,20 @@ const SANITIZED_ERROR_CODES: &[ApcoreErrorCode] = &[ApcoreErrorCode::ACLDenied];
 /// Structured MCP error response.
 ///
 /// Wire format uses camelCase keys to match MCP/TypeScript convention.
-/// Optional fields are omitted when `None`.
+///
+/// The AI-guidance fields are omitted when `None`, matching Python's
+/// `_attach_ai_guidance` (which only writes non-None values) and TypeScript's
+/// conditional spread. `details` is NOT omitted: [A-D-EM-1] both peers always
+/// emit the key — `"details": None` in Python, `details: null` in TypeScript —
+/// and the error-mapper spec pins the envelope as byte-identical across SDKs,
+/// so a client written as `if ('details' in resp)` must not branch differently
+/// against Rust.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct McpErrorResponse {
     pub is_error: bool,
     pub error_type: String,
     pub message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retryable: Option<bool>,
@@ -103,11 +109,7 @@ impl ErrorMapper {
         // Schema validation → format field-level errors
         if code == ApcoreErrorCode::SchemaValidationError {
             let formatted = format_validation_errors(&error.details);
-            let details_value = if error.details.is_empty() {
-                None
-            } else {
-                Some(serde_json::to_value(&error.details).unwrap_or(Value::Null))
-            };
+            let details_value = Some(details_value(error));
             let mut resp = McpErrorResponse {
                 is_error: true,
                 error_type,
@@ -144,11 +146,7 @@ impl ErrorMapper {
 
         // Approval timeout → pass through with retryable=true
         if code == ApcoreErrorCode::ApprovalTimeout {
-            let details_value = if error.details.is_empty() {
-                None
-            } else {
-                Some(serde_json::to_value(&error.details).unwrap_or(Value::Null))
-            };
+            let details_value = Some(details_value(error));
             let mut resp = McpErrorResponse {
                 is_error: true,
                 error_type,
@@ -165,16 +163,9 @@ impl ErrorMapper {
 
         // Approval denied → extract reason
         if code == ApcoreErrorCode::ApprovalDenied {
-            let reason = error.details.get("reason");
-            let details_value = match reason {
+            let details_value = match error.details.get("reason") {
                 Some(r) => Some(serde_json::json!({ "reason": r })),
-                None => {
-                    if error.details.is_empty() {
-                        None
-                    } else {
-                        Some(serde_json::to_value(&error.details).unwrap_or(Value::Null))
-                    }
-                }
+                None => Some(details_value(error)),
             };
             let mut resp = McpErrorResponse {
                 is_error: true,
@@ -280,11 +271,7 @@ impl ErrorMapper {
         }
 
         // Default: pass through message and details
-        let details_value = if error.details.is_empty() {
-            None
-        } else {
-            Some(serde_json::to_value(&error.details).unwrap_or(Value::Null))
-        };
+        let details_value = Some(details_value(error));
         let mut resp = McpErrorResponse {
             is_error: true,
             error_type,
@@ -353,16 +340,22 @@ fn format_validation_errors(details: &std::collections::HashMap<String, Value>) 
 ///
 /// Used by error-code-specific branches that extract a detail field into
 /// a custom message but otherwise follow the same structure.
+/// Serialize an apcore error's `details` map for the wire envelope.
+///
+/// [A-D-EM-1] An empty map serializes to `{}`, never to a dropped key. Python
+/// (`details or {}`) and TypeScript (`details ?? {}`) both hand the empty map
+/// straight through, so collapsing it to `None` here made ordinary error
+/// envelopes lose the key that the peers emit.
+fn details_value(error: &ModuleError) -> Value {
+    serde_json::to_value(&error.details).unwrap_or(Value::Null)
+}
+
 fn build_detail_response(
     error: &ModuleError,
     error_type: String,
     message: String,
 ) -> McpErrorResponse {
-    let details_value = if error.details.is_empty() {
-        None
-    } else {
-        Some(serde_json::to_value(&error.details).unwrap_or(Value::Null))
-    };
+    let details_value = Some(details_value(error));
     let mut resp = McpErrorResponse {
         is_error: true,
         error_type,
@@ -431,6 +424,44 @@ pub fn internal_error_response() -> McpErrorResponse {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    // -- wire envelope shape [A-D-EM-1] ---------------------------------
+
+    /// `details` must always be present on the wire. Python emits
+    /// `"details": None` and TypeScript `details: null`, and the spec pins the
+    /// `internal_error_response()` envelope as byte-identical across SDKs — a
+    /// client written as `if ('details' in resp)` must not branch differently
+    /// against Rust.
+    #[test]
+    fn internal_error_response_serializes_details_as_null() {
+        let json = serde_json::to_value(internal_error_response()).expect("serialize");
+        let obj = json.as_object().expect("object");
+        assert_eq!(
+            obj.len(),
+            4,
+            "expected exactly isError/errorType/message/details, got {json}"
+        );
+        assert_eq!(obj.get("details"), Some(&Value::Null));
+        assert_eq!(obj.get("isError"), Some(&Value::Bool(true)));
+        assert_eq!(
+            obj.get("errorType").and_then(|v| v.as_str()),
+            Some("GENERAL_INTERNAL_ERROR")
+        );
+    }
+
+    /// An apcore error carrying an EMPTY details map must serialize as `{}`,
+    /// not as an omitted key — `details or {}` in Python and `details ?? {}`
+    /// in TypeScript both hand the empty map straight through.
+    #[test]
+    fn empty_details_map_serializes_as_empty_object() {
+        let err = make_error(ApcoreErrorCode::ModuleNotFound, "nope");
+        let json = serde_json::to_value(ErrorMapper::to_mcp_error(&err)).expect("serialize");
+        assert_eq!(
+            json.get("details"),
+            Some(&serde_json::json!({})),
+            "empty details must round-trip as {{}}: {json}"
+        );
+    }
 
     /// Helper: create a basic ModuleError with the given code and message.
     fn make_error(code: ApcoreErrorCode, message: &str) -> ModuleError {
