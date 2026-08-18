@@ -462,7 +462,7 @@ impl OpenAIConverter {
 
     /// Apply OpenAI strict mode transformations to a schema.
     ///
-    /// 1. Promotes `x-llm-description` to `description` where both exist.
+    /// 1. Promotes `x-llm-description` to `description` wherever it appears.
     /// 2. Strips all `x-*` extension keys and `default` keys.
     /// 3. Enforces strict mode rules (`additionalProperties: false`, all
     ///    properties required, optional properties become nullable).
@@ -474,51 +474,38 @@ impl OpenAIConverter {
         schema
     }
 
-    /// Replace `description` with `x-llm-description` where both exist.
-    /// Recurses into properties, items, oneOf/anyOf/allOf, $defs/definitions.
+    /// Promote `x-llm-description` to `description` recursively.
+    ///
+    /// [A-D-OC-3] Promotion is unconditional: spec step 1 pins
+    /// "Promote `x-llm-description` -> `description` (before stripping)" with
+    /// no precondition, and TypeScript promotes whenever the key holds a
+    /// string. Guarding on an existing `description` meant step 2's `x-*`
+    /// strip silently discarded the text on nodes annotated only with
+    /// `x-llm-description`.
+    ///
+    /// The walk is generic rather than a keyword whitelist, matching both
+    /// TypeScript and [`Self::strip_extensions`] in this same pipeline — a
+    /// narrower walk here would let the strip remove an annotation this pass
+    /// never saw.
     fn apply_llm_descriptions(node: &mut Value) {
-        let obj = match node.as_object_mut() {
-            Some(o) => o,
-            None => return,
-        };
-
-        // Promote x-llm-description to description
-        if let Some(llm_desc) = obj.get("x-llm-description").cloned() {
-            if obj.contains_key("description") {
-                obj.insert("description".to_string(), llm_desc);
-            }
-        }
-
-        // Recurse into properties
-        if let Some(Value::Object(props)) = obj.get_mut("properties") {
-            for prop in props.values_mut() {
-                Self::apply_llm_descriptions(prop);
-            }
-        }
-
-        // Recurse into items
-        if let Some(items) = obj.get_mut("items") {
-            if items.is_object() {
-                Self::apply_llm_descriptions(items);
-            }
-        }
-
-        // Recurse into oneOf/anyOf/allOf
-        for keyword in &["oneOf", "anyOf", "allOf"] {
-            if let Some(Value::Array(arr)) = obj.get_mut(*keyword) {
-                for sub in arr.iter_mut() {
-                    Self::apply_llm_descriptions(sub);
+        match node {
+            Value::Object(map) => {
+                // Only string values are promotable, as TypeScript's
+                // `typeof obj["x-llm-description"] === "string"` guard requires.
+                if let Some(llm_desc) = map.get("x-llm-description").and_then(Value::as_str) {
+                    let llm_desc = llm_desc.to_string();
+                    map.insert("description".to_string(), Value::String(llm_desc));
+                }
+                for value in map.values_mut() {
+                    Self::apply_llm_descriptions(value);
                 }
             }
-        }
-
-        // Recurse into $defs/definitions
-        for defs_key in &["$defs", "definitions"] {
-            if let Some(Value::Object(defs)) = obj.get_mut(*defs_key) {
-                for defn in defs.values_mut() {
-                    Self::apply_llm_descriptions(defn);
+            Value::Array(arr) => {
+                for item in arr.iter_mut() {
+                    Self::apply_llm_descriptions(item);
                 }
             }
+            _ => {}
         }
     }
 
@@ -1204,15 +1191,67 @@ mod tests {
         assert_eq!(node, original);
     }
 
+    /// [A-D-OC-3] Promotion is unconditional. Spec step 1 pins
+    /// "Promote `x-llm-description` -> `description` (before stripping)" with
+    /// no precondition, and TypeScript promotes whenever the key holds a
+    /// string. Requiring an existing `description` meant step 2's `x-*` strip
+    /// silently discarded the text on a node annotated only with
+    /// `x-llm-description`.
     #[test]
-    fn test_apply_llm_descriptions_no_description_key() {
-        // x-llm-description without description should NOT create description
+    fn test_apply_llm_descriptions_without_existing_description_key() {
         let mut node = json!({
             "x-llm-description": "LLM only"
         });
         OpenAIConverter::apply_llm_descriptions(&mut node);
+        assert_eq!(node["description"], "LLM only");
+    }
+
+    /// [A-D-OC-3] Non-string values are not promoted — TypeScript guards with
+    /// `typeof obj["x-llm-description"] === "string"`.
+    #[test]
+    fn test_apply_llm_descriptions_ignores_non_string() {
+        let mut node = json!({"x-llm-description": 42});
+        OpenAIConverter::apply_llm_descriptions(&mut node);
         assert!(node.get("description").is_none());
-        assert_eq!(node["x-llm-description"], "LLM only");
+    }
+
+    /// [A-D-OC-3] The keyed walk visited only
+    /// properties/items/oneOf/anyOf/allOf/$defs/definitions, so nodes reached
+    /// through any other keyword were promoted in TypeScript and not in Rust —
+    /// and then stripped, losing the text entirely.
+    #[test]
+    fn test_apply_llm_descriptions_reaches_non_whitelisted_keywords() {
+        let mut node = json!({
+            "type": "object",
+            "patternProperties": {
+                "^a": {"type": "string", "x-llm-description": "pattern doc"}
+            },
+            "prefixItems": [{"type": "string", "x-llm-description": "prefix doc"}]
+        });
+        OpenAIConverter::apply_llm_descriptions(&mut node);
+        assert_eq!(
+            node["patternProperties"]["^a"]["description"],
+            "pattern doc"
+        );
+        assert_eq!(node["prefixItems"][0]["description"], "prefix doc");
+    }
+
+    /// End-to-end through strict conversion: a property carrying ONLY
+    /// `x-llm-description` keeps that text as `description`.
+    #[test]
+    fn test_strict_mode_keeps_llm_only_description() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "q": {"type": "string", "x-llm-description": "the search term"}
+            }
+        });
+        let result = OpenAIConverter::apply_strict_mode(&schema);
+        assert_eq!(
+            result["properties"]["q"]["description"], "the search term",
+            "got: {result}"
+        );
+        assert!(result["properties"]["q"].get("x-llm-description").is_none());
     }
 
     #[test]
