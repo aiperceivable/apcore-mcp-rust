@@ -683,14 +683,36 @@ impl APCoreMCP {
     /// # Panics
     ///
     /// Panics if called from within an active Tokio runtime (e.g. inside
-    /// `#[tokio::main]`).  Use [`async_serve`](Self::async_serve) for
-    /// async contexts.
+    /// `#[tokio::main]`).  Use [`serve_async`](Self::serve_async) for async
+    /// contexts, or [`async_serve`](Self::async_serve) to obtain a router
+    /// instead of running the transport.
     pub fn serve(&self) -> Result<(), APCoreMCPError> {
         self.serve_with_options(ServeOptions::default())
     }
 
     /// Synchronously start the MCP server with custom options (blocks the current thread).
+    ///
+    /// # Panics
+    ///
+    /// Panics if called from within an active Tokio runtime; use
+    /// [`serve_with_options_async`](Self::serve_with_options_async) there.
     pub fn serve_with_options(&self, opts: ServeOptions) -> Result<(), APCoreMCPError> {
+        tokio::runtime::Runtime::new()
+            .map_err(|e| APCoreMCPError::ServerError(e.to_string()))?
+            .block_on(self.serve_with_options_async(opts))
+    }
+
+    /// Start the MCP server on the caller's Tokio runtime and run until shutdown.
+    ///
+    /// The async counterpart of [`serve`](Self::serve): it borrows the ambient
+    /// runtime rather than constructing one, so it is safe to call from inside
+    /// `#[tokio::main]` or any other async context.
+    pub async fn serve_async(&self) -> Result<(), APCoreMCPError> {
+        self.serve_with_options_async(ServeOptions::default()).await
+    }
+
+    /// Start the MCP server with custom options on the caller's Tokio runtime.
+    pub async fn serve_with_options_async(&self, opts: ServeOptions) -> Result<(), APCoreMCPError> {
         // Validate explorer prefix if explorer is enabled
         if opts.explorer.explorer && !opts.explorer.explorer_prefix.starts_with('/') {
             return Err(APCoreMCPError::InvalidExplorerPrefix);
@@ -790,65 +812,64 @@ impl APCoreMCP {
             on_startup();
         }
 
-        let result = tokio::runtime::Runtime::new()
-            .map_err(|e| APCoreMCPError::ServerError(e.to_string()))?
-            .block_on(async {
-                use crate::server::transport::HttpAuthConfig;
-                // [H-1] Start the approval store TTL sweep, if configured.
-                if let Some(ref store) = self.approval_store {
-                    if store.start_sweep().is_some() {
-                        tracing::info!("Approval store TTL sweep started");
-                    }
+        let result = async {
+            use crate::server::transport::HttpAuthConfig;
+            // [H-1] Start the approval store TTL sweep, if configured.
+            if let Some(ref store) = self.approval_store {
+                if store.start_sweep().is_some() {
+                    tracing::info!("Approval store TTL sweep started");
                 }
-                match transport.as_str() {
-                    "streamable-http" => transport_manager
-                        .run_streamable_http_with_auth(
-                            Arc::clone(&handler),
-                            &self.config.host,
-                            self.config.port,
-                            explorer_router,
-                            HttpAuthConfig {
-                                authenticator: self.authenticator.clone(),
-                                require_auth: self.config.require_auth,
-                                explorer_prefix: if opts.explorer.explorer {
-                                    Some(opts.explorer.explorer_prefix.clone())
-                                } else {
-                                    None
-                                },
-                                exempt_paths: self.config.exempt_paths.clone(),
+            }
+            match transport.as_str() {
+                "streamable-http" => transport_manager
+                    .run_streamable_http_with_auth(
+                        Arc::clone(&handler),
+                        &self.config.host,
+                        self.config.port,
+                        explorer_router,
+                        HttpAuthConfig {
+                            authenticator: self.authenticator.clone(),
+                            require_auth: self.config.require_auth,
+                            explorer_prefix: if opts.explorer.explorer {
+                                Some(opts.explorer.explorer_prefix.clone())
+                            } else {
+                                None
                             },
-                        )
-                        .await
-                        .map_err(|e| APCoreMCPError::ServerError(e.to_string())),
-                    #[allow(deprecated)]
-                    "sse" => transport_manager
-                        .run_sse_with_auth(
-                            Arc::clone(&handler),
-                            &self.config.host,
-                            self.config.port,
-                            explorer_router,
-                            HttpAuthConfig {
-                                authenticator: self.authenticator.clone(),
-                                require_auth: self.config.require_auth,
-                                explorer_prefix: if opts.explorer.explorer {
-                                    Some(opts.explorer.explorer_prefix.clone())
-                                } else {
-                                    None
-                                },
-                                exempt_paths: self.config.exempt_paths.clone(),
+                            exempt_paths: self.config.exempt_paths.clone(),
+                        },
+                    )
+                    .await
+                    .map_err(|e| APCoreMCPError::ServerError(e.to_string())),
+                #[allow(deprecated)]
+                "sse" => transport_manager
+                    .run_sse_with_auth(
+                        Arc::clone(&handler),
+                        &self.config.host,
+                        self.config.port,
+                        explorer_router,
+                        HttpAuthConfig {
+                            authenticator: self.authenticator.clone(),
+                            require_auth: self.config.require_auth,
+                            explorer_prefix: if opts.explorer.explorer {
+                                Some(opts.explorer.explorer_prefix.clone())
+                            } else {
+                                None
                             },
-                        )
+                            exempt_paths: self.config.exempt_paths.clone(),
+                        },
+                    )
+                    .await
+                    .map_err(|e| APCoreMCPError::ServerError(e.to_string())),
+                _ => {
+                    // stdio
+                    transport_manager
+                        .run_stdio(&*handler)
                         .await
-                        .map_err(|e| APCoreMCPError::ServerError(e.to_string())),
-                    _ => {
-                        // stdio
-                        transport_manager
-                            .run_stdio(&*handler)
-                            .await
-                            .map_err(|e| APCoreMCPError::ServerError(e.to_string()))
-                    }
+                        .map_err(|e| APCoreMCPError::ServerError(e.to_string()))
                 }
-            });
+            }
+        }
+        .await;
 
         if let Some(ref on_shutdown) = opts.on_shutdown {
             on_shutdown();

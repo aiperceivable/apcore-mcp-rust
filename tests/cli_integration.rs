@@ -130,3 +130,73 @@ fn jwt_key_file_nonexistent_exits_one() {
         "stderr should mention missing key file: {stderr}"
     );
 }
+
+/// [B-RS-1] The shipped binary must actually start and answer requests.
+///
+/// The earlier tests only covered `--help` and error paths, which let a
+/// nested-runtime panic ship: `#[tokio::main]` in `bin/apcore-mcp.rs` plus a
+/// `Runtime::new().block_on(..)` inside `serve()` aborted every transport at
+/// startup. This drives a real stdio session end to end.
+#[test]
+fn stdio_transport_answers_tools_list() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::Stdio;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = Command::new(binary_path())
+        .args([
+            "--extensions-dir",
+            dir.path().to_str().unwrap(),
+            "--transport",
+            "stdio",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn binary");
+
+    {
+        let stdin = child.stdin.as_mut().expect("stdin");
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2024-11-05","capabilities":{{}},"clientInfo":{{"name":"conformance","version":"1"}}}}}}"#
+        )
+        .expect("write initialize");
+        writeln!(stdin, r#"{{"jsonrpc":"2.0","id":2,"method":"tools/list"}}"#)
+            .expect("write tools/list");
+        stdin.flush().expect("flush");
+    }
+
+    // Read until the `tools/list` reply (id 2) arrives, then shut the child down.
+    let stdout = child.stdout.take().expect("stdout");
+    let mut tools_reply = None;
+    for line in BufReader::new(stdout).lines() {
+        let line = line.expect("read stdout line");
+        let value: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if value.get("id").and_then(|v| v.as_u64()) == Some(2) {
+            tools_reply = Some(value);
+            break;
+        }
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let reply = tools_reply
+        .expect("no tools/list response on stdio — the binary never reached a serving state");
+    assert!(
+        reply.get("error").is_none(),
+        "tools/list returned an error: {reply}"
+    );
+    assert!(
+        reply
+            .pointer("/result/tools")
+            .and_then(|t| t.as_array())
+            .is_some(),
+        "tools/list response has no result.tools array: {reply}"
+    );
+}

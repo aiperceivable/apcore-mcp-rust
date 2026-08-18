@@ -439,8 +439,11 @@ pub async fn run() -> Result<(), CliError> {
         .build()
         .map_err(|e| CliError::StartupFailure(e.to_string()))?;
 
-    // Start the server (blocks until shutdown).
-    mcp.serve()
+    // Start the server on the ambient runtime (runs until shutdown).
+    // `serve()` would construct a second Tokio runtime, which panics because
+    // the binary already runs under `#[tokio::main]`. [B-RS-1]
+    mcp.serve_async()
+        .await
         .map_err(|e| CliError::StartupFailure(e.to_string()))?;
 
     Ok(())
