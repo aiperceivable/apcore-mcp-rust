@@ -225,12 +225,31 @@ impl OutboundSink for StdioSink {
 struct StdioSessionGuard {
     session_id: String,
     registry: Option<Arc<SessionRegistry>>,
+    /// Cancel handler cloned from the manager.
+    ///
+    /// [A-D-TR-2] The guard needs cancellation, not the whole manager, so it
+    /// holds the handler rather than an `Arc<TransportManager>` — this keeps
+    /// `run_stdio`'s `&self` signature intact.
+    #[allow(clippy::type_complexity)]
+    cancel_handler: Option<Arc<dyn Fn(&str) + Send + Sync>>,
 }
 
 impl Drop for StdioSessionGuard {
     fn drop(&mut self) {
         if let Some(ref registry) = self.registry {
             registry.remove(&self.session_id);
+        }
+        // [A-D-TR-2] Cancel the session's async tasks on teardown, as
+        // `SseSessionGuard::drop` already does. The
+        // `set_async_task_bridge` / `set_cancel_handler` Contract says the
+        // manager cancels a session's tasks on transport teardown and does not
+        // restrict that to network transports; Python honours it on stdio too,
+        // so stdio tasks used to leak past client exit on Rust only.
+        // Registry removal comes first, matching the SSE ordering: a tool call
+        // blocked on an elicitation is woken by the closed session rather than
+        // waiting out its timeout.
+        if let Some(ref cancel) = self.cancel_handler {
+            cancel(&self.session_id);
         }
     }
 }
@@ -438,6 +457,7 @@ impl TransportManager {
         let _session_guard = StdioSessionGuard {
             session_id: session_id.clone(),
             registry: session_registry.clone(),
+            cancel_handler: self.cancel_handler.clone(),
         };
 
         let mut lines = LinesStream::new(BufReader::new(reader).lines());
@@ -1633,6 +1653,45 @@ mod tests {
 
         assert!(result.is_ok());
         assert!(output.is_empty());
+    }
+
+    /// [A-D-TR-2] stdio teardown must cancel the session's async tasks.
+    ///
+    /// `StdioSessionGuard::drop` removed the session from the registry but
+    /// never reached the cancel handler — `notify_cancel` had exactly one call
+    /// site in the file, `SseSessionGuard::drop`. The
+    /// `set_async_task_bridge` / `set_cancel_handler` Contract is not
+    /// restricted to network transports, and Python honours it on stdio.
+    #[tokio::test]
+    async fn stdio_teardown_notifies_cancel_handler() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let calls_cb = Arc::clone(&calls);
+        let seen_cb = Arc::clone(&seen);
+        let mut tm = TransportManager::new(None);
+        tm.set_cancel_handler(Some(Arc::new(move |session_id: &str| {
+            calls_cb.fetch_add(1, Ordering::SeqCst);
+            seen_cb.lock().unwrap().push(session_id.to_string());
+        })));
+
+        let reader = std::io::Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+        tm.run_stdio_with_io(reader, &mut output, &EchoHandler)
+            .await
+            .expect("stdio run");
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "stdio teardown must invoke the cancel handler exactly once"
+        );
+        assert!(
+            !seen.lock().unwrap()[0].is_empty(),
+            "the cancel handler must receive the stdio session id"
+        );
     }
 
     #[tokio::test]
