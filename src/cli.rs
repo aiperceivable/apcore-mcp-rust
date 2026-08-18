@@ -309,10 +309,13 @@ fn validate_args(args: &CliArgs) -> Result<(), CliError> {
             args.extensions_dir.display()
         )));
     }
-    if args.name.len() > 255 {
+    // CHARACTERS, not UTF-8 bytes — same counting unit as
+    // `APCoreMCPBuilder::build` and `MCPServerFactory::create_server`, and as
+    // Python (code points) and TypeScript (UTF-16 units). [A-D-FA-3]
+    let name_len = args.name.chars().count();
+    if name_len > 255 {
         return Err(CliError::InvalidArgs(format!(
-            "--name must be at most 255 characters, got {}",
-            args.name.len()
+            "--name must be at most 255 characters, got {name_len}"
         )));
     }
     Ok(())
@@ -842,6 +845,28 @@ mod tests {
         let err = validate_args(&args).unwrap_err();
         assert_eq!(err.exit_code(), 1);
         assert!(err.to_string().contains("255"));
+    }
+
+    /// The `--name` bound counts CHARACTERS, not UTF-8 bytes.
+    ///
+    /// `validate_args` is the CLI's first gate, ahead of the builder, so a
+    /// byte count here rejected a 100-character CJK name (300 bytes) that
+    /// Python and TypeScript both accept.
+    #[test]
+    fn validate_args_accepts_multibyte_name_under_the_char_limit() {
+        // Escape form keeps this source file ASCII-only (apdev check-chars).
+        let name: String = "\u{670D}".repeat(100);
+        assert_eq!(name.len(), 300, "fixture must be multi-byte");
+        let dir = tempfile::tempdir().unwrap();
+        let args = parse_args(&[
+            "apcore-mcp",
+            "--extensions-dir",
+            dir.path().to_str().unwrap(),
+            "--name",
+            &name,
+        ])
+        .unwrap();
+        validate_args(&args).expect("a 100-character name is within the limit");
     }
 
     #[test]

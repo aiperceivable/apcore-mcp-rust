@@ -687,10 +687,37 @@ impl APCoreMCP {
     /// contexts, or [`async_serve`](Self::async_serve) to obtain a router
     /// instead of running the transport.
     pub fn serve(&self) -> Result<(), APCoreMCPError> {
-        self.serve_with_options(ServeOptions::default())
+        self.serve_with_options(self.serve_options_from_config())
+    }
+
+    /// Build [`ServeOptions`] from the configuration the builder captured.
+    ///
+    /// The explorer setters on [`APCoreMCPBuilder`] (`include_explorer`,
+    /// `path_prefix`, `explorer_title`, `explorer_project_name`,
+    /// `explorer_project_url`, `allow_execute`) write to `self.config`, while
+    /// `serve_with_options` reads explorer settings from its options argument.
+    /// The no-options entry points bridge the two — passing
+    /// `ServeOptions::default()` instead silently dropped every
+    /// builder-configured explorer flag, including the CLI's `--explorer`,
+    /// `--explorer-prefix`, `--explorer-title` and `--allow-execute`.
+    fn serve_options_from_config(&self) -> ServeOptions {
+        ServeOptions {
+            explorer: ExplorerOptions {
+                explorer: self.config.explorer,
+                explorer_prefix: self.config.explorer_prefix.clone(),
+                explorer_title: self.config.explorer_title.clone(),
+                explorer_project_name: self.config.explorer_project_name.clone(),
+                explorer_project_url: self.config.explorer_project_url.clone(),
+                allow_execute: self.config.allow_execute,
+            },
+            ..Default::default()
+        }
     }
 
     /// Synchronously start the MCP server with custom options (blocks the current thread).
+    ///
+    /// `opts.explorer` REPLACES the explorer configuration held on the builder;
+    /// use [`serve`](Self::serve) to run with that configuration instead.
     ///
     /// # Panics
     ///
@@ -706,9 +733,11 @@ impl APCoreMCP {
     ///
     /// The async counterpart of [`serve`](Self::serve): it borrows the ambient
     /// runtime rather than constructing one, so it is safe to call from inside
-    /// `#[tokio::main]` or any other async context.
+    /// `#[tokio::main]` or any other async context. Like `serve`, it runs with
+    /// the explorer configuration held on the builder.
     pub async fn serve_async(&self) -> Result<(), APCoreMCPError> {
-        self.serve_with_options_async(ServeOptions::default()).await
+        self.serve_with_options_async(self.serve_options_from_config())
+            .await
     }
 
     /// Start the MCP server with custom options on the caller's Tokio runtime.
@@ -1433,12 +1462,18 @@ impl APCoreMCPBuilder {
     /// Validates all inputs matching Python validation order, then resolves
     /// the backend into a registry and executor.
     pub fn build(self) -> Result<APCoreMCP, APCoreMCPError> {
-        // Validate name
+        // Validate name.
+        //
+        // The 255 bound counts CHARACTERS, not UTF-8 bytes: `str::len()` made a
+        // 100-character CJK name measure 300 and fail here, while Python
+        // (code points) and TypeScript (UTF-16 units) both accept it. Same
+        // counting unit as `MCPServerFactory::create_server`. [A-D-FA-3]
         if self.config.name.is_empty() {
             return Err(APCoreMCPError::EmptyName);
         }
-        if self.config.name.len() > 255 {
-            return Err(APCoreMCPError::NameTooLong(self.config.name.len()));
+        let name_len = self.config.name.chars().count();
+        if name_len > 255 {
+            return Err(APCoreMCPError::NameTooLong(name_len));
         }
 
         // Validate tags
@@ -2503,6 +2538,24 @@ mod tests {
         assert!(matches!(result, Err(APCoreMCPError::NameTooLong(256))));
     }
 
+    /// The 255 bound counts CHARACTERS, not UTF-8 bytes.
+    ///
+    /// Same defect class as A-D-FA-3 in `MCPServerFactory::create_server`, on
+    /// the path the CLI actually takes: a 100-character CJK name measures 300
+    /// bytes and was rejected here while Python (code points) and TypeScript
+    /// (UTF-16 units) both accept it.
+    #[test]
+    fn builder_accepts_multibyte_name_under_the_char_limit() {
+        // Escape form keeps this source file ASCII-only (apdev check-chars).
+        let name: String = "\u{670D}".repeat(100);
+        assert_eq!(name.len(), 300, "fixture must be multi-byte");
+        let result = APCoreMCP::builder().backend("./ext").name(&name).build();
+        assert!(
+            !matches!(result, Err(APCoreMCPError::NameTooLong(_))),
+            "a 100-character name is within the 255-character limit"
+        );
+    }
+
     #[test]
     fn builder_rejects_empty_tag() {
         let result = APCoreMCP::builder()
@@ -2969,6 +3022,52 @@ mod tests {
             ..Default::default()
         });
         assert!(matches!(result, Err(APCoreMCPError::InvalidExplorerPrefix)));
+    }
+
+    /// `serve()` must carry the explorer configuration captured by the
+    /// builder.
+    ///
+    /// It used to pass `ServeOptions::default()`, while `serve_with_options`
+    /// reads explorer settings from its options argument — so every
+    /// builder-configured explorer flag was silently dropped, including the
+    /// CLI's `--explorer`, `--explorer-prefix` and `--allow-execute`.
+    ///
+    /// The fixture sets an invalid explorer prefix AND an unknown transport.
+    /// The explorer check runs first, so the error names which options
+    /// actually reached `serve_with_options`, and neither path starts a server.
+    #[test]
+    fn serve_carries_builder_explorer_config() {
+        let mut mcp = make_test_apcore_mcp_with_transport("websocket");
+        mcp.config.explorer = true;
+        mcp.config.explorer_prefix = "no-slash".to_string();
+        let result = mcp.serve();
+        assert!(
+            matches!(result, Err(APCoreMCPError::InvalidExplorerPrefix)),
+            "serve() must pass the builder's explorer config through; got: {result:?}"
+        );
+    }
+
+    /// Same for the async entry point.
+    #[tokio::test]
+    async fn serve_async_carries_builder_explorer_config() {
+        let mut mcp = make_test_apcore_mcp_with_transport("websocket");
+        mcp.config.explorer = true;
+        mcp.config.explorer_prefix = "no-slash".to_string();
+        let result = mcp.serve_async().await;
+        assert!(
+            matches!(result, Err(APCoreMCPError::InvalidExplorerPrefix)),
+            "serve_async() must pass the builder's explorer config through; got: {result:?}"
+        );
+    }
+
+    /// Explorer off in the config must stay off — the prefix is then
+    /// irrelevant and the transport check is what fires.
+    #[test]
+    fn serve_leaves_explorer_off_when_the_builder_did_not_enable_it() {
+        let mut mcp = make_test_apcore_mcp_with_transport("websocket");
+        mcp.config.explorer_prefix = "no-slash".to_string();
+        let result = mcp.serve();
+        assert!(matches!(result, Err(APCoreMCPError::UnknownTransport(_))));
     }
 
     #[tokio::test]
