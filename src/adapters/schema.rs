@@ -80,12 +80,18 @@ impl SchemaConverter {
             return Ok(base);
         }
 
-        // Inline $refs if $defs present
-        if let Some(defs) = schema.get("$defs").cloned() {
-            schema = Self::inline_refs(&schema, &defs, &HashSet::new(), 0)?;
-            if let Some(obj) = schema.as_object_mut() {
-                obj.remove("$defs");
-            }
+        // Inline $refs unconditionally.
+        //
+        // [A-D-SC-1] Gating this on a root `$defs` let three things slip: a
+        // dangling `{"$ref": "#/$defs/Foo"}` was returned verbatim as an
+        // unresolvable pointer in the MCP inputSchema, nested `$defs` were not
+        // stripped, and the MAX_REF_DEPTH cap — which lives inside the inliner —
+        // went unenforced. TypeScript always inlines (schema.ts:68) and throws
+        // `$ref not found`; an absent `$defs` is simply an empty definition map.
+        let defs = schema.get("$defs").cloned().unwrap_or_else(|| json!({}));
+        schema = Self::inline_refs(&schema, &defs, &HashSet::new(), 0)?;
+        if let Some(obj) = schema.as_object_mut() {
+            obj.remove("$defs");
         }
 
         // Ensure root type: object
@@ -779,5 +785,48 @@ mod tests {
                 "strict must NOT inject into examples data leaves; got: {entry:?}"
             );
         }
+    }
+
+    // ---- [A-D-SC-1] dangling $ref must not leak ----
+
+    /// A `$ref` with no root `$defs` used to skip the inliner entirely and
+    /// ship an unresolvable pointer in the MCP inputSchema. TypeScript always
+    /// inlines and throws `$ref not found`.
+    #[test]
+    fn test_dangling_ref_without_defs_is_an_error() {
+        let schema = json!({"$ref": "#/$defs/Foo"});
+        let err = SchemaConverter::convert_input_schema(&schema)
+            .expect_err("a dangling $ref must not be returned verbatim");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Foo"),
+            "error should name the missing definition; got: {msg}"
+        );
+    }
+
+    /// The same applies one level down, inside `properties`.
+    #[test]
+    fn test_nested_dangling_ref_without_defs_is_an_error() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"a": {"$ref": "#/$defs/Missing"}}
+        });
+        assert!(SchemaConverter::convert_input_schema(&schema).is_err());
+    }
+
+    /// Nested `$defs` are stripped at every level, not just the root.
+    #[test]
+    fn test_nested_defs_are_stripped_without_root_defs() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "a": {"type": "object", "properties": {}, "$defs": {"Unused": {"type": "string"}}}
+            }
+        });
+        let result = SchemaConverter::convert_input_schema(&schema).expect("convert");
+        assert!(
+            result.pointer("/properties/a/$defs").is_none(),
+            "nested $defs must be stripped; got: {result}"
+        );
     }
 }
