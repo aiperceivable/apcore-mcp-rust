@@ -4795,27 +4795,80 @@ mod tests {
     /// `apcore-mcp/conformance/fixtures`, which covers both the sibling
     /// checkout developers use and the CI layout where the spec repo is
     /// checked out inside the workspace.
+    /// The candidate fixture directories, in resolution order.
+    ///
+    /// Shared by the lookup and by `conformance_search_report` so the two
+    /// cannot drift.
+    fn conformance_candidates() -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        let mut dir: std::path::PathBuf = env!("CARGO_MANIFEST_DIR").into();
+        for _ in 0..=4 {
+            out.push(dir.join("apcore-mcp").join("conformance").join("fixtures"));
+            if !dir.pop() {
+                break;
+            }
+        }
+        out
+    }
+
+    /// Describe what the search actually saw.
+    ///
+    /// A missing fixture is a hard failure in CI, so the message has to carry
+    /// enough to act on: whether the env override was in play, every path
+    /// tried, and — when a fixtures directory *was* found — what it holds
+    /// instead. Stating the policy without the evidence leaves a CI-only
+    /// failure with nothing to diagnose from.
+    fn conformance_search_report(name: &str) -> String {
+        let mut out = String::new();
+        match std::env::var("APCORE_CONFORMANCE_FIXTURES") {
+            Ok(value) => {
+                let verdict = if std::path::PathBuf::from(&value).is_dir() {
+                    "directory exists"
+                } else {
+                    "NOT a directory - when this is set the ancestor walk is skipped entirely"
+                };
+                out.push_str(&format!(
+                    "  $APCORE_CONFORMANCE_FIXTURES = {value:?} ({verdict})\n"
+                ));
+            }
+            Err(_) => out.push_str("  $APCORE_CONFORMANCE_FIXTURES: unset\n"),
+        }
+        out.push_str(&format!(
+            "  ancestors of {} searched for apcore-mcp/conformance/fixtures:\n",
+            env!("CARGO_MANIFEST_DIR"),
+        ));
+        for candidate in conformance_candidates() {
+            let status = if !candidate.is_dir() {
+                "no such directory".to_string()
+            } else if candidate.join(name).is_file() {
+                "HAS the fixture (it should have loaded - report this)".to_string()
+            } else {
+                format!("directory exists but holds no {name:?}; contains [{}]", {
+                    let mut names: Vec<String> = std::fs::read_dir(&candidate)
+                        .map(|rd| {
+                            rd.filter_map(Result::ok)
+                                .map(|e| e.file_name().to_string_lossy().into_owned())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    names.sort();
+                    names.join(", ")
+                })
+            };
+            out.push_str(&format!("    - {} -> {status}\n", candidate.display()));
+        }
+        out
+    }
+
     fn conformance_fixture(name: &str) -> Option<Value> {
         let dir = match std::env::var("APCORE_CONFORMANCE_FIXTURES") {
             Ok(explicit) => {
                 let candidate = std::path::PathBuf::from(explicit);
                 candidate.is_dir().then_some(candidate)
             }
-            Err(_) => {
-                let mut dir: std::path::PathBuf = env!("CARGO_MANIFEST_DIR").into();
-                let mut found = None;
-                for _ in 0..=4 {
-                    let candidate = dir.join("apcore-mcp").join("conformance").join("fixtures");
-                    if candidate.is_dir() {
-                        found = Some(candidate);
-                        break;
-                    }
-                    if !dir.pop() {
-                        break;
-                    }
-                }
-                found
-            }
+            Err(_) => conformance_candidates()
+                .into_iter()
+                .find(|candidate| candidate.is_dir()),
         };
 
         if let Some(dir) = dir {
@@ -4830,14 +4883,19 @@ mod tests {
             }
         }
 
+        let detail = format!(
+            "conformance fixture {name:?} not found.\n{}",
+            conformance_search_report(name)
+        );
         assert!(
             std::env::var_os("CI").is_none(),
-            "conformance fixture {name:?} not found. In CI this is a failure \
-             rather than a skip: the cross-language conformance suite exists to \
-             catch divergence between the three bridges, and skipping it \
-             silently reports success while proving nothing."
+            "{detail}In CI this is a failure rather than a skip: the \
+             cross-language conformance suite exists to catch divergence between \
+             the three bridges, and skipping it silently reports success while \
+             proving nothing. The workflow must check out \
+             aiperceivable/apcore-mcp to the `apcore-mcp` path."
         );
-        eprintln!("skipping: conformance fixture {name:?} not found");
+        eprintln!("skipping: {detail}");
         None
     }
 

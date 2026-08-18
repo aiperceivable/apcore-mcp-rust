@@ -40,20 +40,89 @@ pub fn fixtures_dir() -> Option<PathBuf> {
         let candidate = PathBuf::from(override_path);
         return candidate.is_dir().then_some(candidate);
     }
+    candidates()
+        .into_iter()
+        .find(|candidate| candidate.is_dir())
+}
 
+/// The candidate fixture directories, in resolution order.
+///
+/// Shared by the lookup and by [`search_report`] so the two cannot drift — a
+/// report that describes a different search than the one that ran is worse
+/// than no report.
+fn candidates() -> Vec<PathBuf> {
+    let mut out = Vec::new();
     let mut dir: PathBuf = env!("CARGO_MANIFEST_DIR").into();
     for _ in 0..=MAX_ASCENT {
-        let candidate = FIXTURE_SUBPATH
-            .iter()
-            .fold(dir.clone(), |acc, part| acc.join(part));
-        if candidate.is_dir() {
-            return Some(candidate);
-        }
+        out.push(
+            FIXTURE_SUBPATH
+                .iter()
+                .fold(dir.clone(), |acc, part| acc.join(part)),
+        );
         if !dir.pop() {
             break;
         }
     }
-    None
+    out
+}
+
+/// Describe what the search actually saw.
+///
+/// A missing fixture is a hard failure in CI, so the message has to carry
+/// enough to act on: whether the env override was in play, every path tried,
+/// and — when a fixtures directory *was* found — what it holds instead. The
+/// previous message stated the policy and reported no evidence, which left a
+/// CI-only failure with nothing to diagnose from.
+fn search_report(name: &str) -> String {
+    let mut out = String::new();
+    match std::env::var(ENV_OVERRIDE) {
+        Ok(value) => {
+            let verdict = if PathBuf::from(&value).is_dir() {
+                "directory exists"
+            } else {
+                "NOT a directory - when this is set the ancestor walk is skipped entirely"
+            };
+            out.push_str(&format!(
+                "  ${ENV_OVERRIDE} = {value:?} ({verdict})
+"
+            ));
+        }
+        Err(_) => out.push_str(&format!(
+            "  ${ENV_OVERRIDE}: unset
+"
+        )),
+    }
+    out.push_str(&format!(
+        "  ancestors of {} searched for {}:
+",
+        env!("CARGO_MANIFEST_DIR"),
+        FIXTURE_SUBPATH.join("/"),
+    ));
+    for candidate in candidates() {
+        let status = if !candidate.is_dir() {
+            "no such directory".to_string()
+        } else if candidate.join(name).is_file() {
+            "HAS the fixture (it should have loaded - report this)".to_string()
+        } else {
+            format!("directory exists but holds no {name:?}; contains [{}]", {
+                let mut names: Vec<String> = std::fs::read_dir(&candidate)
+                    .map(|rd| {
+                        rd.filter_map(Result::ok)
+                            .map(|e| e.file_name().to_string_lossy().into_owned())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                names.sort();
+                names.join(", ")
+            })
+        };
+        out.push_str(&format!(
+            "    - {} -> {status}
+",
+            candidate.display()
+        ));
+    }
+    out
 }
 
 /// Load a conformance fixture by file name.
@@ -80,20 +149,22 @@ pub fn load_fixture<T: serde::de::DeserializeOwned>(name: &str) -> Option<T> {
     }
 
     let detail = format!(
-        "conformance fixture {name:?} not found: checked ${ENV_OVERRIDE} and every ancestor of {} for {}",
-        env!("CARGO_MANIFEST_DIR"),
-        FIXTURE_SUBPATH.join("/"),
+        "conformance fixture {name:?} not found.\n{}",
+        search_report(name)
     );
 
     assert!(
         std::env::var_os("CI").is_none(),
-        "{detail}. In CI this is a failure rather than a skip: the \
+        "{detail}In CI this is a failure rather than a skip: the \
          cross-language conformance suite exists to catch divergence between \
          the three bridges, and skipping it silently reports success while \
          proving nothing. The workflow must check out aiperceivable/apcore-mcp \
          to the `apcore-mcp` path."
     );
 
-    eprintln!("skipping: {detail}. Check out aiperceivable/apcore-mcp alongside this repository to run it.");
+    eprintln!(
+        "skipping: {detail}Check out aiperceivable/apcore-mcp alongside this \
+         repository to run it."
+    );
     None
 }
