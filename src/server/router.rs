@@ -1018,10 +1018,13 @@ impl ExecutionRouter {
                 .and_then(|v| v.get("sessionId"))
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
-            let resolved_identity = call_extra
-                .identity
-                .as_ref()
-                .and_then(|v| serde_json::from_value::<apcore::Identity>(v.clone()).ok());
+            // [A-D-FA-7] Same three-tier resolution the context builder uses.
+            // Reading only `call_extra.identity` here left the bridge blind to
+            // the ambient identity, so any transport path that binds
+            // AUTH_IDENTITY without populating `extra` submitted tasks
+            // anonymously — where Python reads `auth_identity_var` and
+            // TypeScript `getCurrentIdentity()` inside their handlers.
+            let resolved_identity = Self::resolve_identity(&call_extra);
             // [A-D-220] Pass send_notification through so the bridge can
             // store it in its progress_senders map and fan out
             // `notifications/progress` via emit_progress(). Cloning the
@@ -1394,17 +1397,18 @@ impl ExecutionRouter {
     /// `trace_parent` when provided, and threads `cancel_token` into the
     /// resulting Context so the executor pipeline and modules observe inbound
     /// MCP `notifications/cancelled`.
-    fn build_context_with_trace(
-        extra: &CallExtra,
-        trace_parent: Option<TraceParent>,
-        cancel_token: Option<CancelToken>,
-    ) -> BuiltContext {
-        let mut data: HashMap<String, Box<dyn std::any::Any + Send + Sync>> = HashMap::new();
-        let mut context_obj = serde_json::Map::new();
-
-        // Resolve identity: prefer typed_identity, then try deserializing
-        // the JSON identity, then try reading the AUTH_IDENTITY task-local.
-        let resolved_identity: Option<apcore::Identity> = extra
+    /// Resolve the caller's identity for one tool call.
+    ///
+    /// Prefers the typed identity, then the JSON one carried in `extra`, then
+    /// the `AUTH_IDENTITY` task-local bound by the auth middleware.
+    ///
+    /// [A-D-FA-7] Single source of truth. This resolution used to be spelled
+    /// out in `build_context_with_trace` with all three tiers and again in the
+    /// async-bridge branch of `handle_call` with only the JSON tier, so the
+    /// same call could be authenticated for the executor and anonymous for the
+    /// bridge.
+    fn resolve_identity(extra: &CallExtra) -> Option<apcore::Identity> {
+        extra
             .typed_identity
             .clone()
             .or_else(|| {
@@ -1413,7 +1417,18 @@ impl ExecutionRouter {
                     .as_ref()
                     .and_then(|v| serde_json::from_value::<apcore::Identity>(v.clone()).ok())
             })
-            .or_else(|| AUTH_IDENTITY.try_with(|id| id.clone()).ok().flatten());
+            .or_else(|| AUTH_IDENTITY.try_with(|id| id.clone()).ok().flatten())
+    }
+
+    fn build_context_with_trace(
+        extra: &CallExtra,
+        trace_parent: Option<TraceParent>,
+        cancel_token: Option<CancelToken>,
+    ) -> BuiltContext {
+        let mut data: HashMap<String, Box<dyn std::any::Any + Send + Sync>> = HashMap::new();
+        let mut context_obj = serde_json::Map::new();
+
+        let resolved_identity: Option<apcore::Identity> = Self::resolve_identity(extra);
 
         // Construct apcore::Context with or without identity.
         // When `trace_parent` is Some, use ContextBuilder so the incoming
@@ -4334,6 +4349,123 @@ mod tests {
             .expect("register async module");
 
         Arc::new(apcore::executor::Executor::new(registry, config))
+    }
+
+    /// Build an executor whose single async-hinted module echoes the context
+    /// identity, so a test can see what the bridge handed the task.
+    fn make_apcore_executor_echoing_identity(module_id: &str) -> Arc<apcore::executor::Executor> {
+        #[derive(Debug)]
+        struct IdentityEchoModule;
+
+        #[async_trait::async_trait]
+        impl apcore::module::Module for IdentityEchoModule {
+            fn input_schema(&self) -> Value {
+                json!({"type": "object", "properties": {}})
+            }
+            fn output_schema(&self) -> Value {
+                json!({"type": "object"})
+            }
+            fn description(&self) -> &str {
+                "identity echo"
+            }
+            async fn execute(
+                &self,
+                _inputs: Value,
+                ctx: &apcore::context::Context<Value>,
+            ) -> Result<Value, apcore::errors::ModuleError> {
+                Ok(json!({
+                    "identity_id": ctx.identity.as_ref().map(|i| i.id().to_string()),
+                }))
+            }
+        }
+
+        let registry = Arc::new(apcore::registry::registry::Registry::default());
+        let config = Arc::new(apcore::config::Config::default());
+
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert("async".to_string(), json!(true));
+        let descriptor = apcore::registry::ModuleDescriptor {
+            module_id: module_id.to_string(),
+            name: None,
+            description: "identity echo".to_string(),
+            documentation: None,
+            input_schema: json!({"type": "object", "properties": {}}),
+            output_schema: json!({"type": "object"}),
+            version: "1.0.0".to_string(),
+            tags: vec![],
+            annotations: Some(apcore::module::ModuleAnnotations::default()),
+            examples: vec![],
+            metadata,
+            display: None,
+            sunset_date: None,
+            dependencies: vec![],
+            enabled: true,
+        };
+        registry
+            .register(module_id, Box::new(IdentityEchoModule), descriptor)
+            .expect("register async module");
+        Arc::new(apcore::executor::Executor::new(registry, config))
+    }
+
+    /// [A-D-FA-7] The async-bridge branch of `handle_call` resolved identity
+    /// from `extra` alone, unlike `build_context_with_trace` which also falls
+    /// back to the `AUTH_IDENTITY` task-local. A transport path that binds the
+    /// task-local but passes no `extra` therefore submitted the task anonymous,
+    /// where Python and TypeScript read their ContextVar / AsyncLocalStorage
+    /// inside the handler and keep the identity.
+    #[tokio::test]
+    async fn async_bridge_submit_uses_the_ambient_identity() {
+        use apcore::TaskStatus;
+
+        let bridge = Arc::new(AsyncTaskBridge::new(make_apcore_executor_echoing_identity(
+            "echo.module",
+        )));
+        let router = ExecutionRouter::new(Box::new(MockExecutor), false, None)
+            .with_async_bridge(Arc::clone(&bridge));
+
+        let identity = apcore::Identity::new(
+            "ambient-user".to_string(),
+            "user".to_string(),
+            vec![],
+            Default::default(),
+        );
+
+        let (content, is_error, _) = AUTH_IDENTITY
+            .scope(Some(identity), async {
+                router
+                    .handle_call(
+                        "__apcore_task_submit",
+                        &json!({"module_id": "echo.module", "arguments": {}}),
+                        None,
+                    )
+                    .await
+            })
+            .await;
+        assert!(!is_error, "submit must succeed: {content:?}");
+
+        let envelope: Value =
+            serde_json::from_str(content[0].data.as_str().expect("string content")).unwrap();
+        let task_id = envelope["task_id"].as_str().expect("task_id").to_string();
+
+        // Poll until the task finishes; the module returns immediately.
+        let mut info = None;
+        for _ in 0..200 {
+            match bridge.get_status(&task_id) {
+                Some(i) if i.status == TaskStatus::Completed || i.status == TaskStatus::Failed => {
+                    info = Some(i);
+                    break;
+                }
+                _ => tokio::task::yield_now().await,
+            }
+        }
+        let info = info.expect("task must reach a terminal state");
+        assert_eq!(info.status, TaskStatus::Completed, "task failed: {info:?}");
+        assert_eq!(
+            info.result.as_ref().and_then(|r| r["identity_id"].as_str()),
+            Some("ambient-user"),
+            "the submitted task must carry the ambient identity; got: {:?}",
+            info.result
+        );
     }
 
     #[tokio::test]

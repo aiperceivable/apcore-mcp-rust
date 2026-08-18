@@ -538,13 +538,15 @@ impl MCPServerFactory {
         let tools_clone = Arc::clone(&tools);
         server.list_tools_handler = Some(Arc::new(move || tools_clone.as_ref().clone()));
 
-        // call_tool handler: delegates to the execution router
-        // [D11-012] Identity propagation: Python+TS auto-extract identity from
-        // ContextVar/AsyncLocalStorage inside the handler. Rust relies on the
-        // caller-populated `extra` map (populated by AuthMiddlewareLayer). If
-        // `extra` is absent, identity is not available here.
-        // NOTE: Identity must be populated in `extra` by the middleware layer
-        // (see AuthMiddlewareLayer in src/auth/middleware.rs). [D11-012]
+        // call_tool handler: delegates to the execution router.
+        //
+        // [D11-012 / A-D-FA-7] Identity propagation: Python+TS auto-extract
+        // identity from ContextVar/AsyncLocalStorage inside the handler. Rust
+        // resolves it one layer down instead — `ExecutionRouter::resolve_identity`
+        // prefers the `extra` map populated by AuthMiddlewareLayer and falls
+        // back to the `AUTH_IDENTITY` task-local, which the middleware binds
+        // around the whole request. So identity flows even when the transport
+        // passes no `extra`, matching the peers' behaviour.
         let router_clone = Arc::clone(&router);
         server.call_tool_handler = Some(Arc::new(move |name, arguments, extra| {
             let router = Arc::clone(&router_clone);
@@ -886,6 +888,103 @@ mod tests {
                 .unwrap();
         }
         registry
+    }
+
+    /// Executor that hands the built context straight back, so a test can
+    /// inspect the identity the router resolved. Mirrors
+    /// `router::tests::IdentityCapturingExecutor`.
+    struct IdentityCapturingExecutor;
+
+    #[async_trait::async_trait]
+    impl crate::server::router::Executor for IdentityCapturingExecutor {
+        async fn call_async(
+            &self,
+            _module_id: &str,
+            _inputs: &serde_json::Value,
+            context: Option<&serde_json::Value>,
+            _version_hint: Option<&str>,
+        ) -> Result<serde_json::Value, crate::server::router::ExecutorError> {
+            Ok(context.cloned().unwrap_or(serde_json::Value::Null))
+        }
+    }
+
+    // ---- [A-D-FA-7] ambient identity reaches the router ----
+
+    /// The call_tool handler performed no ambient identity read: Rust relied
+    /// entirely on the caller-populated `extra` map. Python reads
+    /// `auth_identity_var` (factory.py:335) and TypeScript
+    /// `getCurrentIdentity()` (factory.ts:485) inside the registered handler,
+    /// so identity flows even when the transport passes no `extra`.
+    #[tokio::test]
+    async fn test_call_tool_reads_ambient_identity_when_extra_is_absent() {
+        use crate::auth::middleware::AUTH_IDENTITY;
+
+        let factory = make_factory();
+        let mut server = factory.create_server("test", "1.0.0").unwrap();
+        let router = Arc::new(crate::server::router::ExecutionRouter::new(
+            Box::new(IdentityCapturingExecutor),
+            false,
+            None,
+        ));
+        factory.register_handlers(&mut server, vec![], router);
+
+        let identity = apcore::Identity::new(
+            "ambient-user".to_string(),
+            "user".to_string(),
+            vec!["admin".to_string()],
+            Default::default(),
+        );
+        let result = AUTH_IDENTITY
+            .scope(Some(identity), async {
+                server
+                    .call_tool("mod".to_string(), json!({}), None)
+                    .expect("call_tool handler must be registered")
+                    .await
+            })
+            .await;
+
+        assert!(!result.is_error, "call must succeed: {result:?}");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&result.content[0].text).expect("context JSON");
+        assert_eq!(
+            parsed["identity"]["id"], "ambient-user",
+            "the router must observe the ambient identity; got: {parsed}"
+        );
+    }
+
+    /// An explicit `extra["identity"]` still wins over the ambient one.
+    #[tokio::test]
+    async fn test_explicit_extra_identity_wins_over_ambient() {
+        use crate::auth::middleware::AUTH_IDENTITY;
+
+        let factory = make_factory();
+        let mut server = factory.create_server("test", "1.0.0").unwrap();
+        let router = Arc::new(crate::server::router::ExecutionRouter::new(
+            Box::new(IdentityCapturingExecutor),
+            false,
+            None,
+        ));
+        factory.register_handlers(&mut server, vec![], router);
+
+        let ambient = apcore::Identity::new(
+            "ambient-user".to_string(),
+            "user".to_string(),
+            vec![],
+            Default::default(),
+        );
+        let extra = json!({"identity": {"id": "explicit-user", "type": "user", "roles": []}});
+        let result = AUTH_IDENTITY
+            .scope(Some(ambient), async {
+                server
+                    .call_tool("mod".to_string(), json!({}), Some(extra))
+                    .expect("call_tool handler must be registered")
+                    .await
+            })
+            .await;
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&result.content[0].text).expect("context JSON");
+        assert_eq!(parsed["identity"]["id"], "explicit-user");
     }
 
     // ---- build_tool tests ----
