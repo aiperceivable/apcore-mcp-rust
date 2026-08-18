@@ -628,24 +628,25 @@ impl MCPServerFactory {
     ///
     /// Iterates over the registry and exposes each module's
     /// `descriptor.documentation` field (long-form text) as a
-    /// `docs://{module_id}` resource. Falls back to `description` when the
-    /// canonical `documentation` field is absent — preserves resource
-    /// availability while still preferring the dedicated field. Python and
-    /// TypeScript both use `descriptor.documentation`. [A-D-013]
+    /// `docs://{module_id}` resource. Modules with no `documentation` get no
+    /// resource — Python (factory.py:447) and TypeScript (factory.ts:358) both
+    /// gate on that field alone. [A-D-FA-8, closes A-D-013]
     ///
     /// Handlers are stored as closures on the `MCPServer` struct; see
     /// [`register_handlers`](Self::register_handlers) for why, and for the
     /// planned move onto `rmcp`.
     pub fn register_resource_handlers(&self, server: &mut MCPServer, registry: &Registry) {
-        // Build docs map: module_id -> documentation (preferred) or description (fallback)
+        // Build docs map: module_id -> documentation.
+        //
+        // [A-D-FA-8] No `description` fallback. It gave every module with any
+        // non-empty description a `docs://{id}` entry, so for the same registry
+        // `resources/list` returned more entries on Rust and `resources/read`
+        // of `docs://foo` succeeded here while the peers raise
+        // "Resource not found".
         let mut docs_map: HashMap<String, String> = HashMap::new();
         for module_id in registry.list(None, None, None) {
             if let Ok(Some(descriptor)) = registry.get_definition(&module_id) {
-                let doc_text = descriptor
-                    .documentation
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| descriptor.description.clone());
-                if !doc_text.is_empty() {
+                if let Some(doc_text) = descriptor.documentation.filter(|s| !s.is_empty()) {
                     docs_map.insert(module_id.to_string(), doc_text);
                 }
             }
@@ -842,6 +843,39 @@ mod tests {
                 annotations: Some(ModuleAnnotations::default()),
                 examples: vec![],
                 metadata,
+                display: None,
+                sunset_date: None,
+                dependencies: vec![],
+                enabled: true,
+            };
+            registry
+                .register_internal(name, module, descriptor)
+                .unwrap();
+        }
+        registry
+    }
+
+    /// Registry whose modules carry an explicit `documentation` field.
+    ///
+    /// [A-D-FA-8] `make_registry_with_modules` leaves `documentation` None, so
+    /// docs:// coverage could only be exercised through the description
+    /// fallback that finding removed.
+    fn make_registry_with_documentation(modules: Vec<(&str, &str, Option<&str>)>) -> Registry {
+        let registry = Registry::new();
+        for (name, desc, documentation) in modules {
+            let module = Box::new(MockModule::new(desc));
+            let descriptor = ModuleDescriptor {
+                module_id: name.to_string(),
+                name: None,
+                description: desc.to_string(),
+                documentation: documentation.map(str::to_string),
+                input_schema: json!({"type": "object", "properties": {"q": {"type": "string"}}}),
+                output_schema: json!({}),
+                version: "1.0.0".to_string(),
+                tags: vec![],
+                annotations: Some(ModuleAnnotations::default()),
+                examples: vec![],
+                metadata: HashMap::new(),
                 display: None,
                 sunset_date: None,
                 dependencies: vec![],
@@ -1336,9 +1370,9 @@ mod tests {
     fn test_list_resources_returns_documented_modules() {
         let factory = make_factory();
         let mut server = factory.create_server("test", "1.0.0").unwrap();
-        let registry = make_registry_with_modules(vec![
-            ("mod.a", "Module A docs", vec![]),
-            ("mod.b", "Module B docs", vec![]),
+        let registry = make_registry_with_documentation(vec![
+            ("mod.a", "Module A", Some("Module A docs")),
+            ("mod.b", "Module B", Some("Module B docs")),
         ]);
 
         factory.register_resource_handlers(&mut server, &registry);
@@ -1356,8 +1390,11 @@ mod tests {
     fn test_read_resource_returns_documentation() {
         let factory = make_factory();
         let mut server = factory.create_server("test", "1.0.0").unwrap();
-        let registry =
-            make_registry_with_modules(vec![("mod.a", "Module A documentation text", vec![])]);
+        let registry = make_registry_with_documentation(vec![(
+            "mod.a",
+            "Module A",
+            Some("Module A documentation text"),
+        )]);
 
         factory.register_resource_handlers(&mut server, &registry);
 
@@ -1366,6 +1403,38 @@ mod tests {
         assert_eq!(contents.len(), 1);
         assert_eq!(contents[0].content, "Module A documentation text");
         assert_eq!(contents[0].mime_type, "text/plain");
+    }
+
+    /// [A-D-FA-8] A module with no `documentation` must expose no docs://
+    /// resource. Rust used to fall back to `descriptor.description`, so
+    /// `resources/list` returned an entry per module and `resources/read` of
+    /// `docs://foo` succeeded where Python and TypeScript raise
+    /// "Resource not found".
+    #[test]
+    fn test_undocumented_module_exposes_no_docs_resource() {
+        let factory = make_factory();
+        let mut server = factory.create_server("test", "1.0.0").unwrap();
+        let registry = make_registry_with_documentation(vec![
+            ("mod.documented", "has a description", Some("real docs")),
+            ("mod.bare", "has a description only", None),
+        ]);
+
+        factory.register_resource_handlers(&mut server, &registry);
+
+        let resources = server.list_resources().unwrap();
+        let uris: Vec<&str> = resources.iter().map(|r| r.uri.as_str()).collect();
+        assert_eq!(
+            uris,
+            vec!["docs://mod.documented"],
+            "only modules with a populated documentation field get a resource"
+        );
+        assert!(
+            server
+                .read_resource("docs://mod.bare".to_string())
+                .unwrap()
+                .is_err(),
+            "reading an undocumented module must be Resource not found"
+        );
     }
 
     #[test]
@@ -1528,14 +1597,12 @@ mod tests {
         let factory = make_factory();
         let mut server = factory.create_server("lifecycle-test", "1.0.0").unwrap();
 
-        // Build tools from registry
-        let registry = make_registry_with_modules(vec![
-            (
-                "mod.alpha",
-                "Alpha module with docs",
-                vec!["core".to_string()],
-            ),
-            ("mod.beta", "Beta module", vec!["io".to_string()]),
+        // Build tools from registry. Both modules carry `documentation` so the
+        // resource half of the lifecycle is exercised — [A-D-FA-8] removed the
+        // description fallback that used to stand in for it.
+        let registry = make_registry_with_documentation(vec![
+            ("mod.alpha", "Alpha module", Some("Alpha module docs")),
+            ("mod.beta", "Beta module", Some("Beta module docs")),
         ]);
 
         let tools = factory
@@ -1572,10 +1639,10 @@ mod tests {
     fn test_end_to_end_resource_read() {
         let factory = make_factory();
         let mut server = factory.create_server("test", "1.0.0").unwrap();
-        let registry = make_registry_with_modules(vec![(
+        let registry = make_registry_with_documentation(vec![(
             "doc.module",
-            "This is the documentation for doc.module",
-            vec![],
+            "doc.module",
+            Some("This is the documentation for doc.module"),
         )]);
 
         factory.register_resource_handlers(&mut server, &registry);
