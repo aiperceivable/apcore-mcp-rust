@@ -1959,8 +1959,10 @@ pub fn serve(backend: impl Into<BackendSource>, config: ServeConfig) -> Result<(
     if let Some(redact) = config.redact_output {
         builder = builder.redact_output(redact);
     }
-    // [D9-003] output_format: caller > bus. Default is Json (handled by builder).
-    if let Some(fmt) = config.output_format.or(bus.output_format) {
+    // [D9-003] output_format is caller-only. Default is Json (handled by the
+    // builder). [A-013] It is deliberately NOT read from the Config Bus —
+    // Python and TypeScript publish no such key, see `config::mcp_defaults`.
+    if let Some(fmt) = config.output_format {
         builder = builder.output_format(fmt);
     }
     // observability — extract bool from `true`/`false` or `{ "enabled": bool }`
@@ -2068,8 +2070,8 @@ pub async fn async_serve(
     if let Some(redact) = config.redact_output {
         builder = builder.redact_output(redact);
     }
-    // [D9-003] output_format: caller > bus.
-    if let Some(fmt) = config.output_format.or(bus.output_format) {
+    // [D9-003] output_format is caller-only; see serve() and [A-013].
+    if let Some(fmt) = config.output_format {
         builder = builder.output_format(fmt);
     }
     // observability — extract bool and forward; matches Python parity. [D1-002]

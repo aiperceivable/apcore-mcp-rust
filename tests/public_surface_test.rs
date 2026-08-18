@@ -22,7 +22,8 @@ fn mcp_defaults_is_exported_at_crate_root() {
     assert_eq!(defaults["explorer"], false);
     assert_eq!(defaults["explorer_prefix"], "/explorer");
     assert_eq!(defaults["require_auth"], true);
-    assert_eq!(defaults["output_format"], "json");
+    // [A-013] No `output_format` key — Python and TypeScript publish none.
+    assert!(defaults.get("output_format").is_none());
     assert!(defaults["middleware"].is_array());
     assert!(defaults["acl"].is_null());
 }

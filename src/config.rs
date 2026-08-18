@@ -86,7 +86,6 @@ pub struct McpScalarConfig {
     pub explorer: Option<bool>,
     pub explorer_prefix: Option<String>,
     pub require_auth: Option<bool>,
-    pub output_format: Option<crate::server::router::OutputFormat>,
 }
 
 /// Read the 9 scalar `mcp.*` keys from the Config Bus.
@@ -139,8 +138,6 @@ pub fn get_scalar_config() -> McpScalarConfig {
                 _ => None,
             })
         }),
-        output_format: read(&config, "output_format")
-            .and_then(|v| v.as_str().and_then(|s| s.parse().ok())),
     }
 }
 
@@ -160,7 +157,13 @@ pub fn mcp_defaults() -> serde_json::Value {
         "explorer": false,
         "explorer_prefix": "/explorer",
         "require_auth": true,
-        "output_format": "json",
+        // [A-013] No `output_format` key. Python's MCP_DEFAULTS (config.py:14)
+        // and TypeScript's (config.ts:12) do not publish one, so honouring
+        // `mcp.output_format` / `APCORE_MCP_OUTPUT_FORMAT` here made the same
+        // Config Bus file produce CSV from the Rust bridge and JSON from the
+        // other two. The option remains available programmatically
+        // (`APCoreMCPBuilder::output_format`, `ServeConfig::output_format`) and
+        // via the CLI's `--output-format`, as it is in all three SDKs.
         // Declarative middleware list. Each entry is { type: string, ...kwargs }.
         // See `middleware_builder::build_middleware_from_config` for supported types.
         "middleware": [],
@@ -182,6 +185,39 @@ mod tests {
     #[test]
     fn test_mcp_env_prefix_constant() {
         assert_eq!(MCP_ENV_PREFIX, "APCORE_MCP");
+    }
+
+    /// [A-013] The Config Bus defaults surface must match Python's
+    /// `MCP_DEFAULTS` (config.py:14) and TypeScript's `MCP_DEFAULTS`
+    /// (config.ts:12) key for key. Rust used to publish a 12th key,
+    /// `output_format`, so the same Config Bus file produced CSV output from
+    /// the Rust bridge and JSON from the other two.
+    #[test]
+    fn test_mcp_defaults_key_set_matches_peer_sdks() {
+        const CROSS_SDK_KEYS: &[&str] = &[
+            "transport",
+            "host",
+            "port",
+            "name",
+            "log_level",
+            "validate_inputs",
+            "explorer",
+            "explorer_prefix",
+            "require_auth",
+            "middleware",
+            "acl",
+        ];
+
+        let defaults = mcp_defaults();
+        let obj = defaults.as_object().expect("defaults must be an object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        let mut expected: Vec<&str> = CROSS_SDK_KEYS.to_vec();
+        expected.sort_unstable();
+        assert_eq!(
+            keys, expected,
+            "the Config Bus defaults surface must match Python and TypeScript exactly"
+        );
     }
 
     #[test]
