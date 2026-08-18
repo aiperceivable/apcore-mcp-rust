@@ -41,7 +41,12 @@ impl Default for ClaimMapping {
 /// Validates JWT Bearer tokens from the `Authorization` header and maps
 /// claims to [`Identity`] via [`ClaimMapping`].
 pub struct JWTAuthenticator {
-    key: DecodingKey,
+    /// Verification key, built for the configured algorithm family.
+    ///
+    /// `None` when the supplied material could not be parsed for that family
+    /// (e.g. a malformed PEM). Verification then always fails — fail closed,
+    /// never fail open.
+    key: Option<DecodingKey>,
     algorithms: Vec<Algorithm>,
     audience: Option<String>,
     issuer: Option<String>,
@@ -60,7 +65,8 @@ impl JWTAuthenticator {
     /// Create a new JWT authenticator.
     ///
     /// # Arguments
-    /// * `key` — HMAC secret (or symmetric key) for token verification.
+    /// * `key` — verification key: an HMAC secret for `HS*`, or a PEM-encoded
+    ///   public key for the `RS*`/`PS*`/`ES*`/`EdDSA` families.
     /// * `algorithms` — Allowed JWT algorithms. Defaults to `[HS256]`.
     /// * `audience` — Expected `aud` claim (optional).
     /// * `issuer` — Expected `iss` claim (optional).
@@ -76,14 +82,58 @@ impl JWTAuthenticator {
         require_claims: Option<Vec<String>>,
         require_auth: Option<bool>,
     ) -> Self {
+        let algorithms = algorithms.unwrap_or_else(|| vec![Algorithm::HS256]);
         Self {
-            key: DecodingKey::from_secret(key.as_bytes()),
-            algorithms: algorithms.unwrap_or_else(|| vec![Algorithm::HS256]),
+            key: Self::build_decoding_key(key, &algorithms),
+            algorithms,
             audience,
             issuer,
             claim_mapping: claim_mapping.unwrap_or_default(),
             require_claims: require_claims.unwrap_or_else(|| vec!["sub".to_string()]),
             require_auth: require_auth.unwrap_or(true),
+        }
+    }
+
+    /// Build the verification key for the configured algorithm family.
+    ///
+    /// [A-D-JWT-1] jsonwebtoken tags a `DecodingKey` with a family at
+    /// construction and rejects a family mismatch *before* parsing the token
+    /// header, so an HMAC secret can never verify an `RS*`/`PS*`/`ES*`/`EdDSA`
+    /// token. Python (pyjwt) and TypeScript (jsonwebtoken) take the key
+    /// verbatim and dispatch on the algorithm; this reproduces that dispatch at
+    /// construction time, which is the only place Rust can do it.
+    ///
+    /// A key that cannot be parsed for its family yields `None`, so the
+    /// authenticator rejects every token rather than silently holding an
+    /// unusable key.
+    fn build_decoding_key(key: &str, algorithms: &[Algorithm]) -> Option<DecodingKey> {
+        // A single key can only belong to one family, so the primary algorithm
+        // decides. Mixing families in `algorithms` cannot work either way.
+        let primary = algorithms.first().copied().unwrap_or(Algorithm::HS256);
+        let bytes = key.as_bytes();
+        let built = match primary {
+            Algorithm::HS256 | Algorithm::HS384 | Algorithm::HS512 => {
+                Ok(DecodingKey::from_secret(bytes))
+            }
+            Algorithm::RS256
+            | Algorithm::RS384
+            | Algorithm::RS512
+            | Algorithm::PS256
+            | Algorithm::PS384
+            | Algorithm::PS512 => DecodingKey::from_rsa_pem(bytes),
+            Algorithm::ES256 | Algorithm::ES384 => DecodingKey::from_ec_pem(bytes),
+            Algorithm::EdDSA => DecodingKey::from_ed_pem(bytes),
+        };
+        match built {
+            Ok(k) => Some(k),
+            Err(e) => {
+                tracing::error!(
+                    "JWT verification key could not be parsed for algorithm {primary:?}: {e}. \
+                     Every token will be rejected. Asymmetric algorithms expect a PEM-encoded \
+                     public key."
+                );
+                None
+            }
         }
     }
 
@@ -94,6 +144,8 @@ impl JWTAuthenticator {
 
     /// Decode and validate a JWT token. Returns `None` on any error.
     fn decode_token(&self, token: &str) -> Option<HashMap<String, serde_json::Value>> {
+        // No usable key (unparseable PEM) — reject rather than fail open.
+        let key = self.key.as_ref()?;
         let mut validation = Validation::new(self.algorithms[0]);
         if self.algorithms.len() > 1 {
             validation.algorithms = self.algorithms.clone();
@@ -125,11 +177,7 @@ impl JWTAuthenticator {
                 .collect::<Vec<_>>(),
         );
 
-        match jsonwebtoken::decode::<HashMap<String, serde_json::Value>>(
-            token,
-            &self.key,
-            &validation,
-        ) {
+        match jsonwebtoken::decode::<HashMap<String, serde_json::Value>>(token, key, &validation) {
             Ok(token_data) => {
                 let claims = token_data.claims;
                 // [D11-006] Post-decode custom-claim enforcement.
@@ -796,5 +844,120 @@ mod tests {
         assert_eq!(identity.id(), "u-99");
         assert_eq!(identity.identity_type(), "service");
         assert_eq!(identity.roles(), vec!["write"]);
+    }
+
+    // ── Asymmetric algorithms [A-D-JWT-1] ──────────────────────────────
+
+    /// Test-only 2048-bit RSA key pair. Never used outside this module.
+    const TEST_RSA_PRIVATE_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
+MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCs8IHfrwfpOloa\n\
+xKulCW4oAsDaK/zZS7r2H8jLAMGuWJjZvPK1mS+lPfdKDZRCmeqIXADqEK7lnbWb\n\
+qcfz9vmfSOFhv+6gU+6ozI0aZaUU1njYG5pkEczNytBRXrFo8wLmFfTILe3K5L+G\n\
+OYgWA71pbsjdjtw/K8tYog+2luAHvKxmhRDnnqHpQQaKZ5H4Yi6+hjQAbYmNFHnI\n\
+6ZlNtospvJjT3kdYWNNAihwUk2ZTtGCx3+oBCn5+LEDtrcBKD8rata9ZYXOkWS17\n\
+/FIMgvRLSwuD5flmcp0m7rY+I9czEakrWQB859Nz0V/6gc32qgl3YOOPSxQ7bM89\n\
+eBqWEJAfAgMBAAECggEADn0ijw2oVASXgqFHis7SHngHQEAUhwAD7JWXylTd5TAh\n\
+s4b+WUiO6AExCVCUmJ/cjmARk4qiRzUsqfCngpZb2NnPnX4/DR+ltxlWw7IQX+vi\n\
+uU2sDwY5amRmNOsCDLuPWpzW9+PL2wZ0eq0HQbuT0D7VL/rFaRAk5orCq5bTCNLE\n\
+3BqUzBq/B4HOctgNakEtOXLG2m4k0jHUghbzcsxSStTYMJ+4/MCYQ4JMF8jN8qjX\n\
+CeNYHb1CFwWAAvq7wWHVbttlvqGHGpScQ0N224sQiN9CCMeZ/S0unE06a2IYJxuI\n\
+Dth2URANr0S0xQyDNRD5SIuTkjOBJJ+rm9nUnaHPQQKBgQDzm7F2ZIoxxMjFt8sQ\n\
+Yx+2pNVnkBjDo8JTHzR+tR6daH0bqaYZWFkYlSRRdisTN0FKacRTLyW0dZFdQ9gZ\n\
+WIWrNibkCFggQTlnj0x4QHhyzV+Sveg4oYSi2odyIyU0mIpl9oFgBPNobhZ1rsBo\n\
+/50FzcdcrMs+DYKp9Og47dR61QKBgQC1vI3vfgDlaDEbLpAPllHpHsnGegtztkiD\n\
+ewvA/s4mHept3aKIbfWMeatvoofi7SKwc2N76eNOH6AoBhXd1K67he7v5mSw8S/d\n\
+rYn0c010gIpbbeND9zLONzZWug3DXwzVjxVNt3CvMCPpd9VmYieS8lsrOzD6encg\n\
+pK/v+v0xIwKBgHwKONBJ3Tv+MSTLsvADKPC8+ZSkAJgNWDMu3nHuE0qfG6TsOxEI\n\
+tUUZG8cG3mQIbIxRUo/wn8hFXOEaXHx7YISPLDpMLWMvEuWyR4OrgCkkfZegbw/2\n\
+3ix2DSWG07j2OvI0FCgqHS59b544fux3yyJbZzm/GjXcdz3G4D+sidaJAoGATNGU\n\
+1WTXkCDIkQrPjicmHHoNJD42VQT6BcmfIEcUcHw4uZPzveNs5aIQWzHCaqN+BEPi\n\
+C2DD2iP4GLLpz0i1S0LDytgCO+DXMMbIB3ItjU9ALIF4jSQSb6Ra7bHbW3fz/tlq\n\
+Ud12XjblFyy2IX7f53dWHiH5BAd8D2pNjAz1tS0CgYAkWkixu/2c9GN1q63BzHTN\n\
+DcHyE4vMjkIZ6/K2qPupEB0CVXs4SMxtyvIHgP/+WpQXk1flQEAB/Qj7Zj4gQtpg\n\
+/okmFHkzcBSd2CS1tPEyOmWHDtHPFs0xNA8HJeVyGHRUEN9nqQeaGoobB8/9IaC+\n\
+6Ogx5XayMhqb8i9LfVPzBg==\n\
+-----END PRIVATE KEY-----\n";
+
+    const TEST_RSA_PUBLIC_PEM: &str = "-----BEGIN PUBLIC KEY-----\n\
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArPCB368H6TpaGsSrpQlu\n\
+KALA2iv82Uu69h/IywDBrliY2bzytZkvpT33Sg2UQpnqiFwA6hCu5Z21m6nH8/b5\n\
+n0jhYb/uoFPuqMyNGmWlFNZ42BuaZBHMzcrQUV6xaPMC5hX0yC3tyuS/hjmIFgO9\n\
+aW7I3Y7cPyvLWKIPtpbgB7ysZoUQ556h6UEGimeR+GIuvoY0AG2JjRR5yOmZTbaL\n\
+KbyY095HWFjTQIocFJNmU7Rgsd/qAQp+fixA7a3ASg/K2rWvWWFzpFkte/xSDIL0\n\
+S0sLg+X5ZnKdJu62PiPXMxGpK1kAfOfTc9Ff+oHN9qoJd2Djj0sUO2zPPXgalhCQ\n\
+HwIDAQAB\n\
+-----END PUBLIC KEY-----\n";
+
+    /// An RS256 token signed with the private key must verify against the
+    /// PEM public key. Before the fix `new` always built an HMAC
+    /// `DecodingKey`, which jsonwebtoken rejects on family mismatch before
+    /// it even parses the header — so every RS/ES/Ed token 401'd.
+    #[tokio::test]
+    async fn rs256_round_trip_returns_identity() {
+        let token = jsonwebtoken::encode(
+            &Header::new(Algorithm::RS256),
+            &serde_json::json!({"sub": "rsa-user", "roles": ["admin"]}),
+            &EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_PEM.as_bytes()).expect("encoding key"),
+        )
+        .expect("encode RS256 JWT");
+
+        let auth = JWTAuthenticator::new(
+            TEST_RSA_PUBLIC_PEM,
+            Some(vec![Algorithm::RS256]),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let identity = auth
+            .authenticate(&headers_with_token(&token))
+            .await
+            .expect("RS256 token should authenticate");
+        assert_eq!(identity.id(), "rsa-user");
+        assert_eq!(identity.roles(), vec!["admin"]);
+    }
+
+    /// A token signed by a *different* RSA key must still be rejected.
+    #[tokio::test]
+    async fn rs256_wrong_key_returns_none() {
+        let token = jsonwebtoken::encode(
+            &Header::new(Algorithm::RS256),
+            &serde_json::json!({"sub": "rsa-user"}),
+            &EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_PEM.as_bytes()).expect("encoding key"),
+        )
+        .expect("encode RS256 JWT");
+
+        // HS256 configured, so the RSA-signed token must not verify.
+        let auth = make_authenticator();
+        assert!(auth
+            .authenticate(&headers_with_token(&token))
+            .await
+            .is_none());
+    }
+
+    /// A malformed PEM must fail closed rather than authenticate anyone.
+    #[tokio::test]
+    async fn rs256_malformed_pem_fails_closed() {
+        let token = jsonwebtoken::encode(
+            &Header::new(Algorithm::RS256),
+            &serde_json::json!({"sub": "rsa-user"}),
+            &EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_PEM.as_bytes()).expect("encoding key"),
+        )
+        .expect("encode RS256 JWT");
+
+        let auth = JWTAuthenticator::new(
+            "not a pem at all",
+            Some(vec![Algorithm::RS256]),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(auth
+            .authenticate(&headers_with_token(&token))
+            .await
+            .is_none());
     }
 }
