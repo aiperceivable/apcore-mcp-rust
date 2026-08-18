@@ -56,3 +56,28 @@ fn async_task_bridge_is_exported_at_crate_root() {
     fn _assert_type<T>() {}
     _assert_type::<apcore_mcp::AsyncTaskBridge>();
 }
+
+#[test]
+fn output_format_is_exported_at_crate_root() {
+    // [B-RS-9] `APCoreMCPBuilder::output_format` takes
+    // `server::router::OutputFormat`, so the documented call in README.md
+    // cannot be written without a crate-root re-export — every other type in a
+    // public builder signature has one.
+    use apcore_mcp::OutputFormat;
+    use std::str::FromStr;
+
+    assert_eq!(OutputFormat::default(), OutputFormat::Json);
+    assert_eq!(OutputFormat::from_str("csv").unwrap(), OutputFormat::Csv);
+    assert_eq!(
+        OutputFormat::from_str("jsonl").unwrap(),
+        OutputFormat::Jsonl
+    );
+    assert!(OutputFormat::from_str("yaml").is_err());
+
+    // FromStr and Display must round-trip: the type travels through config.
+    assert_eq!(OutputFormat::Csv.to_string(), "csv");
+    assert_eq!(
+        OutputFormat::from_str(&OutputFormat::Jsonl.to_string()).unwrap(),
+        OutputFormat::Jsonl
+    );
+}

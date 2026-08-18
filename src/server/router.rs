@@ -299,6 +299,19 @@ pub enum OutputFormat {
     Jsonl,
 }
 
+/// [B-RS-9] Paired with [`FromStr`](std::str::FromStr) so the value
+/// round-trips through config surfaces instead of parsing one way only.
+impl std::fmt::Display for OutputFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            OutputFormat::Json => "json",
+            OutputFormat::Csv => "csv",
+            OutputFormat::Jsonl => "jsonl",
+        };
+        f.write_str(s)
+    }
+}
+
 impl std::str::FromStr for OutputFormat {
     type Err = String;
 

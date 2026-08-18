@@ -52,6 +52,10 @@ pub use crate::auth::protocol::{Authenticator, Identity};
 pub use crate::server::factory::MCPServerFactory;
 pub use crate::server::listener::RegistryListener;
 pub use crate::server::router::ExecutionRouter;
+// [B-RS-9] `APCoreMCPBuilder::output_format` takes this type, so it belongs at
+// the crate root like every other type in a public builder signature —
+// `use apcore_mcp::OutputFormat;` is what the README documents.
+pub use crate::server::router::OutputFormat;
 pub use crate::server::server::{MCPServer, MCPServerConfig, RegistryOrExecutor, TransportKind};
 pub use crate::server::transport::TransportManager;
 
