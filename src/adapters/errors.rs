@@ -219,7 +219,19 @@ impl ErrorMapper {
             return build_detail_response(error, error_type, message);
         }
 
-        // STEP_NOT_FOUND, VERSION_INCOMPATIBLE → handled by default passthrough below.
+        // STEP_NOT_FOUND → prefix the message, matching Python and TypeScript.
+        // [A-D-EM-2] The spec constrains one error code to one message format
+        // across all three SDKs; the bare passthrough diverged.
+        if error_type == "STEP_NOT_FOUND" {
+            let message = format!("Pipeline step not found: {}", error.message);
+            return build_detail_response(error, error_type, message);
+        }
+
+        // VERSION_INCOMPATIBLE → same. [A-D-EM-2]
+        if error_type == "VERSION_INCOMPATIBLE" {
+            let message = format!("Version incompatible: {}", error.message);
+            return build_detail_response(error, error_type, message);
+        }
 
         // Async-task capacity: map `TaskLimitExceeded` to a retryable
         // envelope with an explicit agent-facing message, mirroring the
@@ -685,9 +697,27 @@ mod tests {
     // VERSION_INCOMPATIBLE are handled via string matching on the
     // serialized error code. Tests for CONFIG_ENV_MAP_CONFLICT and
     // PIPELINE_ABORT require the apcore crate to expose those enum
-    // variants. STEP_NOT_FOUND and VERSION_INCOMPATIBLE fall through
-    // to the default passthrough and are implicitly covered by
-    // test_unknown_error_passthrough.
+    // variants.
+
+    /// [A-D-EM-2] The spec constrains the same error code to the same message
+    /// format across SDKs. Python emits `"Pipeline step not found: {msg}"` and
+    /// TypeScript the same; Rust used to fall through to the bare message.
+    #[test]
+    fn test_step_not_found_message_prefix() {
+        let err = make_error(ApcoreErrorCode::StepNotFound, "validate");
+        let resp = ErrorMapper::to_mcp_error(&err);
+        assert_eq!(resp.error_type, "STEP_NOT_FOUND");
+        assert_eq!(resp.message, "Pipeline step not found: validate");
+    }
+
+    /// [A-D-EM-2] Same for VERSION_INCOMPATIBLE.
+    #[test]
+    fn test_version_incompatible_message_prefix() {
+        let err = make_error(ApcoreErrorCode::VersionIncompatible, "needs >=2.0");
+        let resp = ErrorMapper::to_mcp_error(&err);
+        assert_eq!(resp.error_type, "VERSION_INCOMPATIBLE");
+        assert_eq!(resp.message, "Version incompatible: needs >=2.0");
+    }
 
     // ---- Unknown / passthrough ----
 
