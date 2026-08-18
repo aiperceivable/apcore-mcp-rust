@@ -124,6 +124,11 @@ impl SchemaConverter {
         const SUBSCHEMA_DICT_KEYS: &[&str] =
             &["properties", "patternProperties", "$defs", "definitions"];
         // Keys whose value is a single nested schema.
+        //
+        // [A-D-SC-2] `propertyNames` was missing from this set, so an object
+        // nested under it shipped without `additionalProperties: false` from
+        // Rust and with it from Python (_SCHEMA_CHILD_SCHEMA_KEYS) and
+        // TypeScript, both of which walk the full spec-pinned set.
         const SUBSCHEMA_KEYS: &[&str] = &[
             "items",
             "additionalProperties",
@@ -132,12 +137,23 @@ impl SchemaConverter {
             "then",
             "else",
             "contains",
+            "propertyNames",
         ];
         // Keys whose value is a list of nested schemas.
-        const SUBSCHEMA_LIST_KEYS: &[&str] = &["oneOf", "anyOf", "allOf"];
+        // [A-D-SC-2] `prefixItems` likewise.
+        const SUBSCHEMA_LIST_KEYS: &[&str] = &["oneOf", "anyOf", "allOf", "prefixItems"];
 
-        // Strict-mode applies to schema objects only; arrays at the
-        // root level shouldn't be reached in well-formed JSON Schema.
+        // [A-D-SC-2] An array-valued `items` (legacy tuple validation) arrives
+        // here as a `Value::Array`; with no arm for it the whole tuple was a
+        // silent no-op.
+        if let Value::Array(arr) = node {
+            for v in arr.iter_mut() {
+                Self::inject_strict(v);
+            }
+            return;
+        }
+
+        // Strict-mode otherwise applies to schema objects only.
         if let Value::Object(map) = node {
             // [SC-18] Detect object type with nullable form support.
             let type_val = map.get("type");
@@ -827,6 +843,77 @@ mod tests {
         assert!(
             result.pointer("/properties/a/$defs").is_none(),
             "nested $defs must be stripped; got: {result}"
+        );
+    }
+
+    // ---- [A-D-SC-2] full spec-pinned recursion set ----
+
+    /// `prefixItems` holds a LIST of subschemas. It was absent from every
+    /// recursion set, so a nested object inside it shipped without
+    /// `additionalProperties: false` from Rust and with it from the peers.
+    #[test]
+    fn test_strict_recurses_into_prefix_items() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "pair": {
+                    "type": "array",
+                    "prefixItems": [
+                        {"type": "object", "properties": {"a": {"type": "string"}}},
+                        {"type": "string"}
+                    ]
+                }
+            }
+        });
+        let result = SchemaConverter::convert_input_schema(&schema).expect("convert");
+        assert_eq!(
+            result.pointer("/properties/pair/prefixItems/0/additionalProperties"),
+            Some(&json!(false)),
+            "strict must recurse into prefixItems; got: {result}"
+        );
+    }
+
+    /// `propertyNames` holds a SINGLE subschema and was likewise unwalked.
+    #[test]
+    fn test_strict_recurses_into_property_names() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "map": {
+                    "type": "object",
+                    "propertyNames": {"type": "object", "properties": {"a": {"type": "string"}}}
+                }
+            }
+        });
+        let result = SchemaConverter::convert_input_schema(&schema).expect("convert");
+        assert_eq!(
+            result.pointer("/properties/map/propertyNames/additionalProperties"),
+            Some(&json!(false)),
+            "strict must recurse into propertyNames; got: {result}"
+        );
+    }
+
+    /// An array-valued `items` (legacy tuple validation) reached a
+    /// `Value::Array`, which `inject_strict` had no arm for — a silent no-op.
+    #[test]
+    fn test_strict_recurses_into_array_valued_items() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "tuple": {
+                    "type": "array",
+                    "items": [
+                        {"type": "object", "properties": {"a": {"type": "string"}}},
+                        {"type": "integer"}
+                    ]
+                }
+            }
+        });
+        let result = SchemaConverter::convert_input_schema(&schema).expect("convert");
+        assert_eq!(
+            result.pointer("/properties/tuple/items/0/additionalProperties"),
+            Some(&json!(false)),
+            "strict must walk array-valued items; got: {result}"
         );
     }
 }
