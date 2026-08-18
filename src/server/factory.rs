@@ -238,8 +238,9 @@ impl MCPServerFactory {
     /// * `name` - Server name advertised in MCP init. Must be a
     ///   non-empty string of at most 255 characters per the protocol
     ///   spec. [D10-002]
-    /// * `version` - Server version string (used in init options, not
-    ///   stored on server).
+    /// * `version` - Server version string. Bound onto the server's config,
+    ///   so [`build_init_options`](Self::build_init_options) reports it
+    ///   without the caller passing it a second time. [A-D-FA-4]
     ///
     /// # Errors
     /// Returns [`FactoryError::InvalidName`] when `name` is empty or
@@ -248,14 +249,25 @@ impl MCPServerFactory {
     pub fn create_server(
         &self,
         name: &str,
-        _version: &str,
+        version: &str,
     ) -> Result<MCPServer, crate::server::server::FactoryError> {
         // [D10-002] Spec contract: non-empty, <= 255 chars.
-        if name.is_empty() || name.len() > 255 {
-            return Err(crate::server::server::FactoryError::InvalidName(name.len()));
+        //
+        // [A-D-FA-3] CHARACTERS, not bytes. `str::len()` counts UTF-8 bytes,
+        // so a 100-character CJK name measured 300 and was rejected here while
+        // Python (code points) and TypeScript (UTF-16 units) both accepted it.
+        let name_len = name.chars().count();
+        if name.is_empty() || name_len > 255 {
+            return Err(crate::server::server::FactoryError::InvalidName(name_len));
         }
         Ok(MCPServer::new(MCPServerConfig {
             name: name.to_string(),
+            // [A-D-FA-4] Bind the version at construction, as TypeScript's
+            // `new Server({ name, version }, ..)` does. Discarding it left
+            // `MCPServerConfig::version` at None, so a server built through the
+            // factory reported the crate version from `MCPServer::serve` unless
+            // the caller happened to pass it again.
+            version: Some(version.to_string()),
             ..Default::default()
         }))
     }
@@ -684,6 +696,15 @@ impl MCPServerFactory {
         name: &str,
         version: &str,
     ) -> InitializationOptions {
+        // [A-D-FA-4] A server built by `create_server` carries its own
+        // version; the argument is the fallback for servers constructed
+        // directly via `MCPServer::new`, which leaves it None.
+        let server_version = server
+            .config()
+            .version
+            .clone()
+            .unwrap_or_else(|| version.to_string());
+
         let tools_cap = if server.has_tool_handlers() {
             Some(ToolsCapability { list_changed: true })
         } else {
@@ -698,7 +719,7 @@ impl MCPServerFactory {
 
         InitializationOptions {
             server_name: name.to_string(),
-            server_version: version.to_string(),
+            server_version,
             capabilities: ServerCapabilities {
                 tools: tools_cap,
                 resources: resources_cap,
@@ -1382,6 +1403,46 @@ mod tests {
         let registry = make_registry_with_modules(vec![("mod.a", "Module A docs", vec![])]);
         factory.register_resource_handlers(&mut server, &registry);
         assert!(server.has_resource_handlers());
+    }
+
+    // ---- [A-D-FA-3] name length is measured in characters ----
+
+    /// `str::len()` counts UTF-8 BYTES. Python counts code points
+    /// (`len(name)`) and TypeScript UTF-16 units (`name.length`), so a
+    /// 100-character CJK name (300 bytes) was accepted by both peers and
+    /// rejected by Rust with `InvalidName(300)`.
+    #[test]
+    fn test_create_server_accepts_multibyte_name_under_the_char_limit() {
+        let factory = make_factory();
+        // Escape form keeps this source file ASCII-only (apdev check-chars).
+        let name: String = "\u{670D}".repeat(100);
+        assert_eq!(name.len(), 300, "fixture must be multi-byte");
+        factory
+            .create_server(&name, "1.0.0")
+            .expect("a 100-character name is within the 255-character limit");
+    }
+
+    /// The bound stays inclusive and still rejects 256 characters.
+    #[test]
+    fn test_create_server_rejects_name_over_the_char_limit() {
+        let factory = make_factory();
+        assert!(factory.create_server(&"x".repeat(255), "1.0.0").is_ok());
+        assert!(factory.create_server(&"x".repeat(256), "1.0.0").is_err());
+    }
+
+    // ---- [A-D-FA-4] create_server stores the version ----
+
+    /// `create_server` discarded its version argument, leaving
+    /// `MCPServerConfig::version` at None — the value was only recovered if
+    /// the caller passed it a second time to `build_init_options`.
+    /// TypeScript binds it at construction (`new Server({ name, version })`),
+    /// so one call suffices there.
+    #[test]
+    fn test_create_server_binds_version_without_repassing_it() {
+        let factory = make_factory();
+        let server = factory.create_server("x", "2.0.0").unwrap();
+        let opts = factory.build_init_options(&server, "x", "");
+        assert_eq!(opts.server_version, "2.0.0");
     }
 
     // ---- init_options tests ----
