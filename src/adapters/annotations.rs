@@ -123,10 +123,18 @@ impl AnnotationMapper {
         //      the `[Annotations: ...]` block, joined by `\n\n`.
         // This differs from the previous Rust format (key=value inside
         // [Annotations:...]) and from TS (joined by \n in one block).
-        let mut mcp_extras: Vec<(&String, &serde_json::Value)> = annotations
+        //
+        // [A-D-AM-1] Only STRING values pass through. The spec restricts the
+        // passthrough to keys "whose value is a string", Python guards with
+        // `isinstance(extra[key], str)` and TypeScript with
+        // `typeof value === "string"`. Filtering on the key prefix alone let
+        // numbers, booleans and objects be JSON-serialized into the LLM-facing
+        // tool description on Rust only.
+        let mut mcp_extras: Vec<(&String, &str)> = annotations
             .extra
             .iter()
             .filter(|(k, _)| k.starts_with("mcp_"))
+            .filter_map(|(k, v)| v.as_str().map(|s| (k, s)))
             .collect();
         mcp_extras.sort_by(|a, b| a.0.cmp(b.0));
 
@@ -144,13 +152,7 @@ impl AnnotationMapper {
         // Each mcp_ extra is its own paragraph-level section, outside [Annotations:].
         for (k, v) in &mcp_extras {
             let stripped = k.strip_prefix("mcp_").unwrap_or(k);
-            // Use as_str() for string values to avoid JSON quote wrapping;
-            // fall back to to_string() for non-string JSON values.
-            let formatted_val = v
-                .as_str()
-                .map(str::to_string)
-                .unwrap_or_else(|| v.to_string());
-            sections.push(format!("{stripped}: {formatted_val}"));
+            sections.push(format!("{stripped}: {v}"));
         }
 
         format!("\n\n{}", sections.join("\n\n"))
@@ -377,6 +379,47 @@ mod tests {
             result.contains("hint: use sparingly"),
             "stripped extra must appear in result; got: {result:?}"
         );
+    }
+
+    /// [A-D-AM-1] Only string-valued `mcp_` extras are passed through. Python
+    /// guards with `isinstance(extra[key], str)` and TypeScript with
+    /// `typeof value === "string"`; Rust used to filter on the key prefix alone
+    /// and JSON-serialize numbers/booleans/objects into the LLM-facing
+    /// description.
+    #[test]
+    fn test_mcp_extras_non_string_values_are_dropped() {
+        let mut extra = std::collections::HashMap::new();
+        extra.insert("mcp_count".to_string(), serde_json::json!(3));
+        extra.insert("mcp_enabled".to_string(), serde_json::json!(true));
+        extra.insert("mcp_meta".to_string(), serde_json::json!({"a": 1}));
+        extra.insert("mcp_hint".to_string(), serde_json::json!("keep me"));
+        let ann = ModuleAnnotations {
+            extra,
+            ..Default::default()
+        };
+        let result = AnnotationMapper::to_description_suffix(Some(&ann));
+        assert!(
+            result.contains("hint: keep me"),
+            "string extras must survive; got: {result:?}"
+        );
+        for dropped in ["count", "enabled", "meta"] {
+            assert!(
+                !result.contains(dropped),
+                "non-string extra {dropped:?} must be dropped; got: {result:?}"
+            );
+        }
+    }
+
+    /// A module whose ONLY extras are non-strings must produce no suffix at all.
+    #[test]
+    fn test_mcp_extras_only_non_string_yields_empty_suffix() {
+        let mut extra = std::collections::HashMap::new();
+        extra.insert("mcp_count".to_string(), serde_json::json!(3));
+        let ann = ModuleAnnotations {
+            extra,
+            ..Default::default()
+        };
+        assert_eq!(AnnotationMapper::to_description_suffix(Some(&ann)), "");
     }
 
     // ---- has_requires_approval tests ----
