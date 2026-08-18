@@ -259,10 +259,25 @@ fn wrap_call_fn(inner: HandleCallFn) -> mcp_embedded_ui::ToolCallFn {
                         )
                     });
 
-            // Run the call handler within apcore's AUTH_IDENTITY scope.
-            let (raw_content, is_error, error_code) = APCORE_IDENTITY
-                .scope(apcore_identity, async move { inner(name, args).await })
-                .await;
+            // Run the call handler within apcore's AUTH_IDENTITY scope — but
+            // only when the explorer actually supplies an identity.
+            //
+            // [A-D-EX-1] An unconditional `.scope(None, ..)` ESTABLISHES a None
+            // binding that shadows whatever `auth::middleware` bound for the
+            // request, silently downgrading identity-dependent tools to
+            // anonymous whenever the explorer is mounted without its own
+            // authenticator. Python only installs this hook when an explorer
+            // authenticator is configured (explorer/__init__.py:76), leaving
+            // the middleware's value live; leaving the scope untouched here is
+            // the equivalent.
+            let (raw_content, is_error, error_code) = match apcore_identity {
+                Some(identity) => {
+                    APCORE_IDENTITY
+                        .scope(Some(identity), async move { inner(name, args).await })
+                        .await
+                }
+                None => inner(name, args).await,
+            };
 
             // Convert Vec<serde_json::Value> → Vec<mcp_embedded_ui::Content>.
             let content = raw_content
@@ -760,5 +775,94 @@ mod tests {
         assert!(is_error);
         assert_eq!(error_code.as_deref(), Some("ERR_CODE"));
         assert_eq!(content[0].text.as_deref(), Some("error details"));
+    }
+
+    // -- identity propagation [A-D-EX-1] ----------------------------------
+
+    /// With no explorer-level authenticator, an identity already bound by
+    /// `AuthMiddleware` must survive into the tool handler. An unconditional
+    /// `.scope(None, ..)` used to shadow it, silently downgrading
+    /// identity-dependent tools to anonymous.
+    #[tokio::test]
+    async fn wrap_call_fn_preserves_outer_identity_when_ui_supplies_none() {
+        use crate::auth::middleware::AUTH_IDENTITY;
+
+        let inner: HandleCallFn = Arc::new(|_name, _args| {
+            Box::pin(async move {
+                let seen = AUTH_IDENTITY
+                    .try_with(|id| id.as_ref().map(|i| i.id().to_string()))
+                    .ok()
+                    .flatten();
+                let content = vec![json!({"type": "text", "text": seen.unwrap_or_default()})];
+                (content, false, None)
+            })
+        });
+        let wrapped = super::wrap_call_fn(inner);
+
+        let outer = Some(apcore::Identity::new(
+            "middleware-user".to_string(),
+            "user".to_string(),
+            vec!["admin".to_string()],
+            Default::default(),
+        ));
+        let (content, _, _) = AUTH_IDENTITY
+            .scope(
+                outer,
+                async move { wrapped("test".into(), json!({})).await },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            content[0].text.as_deref(),
+            Some("middleware-user"),
+            "explorer must not shadow the middleware-bound identity"
+        );
+    }
+
+    /// When the explorer *does* supply an identity it still wins over any
+    /// outer binding.
+    #[tokio::test]
+    async fn wrap_call_fn_ui_identity_overrides_outer() {
+        use crate::auth::middleware::AUTH_IDENTITY;
+        use mcp_embedded_ui::AUTH_IDENTITY as UI_IDENTITY;
+
+        let inner: HandleCallFn = Arc::new(|_name, _args| {
+            Box::pin(async move {
+                let seen = AUTH_IDENTITY
+                    .try_with(|id| id.as_ref().map(|i| i.id().to_string()))
+                    .ok()
+                    .flatten();
+                let content = vec![json!({"type": "text", "text": seen.unwrap_or_default()})];
+                (content, false, None)
+            })
+        });
+        let wrapped = super::wrap_call_fn(inner);
+
+        let ui_identity = Some(mcp_embedded_ui::Identity {
+            id: "explorer-user".to_string(),
+            identity_type: "user".to_string(),
+            roles: vec![],
+            attrs: Default::default(),
+        });
+        let outer = Some(apcore::Identity::new(
+            "middleware-user".to_string(),
+            "user".to_string(),
+            vec![],
+            Default::default(),
+        ));
+
+        let (content, _, _) = AUTH_IDENTITY
+            .scope(outer, async move {
+                UI_IDENTITY
+                    .scope(ui_identity, async move {
+                        wrapped("test".into(), json!({})).await
+                    })
+                    .await
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(content[0].text.as_deref(), Some("explorer-user"));
     }
 }
