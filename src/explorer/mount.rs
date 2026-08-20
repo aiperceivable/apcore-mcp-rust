@@ -123,6 +123,18 @@ pub struct ExplorerConfig {
     /// URL prefix where the explorer is mounted (e.g. `"/explorer"`).
     pub explorer_prefix: String,
     /// Optional authenticator for protecting explorer endpoints.
+    ///
+    /// **Only needed when mounting the explorer standalone.** On this crate's
+    /// own transport paths the explorer router is merged into the app *before*
+    /// [`apply_auth_layer`](crate::server::transport) wraps it, so
+    /// `AuthMiddlewareLayer` already authenticates every request and scopes
+    /// `AUTH_IDENTITY` around the handler — which is why
+    /// `build_explorer_config` deliberately leaves this field unset there.
+    /// Setting it on those paths would authenticate the same request twice.
+    ///
+    /// It exists for callers who take [`create_explorer_mount`] and mount the
+    /// returned router themselves without that layer; that path is covered by
+    /// `tests/explorer_test.rs`.
     pub authenticator: Option<Arc<dyn Authenticator>>,
     /// Page title shown in the browser tab and heading.
     pub title: String,
