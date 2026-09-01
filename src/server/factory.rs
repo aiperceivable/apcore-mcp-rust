@@ -17,8 +17,8 @@ use crate::server::async_task_bridge::AsyncTaskBridge;
 use crate::server::router::ExecutionRouter;
 use crate::server::server::{FactoryError, MCPServer, MCPServerConfig};
 use crate::server::types::{
-    CallToolResult, InitializationOptions, ReadResourceContents, Resource, ResourcesCapability,
-    ServerCapabilities, TextContent, Tool, ToolAnnotations, ToolsCapability,
+    CallToolResult, InitializationOptions, ReadResourceContents, Resource, ResourceTemplate,
+    ResourcesCapability, ServerCapabilities, TextContent, Tool, ToolAnnotations, ToolsCapability,
 };
 
 /// Summarize a full apcore `PipelineTrace` JSON into the MCP `_meta.trace`
@@ -109,6 +109,242 @@ fn format_intent_label(key: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// The three read-only `system.*` module family prefixes that are exposed as
+/// MCP resources instead of tools (aiperceivable/apcore-mcp#15,
+/// aiperceivable/apcore-mcp-rust#6). `system.control.*` is deliberately not
+/// among them — those modules mutate state and stay tools.
+const READONLY_SYSTEM_RESOURCE_PREFIXES: &[&str] =
+    &["system.health.", "system.usage.", "system.manifest."];
+
+/// Whether `module_id` belongs to one of apcore's read-only `system.*`
+/// module families (`system.health.*`, `system.usage.*`,
+/// `system.manifest.*`).
+///
+/// These modules answer a GET-shaped question with no side effects — the
+/// MCP `resources/*` primitive, not `tools/*`, is the correct fit
+/// (aiperceivable/apcore-mcp#15(a)). [`MCPServerFactory::build_tools`] uses
+/// this to exclude them from the tool list; [`MCPServerFactory::
+/// register_resource_handlers`] uses the same prefixes to expose them as
+/// resources / resource templates instead. `system.control.*` (the
+/// mutating management modules) is unaffected and stays a tool.
+pub fn is_readonly_system_resource_module_id(module_id: &str) -> bool {
+    READONLY_SYSTEM_RESOURCE_PREFIXES
+        .iter()
+        .any(|prefix| module_id.starts_with(prefix))
+}
+
+/// The `com.aiperceivable/management` MCP initialization extension id
+/// (aiperceivable/apcore-mcp#16). Broadcast in `initialize`'s
+/// `capabilities.extensions` when at least one management surface
+/// (health / usage / manifest / control) is registered.
+pub const MANAGEMENT_EXTENSION_ID: &str = "com.aiperceivable/management";
+
+/// The apcore PROTOCOL_SPEC version this bridge's `system.*` surface
+/// implements, reported in the `com.aiperceivable/management` extension.
+/// Bump this alongside the apcore dependency when the sys_modules surface
+/// (module ids, schemas, or governance semantics) is re-vetted against a
+/// newer spec — it is a manual, deliberate value, not derived at build time.
+pub const MANAGEMENT_EXTENSION_PROTOCOL_VERSION: &str = "1.30.0";
+
+/// Which apcore management surfaces (aiperceivable/apcore-mcp#16) this
+/// server instance actually exposes. Drives the `com.aiperceivable/
+/// management` initialize extension: only the `true` flags are named in
+/// `surfaces`, and the extension is omitted entirely when all four are
+/// `false`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ManagementCapabilities {
+    /// `system.health.*` modules are registered.
+    pub health: bool,
+    /// `system.usage.*` modules are registered.
+    pub usage: bool,
+    /// `system.manifest.*` modules are registered.
+    pub manifest: bool,
+    /// `system.control.*` modules are registered.
+    pub control: bool,
+}
+
+impl ManagementCapabilities {
+    /// `true` if any surface is exposed.
+    pub fn any(&self) -> bool {
+        self.health || self.usage || self.manifest || self.control
+    }
+
+    /// The `surfaces` array for the extension payload — only the `true`
+    /// flags, in a fixed, stable order.
+    fn surfaces(&self) -> Vec<&'static str> {
+        let mut surfaces = Vec::with_capacity(4);
+        if self.health {
+            surfaces.push("health");
+        }
+        if self.usage {
+            surfaces.push("usage");
+        }
+        if self.manifest {
+            surfaces.push("manifest");
+        }
+        if self.control {
+            surfaces.push("control");
+        }
+        surfaces
+    }
+
+    /// Build the value of `capabilities.extensions` for `initialize`, or
+    /// `None` when no surface is exposed (in which case the `extensions` key
+    /// is omitted entirely rather than advertised empty).
+    pub fn to_extensions_value(self) -> Option<Value> {
+        if !self.any() {
+            return None;
+        }
+        Some(serde_json::json!({
+            MANAGEMENT_EXTENSION_ID: {
+                "surfaces": self.surfaces(),
+                "protocolVersion": MANAGEMENT_EXTENSION_PROTOCOL_VERSION,
+            }
+        }))
+    }
+}
+
+/// The three read-only `system.*` modules with no required parameters,
+/// registered as static `apcore://` resources: `(module_id, uri, display
+/// name)`.
+const SYSTEM_RESOURCE_MODULES: &[(&str, &str, &str)] = &[
+    (
+        "system.health.summary",
+        "apcore://system.health.summary",
+        "system.health.summary",
+    ),
+    (
+        "system.usage.summary",
+        "apcore://system.usage.summary",
+        "system.usage.summary (optional ?period= query)",
+    ),
+    (
+        "system.manifest.full",
+        "apcore://system.manifest.full",
+        "system.manifest.full",
+    ),
+];
+
+/// The three read-only `system.*` modules that require a `module_id`
+/// argument, registered as `apcore://` resource templates: `(module_id,
+/// uri_template, display name)`.
+///
+/// `system.usage.module`'s template carries the RFC 6570 form-style query
+/// expansion `{?period}` -- aiperceivable/apcore-mcp#15's URI-convention
+/// table declares it as `apcore://system.usage.module/{module_id}{?period}`,
+/// and apcore-mcp-typescript's `systemResourceUriTemplate()` emits the same
+/// suffix. The other two templates take no query parameter.
+const SYSTEM_RESOURCE_TEMPLATE_MODULES: &[(&str, &str, &str)] = &[
+    (
+        "system.health.module",
+        "apcore://system.health.module/{module_id}",
+        "system.health.module",
+    ),
+    (
+        "system.usage.module",
+        "apcore://system.usage.module/{module_id}{?period}",
+        "system.usage.module (optional ?period= query)",
+    ),
+    (
+        "system.manifest.module",
+        "apcore://system.manifest.module/{module_id}",
+        "system.manifest.module",
+    ),
+];
+
+/// Read one of the six read-only `system.*` resources exposed by
+/// [`MCPServerFactory::register_resource_handlers`].
+///
+/// `rest` is the part of the URI after the `apcore://` scheme, e.g.
+/// `"system.health.summary"` or `"system.usage.module/files.read?period=1d"`.
+/// Dispatches through `router.handle_call` — the same path a `tools/call`
+/// takes — so ACL, approval, and redaction all apply exactly as they do for
+/// `system.control.*`. [aiperceivable/apcore-mcp#15(a)]
+async fn read_system_resource(
+    router: &ExecutionRouter,
+    available: &std::collections::HashSet<&'static str>,
+    uri: &str,
+) -> Result<Vec<ReadResourceContents>, FactoryError> {
+    let rest = uri.strip_prefix("apcore://").unwrap_or(uri);
+    let (path, query) = match rest.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (rest, None),
+    };
+    let period = query.and_then(|q| {
+        q.split('&').find_map(|kv| {
+            let (k, v) = kv.split_once('=')?;
+            (k == "period").then(|| v.to_string())
+        })
+    });
+
+    // Static summary/full resources: the path IS the module id.
+    if let Some((module_id, ..)) = SYSTEM_RESOURCE_MODULES
+        .iter()
+        .find(|(module_id, ..)| *module_id == path)
+    {
+        if !available.contains(module_id) {
+            return Err(FactoryError::ResourceNotFound(uri.to_string()));
+        }
+        let mut args = serde_json::Map::new();
+        if *module_id == "system.usage.summary" {
+            if let Some(period) = period {
+                args.insert("period".to_string(), Value::String(period));
+            }
+        }
+        return call_router_as_resource(router, module_id, Value::Object(args), uri).await;
+    }
+
+    // Templated `.module` resources: the path is `"{module_id}/{module_id}"`.
+    for (template_module_id, ..) in SYSTEM_RESOURCE_TEMPLATE_MODULES {
+        let Some(target_module_id) = path.strip_prefix(&format!("{template_module_id}/")) else {
+            continue;
+        };
+        if target_module_id.is_empty() || !available.contains(template_module_id) {
+            return Err(FactoryError::ResourceNotFound(uri.to_string()));
+        }
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "module_id".to_string(),
+            Value::String(target_module_id.to_string()),
+        );
+        if *template_module_id == "system.usage.module" {
+            if let Some(period) = period {
+                args.insert("period".to_string(), Value::String(period));
+            }
+        }
+        return call_router_as_resource(router, template_module_id, Value::Object(args), uri).await;
+    }
+
+    Err(FactoryError::ResourceNotFound(uri.to_string()))
+}
+
+/// Invoke `module_id` through `router.handle_call` and adapt the result into
+/// `resources/read`'s `contents` shape. `handle_call` is the same entry
+/// point `tools/call` uses, so an ACL denial or a required-approval gate
+/// applies identically to a resource read.
+async fn call_router_as_resource(
+    router: &ExecutionRouter,
+    module_id: &str,
+    arguments: Value,
+    uri: &str,
+) -> Result<Vec<ReadResourceContents>, FactoryError> {
+    let (content_items, is_error, _trace_id) =
+        router.handle_call(module_id, &arguments, None).await;
+    let text = content_items
+        .iter()
+        .filter(|item| item.content_type == "text")
+        .filter_map(|item| item.data.as_str())
+        .collect::<Vec<_>>()
+        .join("");
+    if is_error {
+        return Err(FactoryError::Other(format!("{uri}: {text}")));
+    }
+    Ok(vec![ReadResourceContents {
+        content: text,
+        mime_type: "application/json".to_string(),
+    }])
 }
 
 /// Metadata flags derived from module annotations for inclusion in
@@ -398,6 +634,12 @@ impl MCPServerFactory {
         let mut tools = Vec::new();
 
         for module_id in module_ids {
+            // Read-only system.* modules (health/usage/manifest) are exposed
+            // as MCP resources, not tools (aiperceivable/apcore-mcp#15(a)).
+            // `system.control.*` is unaffected — it stays a tool.
+            if is_readonly_system_resource_module_id(&module_id) {
+                continue;
+            }
             // Reject module ids that collide with the reserved async-task
             // meta-tool namespace (`__apcore_` prefix). These names are
             // owned by the AsyncTaskBridge; user modules must not shadow
@@ -637,7 +879,24 @@ impl MCPServerFactory {
     /// Handlers are stored as closures on the `MCPServer` struct; see
     /// [`register_handlers`](Self::register_handlers) for why, and for the
     /// planned move onto `rmcp`.
-    pub fn register_resource_handlers(&self, server: &mut MCPServer, registry: &Registry) {
+    ///
+    /// Also registers the three read-only `system.*` module families as MCP
+    /// resources (aiperceivable/apcore-mcp#15(a), aiperceivable/
+    /// apcore-mcp-rust#6): `system.health.summary`, `system.usage.summary`
+    /// and `system.manifest.full` as static `apcore://` resources, and
+    /// `system.health.module`, `system.usage.module` and
+    /// `system.manifest.module` — which require a `module_id` argument — as
+    /// `apcore://` resource *templates*. Only registered when the
+    /// corresponding module id is actually present in `registry`; no
+    /// separate opt-in flag. A read of any of these goes through `router`'s
+    /// `handle_call` — the same ACL / approval / redaction path a `tools/
+    /// call` gets — never a direct registry or module invocation.
+    pub fn register_resource_handlers(
+        &self,
+        server: &mut MCPServer,
+        registry: &Registry,
+        router: Arc<ExecutionRouter>,
+    ) {
         // Build docs map: module_id -> documentation.
         //
         // [A-D-FA-8] No `description` fallback. It gave every module with any
@@ -656,15 +915,54 @@ impl MCPServerFactory {
 
         let docs = Arc::new(docs_map);
 
+        // Which of the six read-only system.* module ids this registry
+        // actually has. Drives both which resources/templates are
+        // advertised and which reads are accepted at read time — a caller
+        // cannot read `apcore://system.control.update_config` (not in this
+        // set at all) or a summary resource whose module was never
+        // registered.
+        let available: std::collections::HashSet<&'static str> = SYSTEM_RESOURCE_MODULES
+            .iter()
+            .chain(SYSTEM_RESOURCE_TEMPLATE_MODULES.iter())
+            .map(|(id, ..)| *id)
+            .filter(|id| registry.has(id))
+            .collect();
+        let available = Arc::new(available);
+
         // list_resources handler
         let docs_for_list = Arc::clone(&docs);
+        let available_for_list = Arc::clone(&available);
         server.list_resources_handler = Some(Arc::new(move || {
-            docs_for_list
+            let mut resources: Vec<Resource> = docs_for_list
                 .keys()
                 .map(|module_id| Resource {
                     uri: format!("docs://{}", module_id),
                     name: format!("{} documentation", module_id),
                     mime_type: "text/plain".to_string(),
+                })
+                .collect();
+            for (module_id, uri, name) in SYSTEM_RESOURCE_MODULES {
+                if available_for_list.contains(module_id) {
+                    resources.push(Resource {
+                        uri: (*uri).to_string(),
+                        name: (*name).to_string(),
+                        mime_type: "application/json".to_string(),
+                    });
+                }
+            }
+            resources
+        }));
+
+        // list_resource_templates handler
+        let available_for_templates = Arc::clone(&available);
+        server.list_resource_templates_handler = Some(Arc::new(move || {
+            SYSTEM_RESOURCE_TEMPLATE_MODULES
+                .iter()
+                .filter(|(module_id, ..)| available_for_templates.contains(module_id))
+                .map(|(_, uri_template, name)| ResourceTemplate {
+                    uri_template: (*uri_template).to_string(),
+                    name: (*name).to_string(),
+                    mime_type: "application/json".to_string(),
                 })
                 .collect()
         }));
@@ -672,18 +970,24 @@ impl MCPServerFactory {
         // read_resource handler
         let docs_for_read = Arc::clone(&docs);
         server.read_resource_handler = Some(Arc::new(move |uri: String| {
-            let prefix = "docs://";
-            if !uri.starts_with(prefix) {
-                return Err(FactoryError::UnsupportedScheme(uri));
-            }
-            let module_id = &uri[prefix.len()..];
-            match docs_for_read.get(module_id) {
-                Some(doc) => Ok(vec![ReadResourceContents {
-                    content: doc.clone(),
-                    mime_type: "text/plain".to_string(),
-                }]),
-                None => Err(FactoryError::ResourceNotFound(uri)),
-            }
+            let docs = Arc::clone(&docs_for_read);
+            let router = Arc::clone(&router);
+            let available = Arc::clone(&available);
+            Box::pin(async move {
+                if let Some(module_id) = uri.strip_prefix("docs://") {
+                    return match docs.get(module_id) {
+                        Some(doc) => Ok(vec![ReadResourceContents {
+                            content: doc.clone(),
+                            mime_type: "text/plain".to_string(),
+                        }]),
+                        None => Err(FactoryError::ResourceNotFound(uri.clone())),
+                    };
+                }
+                if uri.starts_with("apcore://") {
+                    return read_system_resource(&router, &available, &uri).await;
+                }
+                Err(FactoryError::UnsupportedScheme(uri))
+            })
         }));
     }
 
@@ -693,11 +997,20 @@ impl MCPServerFactory {
     ///
     /// Constructs `InitializationOptions` with server name, version, and
     /// capabilities derived from the registered handlers on the server.
+    ///
+    /// `management`, when given, broadcasts the `com.aiperceivable/
+    /// management` initialize extension (aiperceivable/apcore-mcp#16)
+    /// naming which management surfaces (health/usage/manifest/control) this
+    /// server exposes. `None` — or `Some` with every flag `false` — omits
+    /// the extension entirely; a client that never declares support for it
+    /// is unaffected either way; it does not gate access to any resource or
+    /// tool.
     pub fn build_init_options(
         &self,
         server: &MCPServer,
         name: &str,
         version: &str,
+        management: Option<ManagementCapabilities>,
     ) -> InitializationOptions {
         // [A-D-FA-4] A server built by `create_server` carries its own
         // version; the argument is the fallback for servers constructed
@@ -720,12 +1033,15 @@ impl MCPServerFactory {
             None
         };
 
+        let extensions = management.and_then(ManagementCapabilities::to_extensions_value);
+
         InitializationOptions {
             server_name: name.to_string(),
             server_version,
             capabilities: ServerCapabilities {
                 tools: tools_cap,
                 resources: resources_cap,
+                extensions,
             },
         }
     }
@@ -1474,7 +1790,11 @@ mod tests {
             ("mod.b", "Module B", Some("Module B docs")),
         ]);
 
-        factory.register_resource_handlers(&mut server, &registry);
+        factory.register_resource_handlers(
+            &mut server,
+            &registry,
+            Arc::new(ExecutionRouter::stub()),
+        );
 
         let resources = server.list_resources().unwrap();
         assert_eq!(resources.len(), 2);
@@ -1485,8 +1805,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_read_resource_returns_documentation() {
+    #[tokio::test]
+    async fn test_read_resource_returns_documentation() {
         let factory = make_factory();
         let mut server = factory.create_server("test", "1.0.0").unwrap();
         let registry = make_registry_with_documentation(vec![(
@@ -1495,9 +1815,16 @@ mod tests {
             Some("Module A documentation text"),
         )]);
 
-        factory.register_resource_handlers(&mut server, &registry);
+        factory.register_resource_handlers(
+            &mut server,
+            &registry,
+            Arc::new(ExecutionRouter::stub()),
+        );
 
-        let result = server.read_resource("docs://mod.a".to_string()).unwrap();
+        let result = server
+            .read_resource("docs://mod.a".to_string())
+            .unwrap()
+            .await;
         let contents = result.unwrap();
         assert_eq!(contents.len(), 1);
         assert_eq!(contents[0].content, "Module A documentation text");
@@ -1509,8 +1836,8 @@ mod tests {
     /// `resources/list` returned an entry per module and `resources/read` of
     /// `docs://foo` succeeded where Python and TypeScript raise
     /// "Resource not found".
-    #[test]
-    fn test_undocumented_module_exposes_no_docs_resource() {
+    #[tokio::test]
+    async fn test_undocumented_module_exposes_no_docs_resource() {
         let factory = make_factory();
         let mut server = factory.create_server("test", "1.0.0").unwrap();
         let registry = make_registry_with_documentation(vec![
@@ -1518,7 +1845,11 @@ mod tests {
             ("mod.bare", "has a description only", None),
         ]);
 
-        factory.register_resource_handlers(&mut server, &registry);
+        factory.register_resource_handlers(
+            &mut server,
+            &registry,
+            Arc::new(ExecutionRouter::stub()),
+        );
 
         let resources = server.list_resources().unwrap();
         let uris: Vec<&str> = resources.iter().map(|r| r.uri.as_str()).collect();
@@ -1531,34 +1862,47 @@ mod tests {
             server
                 .read_resource("docs://mod.bare".to_string())
                 .unwrap()
+                .await
                 .is_err(),
             "reading an undocumented module must be Resource not found"
         );
     }
 
-    #[test]
-    fn test_read_resource_unknown_uri_errors() {
+    #[tokio::test]
+    async fn test_read_resource_unknown_uri_errors() {
         let factory = make_factory();
         let mut server = factory.create_server("test", "1.0.0").unwrap();
         let registry = make_registry_with_modules(vec![("mod.a", "Module A docs", vec![])]);
 
-        factory.register_resource_handlers(&mut server, &registry);
+        factory.register_resource_handlers(
+            &mut server,
+            &registry,
+            Arc::new(ExecutionRouter::stub()),
+        );
 
         let result = server
             .read_resource("docs://nonexistent".to_string())
-            .unwrap();
+            .unwrap()
+            .await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_read_resource_wrong_scheme_errors() {
+    #[tokio::test]
+    async fn test_read_resource_wrong_scheme_errors() {
         let factory = make_factory();
         let mut server = factory.create_server("test", "1.0.0").unwrap();
         let registry = make_registry_with_modules(vec![("mod.a", "Module A docs", vec![])]);
 
-        factory.register_resource_handlers(&mut server, &registry);
+        factory.register_resource_handlers(
+            &mut server,
+            &registry,
+            Arc::new(ExecutionRouter::stub()),
+        );
 
-        let result = server.read_resource("http://mod.a".to_string()).unwrap();
+        let result = server
+            .read_resource("http://mod.a".to_string())
+            .unwrap()
+            .await;
         assert!(result.is_err());
     }
 
@@ -1569,7 +1913,11 @@ mod tests {
         assert!(!server.has_resource_handlers());
 
         let registry = make_registry_with_modules(vec![("mod.a", "Module A docs", vec![])]);
-        factory.register_resource_handlers(&mut server, &registry);
+        factory.register_resource_handlers(
+            &mut server,
+            &registry,
+            Arc::new(ExecutionRouter::stub()),
+        );
         assert!(server.has_resource_handlers());
     }
 
@@ -1609,7 +1957,7 @@ mod tests {
     fn test_create_server_binds_version_without_repassing_it() {
         let factory = make_factory();
         let server = factory.create_server("x", "2.0.0").unwrap();
-        let opts = factory.build_init_options(&server, "x", "");
+        let opts = factory.build_init_options(&server, "x", "", None);
         assert_eq!(opts.server_version, "2.0.0");
     }
 
@@ -1619,7 +1967,7 @@ mod tests {
     fn test_init_options_has_server_name() {
         let factory = make_factory();
         let server = factory.create_server("my-server", "2.0.0").unwrap();
-        let opts = factory.build_init_options(&server, "my-server", "2.0.0");
+        let opts = factory.build_init_options(&server, "my-server", "2.0.0", None);
         assert_eq!(opts.server_name, "my-server");
     }
 
@@ -1627,7 +1975,7 @@ mod tests {
     fn test_init_options_has_server_version() {
         let factory = make_factory();
         let server = factory.create_server("test", "1.2.3").unwrap();
-        let opts = factory.build_init_options(&server, "test", "1.2.3");
+        let opts = factory.build_init_options(&server, "test", "1.2.3", None);
         assert_eq!(opts.server_version, "1.2.3");
     }
 
@@ -1635,7 +1983,7 @@ mod tests {
     fn test_init_options_no_capabilities_when_no_handlers() {
         let factory = make_factory();
         let server = factory.create_server("test", "1.0.0").unwrap();
-        let opts = factory.build_init_options(&server, "test", "1.0.0");
+        let opts = factory.build_init_options(&server, "test", "1.0.0", None);
         assert!(opts.capabilities.tools.is_none());
         assert!(opts.capabilities.resources.is_none());
     }
@@ -1647,7 +1995,7 @@ mod tests {
         let router = Arc::new(ExecutionRouter::stub());
         factory.register_handlers(&mut server, vec![], router);
 
-        let opts = factory.build_init_options(&server, "test", "1.0.0");
+        let opts = factory.build_init_options(&server, "test", "1.0.0", None);
         assert!(opts.capabilities.tools.is_some());
         assert!(opts.capabilities.tools.unwrap().list_changed);
     }
@@ -1657,9 +2005,13 @@ mod tests {
         let factory = make_factory();
         let mut server = factory.create_server("test", "1.0.0").unwrap();
         let registry = make_registry_with_modules(vec![("mod.a", "Module A docs", vec![])]);
-        factory.register_resource_handlers(&mut server, &registry);
+        factory.register_resource_handlers(
+            &mut server,
+            &registry,
+            Arc::new(ExecutionRouter::stub()),
+        );
 
-        let opts = factory.build_init_options(&server, "test", "1.0.0");
+        let opts = factory.build_init_options(&server, "test", "1.0.0", None);
         assert!(opts.capabilities.resources.is_some());
         assert!(opts.capabilities.resources.unwrap().list_changed);
     }
@@ -1668,7 +2020,7 @@ mod tests {
     fn test_init_options_default_values() {
         let factory = make_factory();
         let server = factory.create_server("apcore-mcp", "0.1.0").unwrap();
-        let opts = factory.build_init_options(&server, "apcore-mcp", "0.1.0");
+        let opts = factory.build_init_options(&server, "apcore-mcp", "0.1.0", None);
         assert_eq!(opts.server_name, "apcore-mcp");
         assert_eq!(opts.server_version, "0.1.0");
     }
@@ -1715,11 +2067,15 @@ mod tests {
         assert!(server.has_tool_handlers());
 
         // Register resource handlers
-        factory.register_resource_handlers(&mut server, &registry);
+        factory.register_resource_handlers(
+            &mut server,
+            &registry,
+            Arc::new(ExecutionRouter::stub()),
+        );
         assert!(server.has_resource_handlers());
 
         // Build init options — should reflect both capabilities
-        let opts = factory.build_init_options(&server, "lifecycle-test", "1.0.0");
+        let opts = factory.build_init_options(&server, "lifecycle-test", "1.0.0", None);
         assert_eq!(opts.server_name, "lifecycle-test");
         assert_eq!(opts.server_version, "1.0.0");
         assert!(opts.capabilities.tools.is_some());
@@ -1734,8 +2090,8 @@ mod tests {
         assert_eq!(resources.len(), 2);
     }
 
-    #[test]
-    fn test_end_to_end_resource_read() {
+    #[tokio::test]
+    async fn test_end_to_end_resource_read() {
         let factory = make_factory();
         let mut server = factory.create_server("test", "1.0.0").unwrap();
         let registry = make_registry_with_documentation(vec![(
@@ -1744,12 +2100,17 @@ mod tests {
             Some("This is the documentation for doc.module"),
         )]);
 
-        factory.register_resource_handlers(&mut server, &registry);
+        factory.register_resource_handlers(
+            &mut server,
+            &registry,
+            Arc::new(ExecutionRouter::stub()),
+        );
 
         // Read the resource
         let result = server
             .read_resource("docs://doc.module".to_string())
             .unwrap()
+            .await
             .unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(
@@ -2185,5 +2546,285 @@ mod tests {
         let tool = factory.build_tool(&desc, "identity test", None).unwrap();
         assert_eq!(tool.description, "identity test");
         assert_eq!(tool.name, "test.module");
+    }
+
+    // ---- is_readonly_system_resource_module_id (aiperceivable/apcore-mcp#15(a)) ----
+
+    #[test]
+    fn readonly_system_resource_classifier_matches_health_usage_manifest() {
+        for id in [
+            "system.health.summary",
+            "system.health.module",
+            "system.usage.summary",
+            "system.usage.module",
+            "system.manifest.full",
+            "system.manifest.module",
+        ] {
+            assert!(
+                is_readonly_system_resource_module_id(id),
+                "{id} should be classified as a read-only system resource"
+            );
+        }
+    }
+
+    #[test]
+    fn readonly_system_resource_classifier_excludes_control_and_others() {
+        for id in [
+            "system.control.update_config",
+            "system.control.reload_module",
+            "system.control.toggle_feature",
+            "files.read",
+            "system",
+            "system.healthy.not_a_real_family",
+        ] {
+            assert!(
+                !is_readonly_system_resource_module_id(id),
+                "{id} must NOT be classified as a read-only system resource"
+            );
+        }
+    }
+
+    #[test]
+    fn build_tools_excludes_readonly_system_resources_but_keeps_control() {
+        let factory = make_factory();
+        let registry = make_registry_with_modules(vec![
+            ("system.health.summary", "health", vec![]),
+            ("system.usage.module", "usage", vec![]),
+            ("system.manifest.full", "manifest", vec![]),
+            ("system.control.update_config", "control", vec![]),
+            ("files.read", "files", vec![]),
+        ]);
+
+        let tools = factory
+            .build_tools(&registry, None, None)
+            .expect("build_tools should not fail in test");
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+
+        assert!(!names.contains(&"system.health.summary"));
+        assert!(!names.contains(&"system.usage.module"));
+        assert!(!names.contains(&"system.manifest.full"));
+        assert!(
+            names.contains(&"system.control.update_config"),
+            "system.control.* must stay a tool"
+        );
+        assert!(names.contains(&"files.read"));
+    }
+
+    // ---- ManagementCapabilities (aiperceivable/apcore-mcp#16) ----
+
+    #[test]
+    fn management_capabilities_no_extension_when_all_false() {
+        let caps = ManagementCapabilities::default();
+        assert!(!caps.any());
+        assert!(caps.to_extensions_value().is_none());
+    }
+
+    #[test]
+    fn management_capabilities_surfaces_only_true_flags() {
+        let caps = ManagementCapabilities {
+            health: true,
+            usage: false,
+            manifest: true,
+            control: false,
+        };
+        let value = caps
+            .to_extensions_value()
+            .expect("at least one surface is true");
+        let surfaces = value[MANAGEMENT_EXTENSION_ID]["surfaces"]
+            .as_array()
+            .unwrap();
+        let surfaces: Vec<&str> = surfaces.iter().map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(surfaces, vec!["health", "manifest"]);
+        assert_eq!(
+            value[MANAGEMENT_EXTENSION_ID]["protocolVersion"],
+            MANAGEMENT_EXTENSION_PROTOCOL_VERSION
+        );
+    }
+
+    #[test]
+    fn build_init_options_omits_extensions_when_management_is_none() {
+        let factory = make_factory();
+        let server = factory.create_server("test", "1.0.0").unwrap();
+        let opts = factory.build_init_options(&server, "test", "1.0.0", None);
+        assert!(opts.capabilities.extensions.is_none());
+    }
+
+    #[test]
+    fn build_init_options_sets_extensions_when_a_surface_is_present() {
+        let factory = make_factory();
+        let server = factory.create_server("test", "1.0.0").unwrap();
+        let management = ManagementCapabilities {
+            control: true,
+            ..Default::default()
+        };
+        let opts = factory.build_init_options(&server, "test", "1.0.0", Some(management));
+        let extensions = opts
+            .capabilities
+            .extensions
+            .expect("control:true must produce an extensions value");
+        assert_eq!(
+            extensions[MANAGEMENT_EXTENSION_ID]["surfaces"],
+            json!(["control"])
+        );
+    }
+
+    /// A client whose `initialize` request never mentions the
+    /// `com.aiperceivable/management` extension — i.e. every ordinary MCP
+    /// client — must still be able to call tools and read resources exactly
+    /// as if the extension were never broadcast. The extension is pure
+    /// metadata: nothing in `tools/call` or `resources/read` consults it.
+    #[tokio::test]
+    async fn management_extension_does_not_gate_tool_or_resource_access() {
+        let factory = make_factory();
+        let mut server = factory.create_server("test", "1.0.0").unwrap();
+
+        let registry =
+            make_registry_with_documentation(vec![("demo.tool", "A demo tool", Some("demo docs"))]);
+        let tools = factory
+            .build_tools(&registry, None, None)
+            .expect("build_tools should not fail");
+        assert_eq!(tools.len(), 1);
+
+        let router = Arc::new(ExecutionRouter::new(
+            Box::new(IdentityCapturingExecutor),
+            false,
+            None,
+        ));
+        factory.register_handlers(&mut server, tools, Arc::clone(&router));
+        factory.register_resource_handlers(&mut server, &registry, router);
+
+        // Broadcast the extension (as if control/health/etc. were present) —
+        // this only affects what `build_init_options` returns, never what
+        // `call_tool` / `read_resource` do.
+        let management = ManagementCapabilities {
+            control: true,
+            ..Default::default()
+        };
+        let opts = factory.build_init_options(&server, "test", "1.0.0", Some(management));
+        assert!(
+            opts.capabilities.extensions.is_some(),
+            "sanity: the extension should be present in this server's init options"
+        );
+
+        // A plain client — no capability negotiation touches our extension —
+        // still gets a normal tool call...
+        let call_result = server
+            .call_tool("demo.tool".to_string(), json!({}), None)
+            .expect("call_tool handler must be registered")
+            .await;
+        assert!(
+            !call_result.is_error,
+            "tool call must succeed for a client unaware of the extension: {call_result:?}"
+        );
+
+        // ...and a normal resource read.
+        let read_result = server
+            .read_resource("docs://demo.tool".to_string())
+            .expect("read_resource handler must be registered")
+            .await;
+        assert!(
+            read_result.is_ok(),
+            "resource read must succeed for a client unaware of the extension: {read_result:?}"
+        );
+    }
+
+    // ---- system.* resources / templates (aiperceivable/apcore-mcp#15(a)) ----
+
+    #[tokio::test]
+    async fn system_resources_are_registered_as_resources_and_templates() {
+        let factory = make_factory();
+        let mut server = factory.create_server("test", "1.0.0").unwrap();
+        let registry = make_registry_with_modules(vec![
+            ("system.health.summary", "health summary", vec![]),
+            ("system.usage.module", "usage module", vec![]),
+        ]);
+        let router = Arc::new(ExecutionRouter::new(
+            Box::new(IdentityCapturingExecutor),
+            false,
+            None,
+        ));
+        factory.register_resource_handlers(&mut server, &registry, router);
+
+        // The parameterless summary module is a static resource...
+        let resources = server.list_resources().unwrap();
+        assert!(
+            resources
+                .iter()
+                .any(|r| r.uri == "apcore://system.health.summary"),
+            "got: {resources:?}"
+        );
+        assert!(
+            !resources
+                .iter()
+                .any(|r| r.uri.contains("system.usage.module")),
+            "the .module variant takes an argument and must not be a static resource"
+        );
+        // ...an unregistered system module (manifest.full was never added to
+        // this registry) must not appear at all.
+        assert!(!resources.iter().any(|r| r.uri.contains("system.manifest")));
+
+        // The module-scoped variant is a resource template instead.
+        let templates = server.list_resource_templates().unwrap();
+        assert!(
+            templates
+                .iter()
+                .any(|t| t.uri_template == "apcore://system.usage.module/{module_id}{?period}"),
+            "got: {templates:?}"
+        );
+
+        // Reading the static resource dispatches through the router...
+        let read = server
+            .read_resource("apcore://system.health.summary".to_string())
+            .expect("handler registered")
+            .await
+            .expect("read of a registered system resource should succeed");
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].mime_type, "application/json");
+
+        // ...and so does reading the templated resource, with the trailing
+        // path segment extracted as `module_id`.
+        let templated_read = server
+            .read_resource("apcore://system.usage.module/files.read?period=7d".to_string())
+            .expect("handler registered")
+            .await
+            .expect("read of a registered templated system resource should succeed");
+        assert_eq!(templated_read.len(), 1);
+
+        // A system.* module that was never registered in this registry is
+        // "not found", not silently executed anyway.
+        let missing = server
+            .read_resource("apcore://system.manifest.full".to_string())
+            .expect("handler registered")
+            .await;
+        assert!(missing.is_err(), "unregistered system resource must 404");
+    }
+
+    #[tokio::test]
+    async fn system_resource_read_goes_through_the_router_not_the_registry_directly() {
+        // The mock executor ignores module_id and always echoes the built
+        // context back as the "result" — so a successful read here proves
+        // the call passed through `ExecutionRouter::handle_call` (the same
+        // entry point tools/call uses), not a bypass straight to the
+        // registry/module.
+        let factory = make_factory();
+        let mut server = factory.create_server("test", "1.0.0").unwrap();
+        let registry =
+            make_registry_with_modules(vec![("system.manifest.full", "manifest", vec![])]);
+        let router = Arc::new(ExecutionRouter::new(
+            Box::new(IdentityCapturingExecutor),
+            false,
+            None,
+        ));
+        factory.register_resource_handlers(&mut server, &registry, router);
+
+        let read = server
+            .read_resource("apcore://system.manifest.full".to_string())
+            .expect("handler registered")
+            .await
+            .expect("read should succeed via the router");
+        assert_eq!(read.len(), 1);
+        // IdentityCapturingExecutor serializes the apcore Context it was
+        // handed; a non-empty JSON body confirms the router actually ran.
+        assert!(!read[0].content.is_empty());
     }
 }

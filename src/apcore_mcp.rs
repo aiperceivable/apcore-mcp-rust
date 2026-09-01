@@ -605,13 +605,101 @@ impl APCoreMCP {
         // Register handlers
         factory.register_handlers(&mut server, tools.clone(), Arc::clone(&router));
 
-        // Register resource handlers
-        factory.register_resource_handlers(&mut server, self.reg());
+        // Register resource handlers. Reads dispatch through `router` so the
+        // system.* resources added by #15(a) get the same ACL / approval /
+        // redaction path a tools/call gets.
+        factory.register_resource_handlers(&mut server, self.reg(), Arc::clone(&router));
+
+        // Which management surfaces (aiperceivable/apcore-mcp#16) this
+        // server instance actually exposes, for the `com.aiperceivable/
+        // management` initialize extension. Scanned with `visibility:
+        // ["public", "hidden"]` — the same conservative choice
+        // `Executor::governance_state` makes — so a control module
+        // registered non-discoverable is still reported as present, since
+        // it is still callable by id.
+        let all_ids = self.reg().list(None, None, Some(&["public", "hidden"]));
+        let management = crate::server::factory::ManagementCapabilities {
+            health: all_ids.iter().any(|id| id.starts_with("system.health.")),
+            usage: all_ids.iter().any(|id| id.starts_with("system.usage.")),
+            manifest: all_ids.iter().any(|id| id.starts_with("system.manifest.")),
+            control: all_ids.iter().any(|id| id.starts_with("system.control.")),
+        };
 
         // Build init options
-        let init_options = factory.build_init_options(&server, &self.config.name, &version);
+        let init_options =
+            factory.build_init_options(&server, &self.config.name, &version, Some(management));
+
+        // [aiperceivable/apcore-mcp#15(b)] Warn — loudly, but do not refuse
+        // to start — when system.control.* is registered and reachable with
+        // no recognised gate protecting it. Executor assembly (ACL, approval
+        // handler, strategy) is complete by this point and no transport has
+        // started listening yet.
+        self.warn_if_control_surface_unprotected();
 
         Ok((server, router, tools, init_options, version, Some(bridge)))
+    }
+
+    /// Log a loud, actionable warning when `system.control.*` modules are
+    /// registered but no recognised built-in gate protects them
+    /// (aiperceivable/apcore-mcp#15(b), aiperceivable/apcore-mcp-rust#6).
+    ///
+    /// Reads `Executor::governance_state()` — a pure accessor added in
+    /// apcore 0.28.0 (apcore#97) that reports what is actually wired into
+    /// the running pipeline, not merely what fields are set. This is a
+    /// warning only: it never refuses to start, since a deployment may be
+    /// relying on a custom step or an upstream gateway this accessor cannot
+    /// see (see `GovernanceState::unprotected_control_surface`'s own docs).
+    fn warn_if_control_surface_unprotected(&self) {
+        let governance = self.executor.governance_state();
+        if !governance.unprotected_control_surface {
+            return;
+        }
+
+        let mut missing = Vec::new();
+        if !governance.acl_configured {
+            missing.push("no ACL is configured (mcp.acl is empty or unset)".to_string());
+        } else if !governance.builtin_acl_gate_wired {
+            missing.push(
+                "an ACL is configured, but the built-in ACL gate is not wired into the \
+                 execution strategy"
+                    .to_string(),
+            );
+        }
+        if !governance.approval_handler_configured && !governance.policy_strict {
+            missing.push(
+                "no approval handler is configured and the execution policy is not strict"
+                    .to_string(),
+            );
+        }
+        if !governance.all_control_modules_require_approval {
+            missing
+                .push("not every system.control.* module declares requires_approval".to_string());
+        }
+
+        tracing::error!(
+            "\n\
+             ============================================================\n\
+             UNPROTECTED MANAGEMENT SURFACE (aiperceivable/apcore-mcp#15)\n\
+             system.control.* modules are registered (update_config /\n\
+             reload_module / toggle_feature), but no recognised gate is\n\
+             wired to protect them:\n\
+             {}\n\
+             Any caller that can reach this server can reconfigure, reload,\n\
+             or toggle apcore modules with NO authorization check.\n\
+             \n\
+             Fix at least one of:\n\
+             - Configure `mcp.acl` with a rule gating `system.control.*`\n\
+               (see `acl_builder`'s module doc for the reference template)\n\
+               AND ensure the execution strategy wires the built-in ACL gate.\n\
+             - Attach an ApprovalHandler, or set a strict ExecutionPolicy,\n\
+               so every system.control.* call is put to a human.\n\
+             ============================================================",
+            missing
+                .iter()
+                .map(|reason| format!("  - {reason}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
     }
 
     /// Build an [`ExplorerConfig`] from the given tools and explorer parameters.
@@ -2786,6 +2874,10 @@ mod tests {
                 callers: vec!["role:admin".to_string()],
                 targets: vec!["sys.*".to_string()],
                 effect: "allow".to_string(),
+                // apcore 0.28.0 (apcore#108): `ACLRule` is not
+                // `#[non_exhaustive]`, so every literal now names this field.
+                // `None` keeps this rule's pre-0.28.0 meaning exactly.
+                approval: None,
                 description: None,
                 conditions: None,
             }],

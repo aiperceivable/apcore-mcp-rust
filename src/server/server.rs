@@ -15,7 +15,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::server::types::{
-    CallToolResult, InitializationOptions, ReadResourceContents, Resource, Tool,
+    CallToolResult, InitializationOptions, ReadResourceContents, Resource, ResourceTemplate, Tool,
 };
 
 // ---------------------------------------------------------------------------
@@ -224,9 +224,19 @@ pub type CallToolHandler = Arc<
         + Sync,
 >;
 
+/// Future returned by a [`ReadResourceHandler`] invocation.
+pub type ReadResourceFuture =
+    Pin<Box<dyn Future<Output = Result<Vec<ReadResourceContents>, FactoryError>> + Send>>;
+
 /// Type alias for the read_resource handler.
-pub type ReadResourceHandler =
-    Arc<dyn Fn(String) -> Result<Vec<ReadResourceContents>, FactoryError> + Send + Sync>;
+///
+/// Async (aiperceivable/apcore-mcp#15(a)): reading a `system.*` resource
+/// dispatches through `ExecutionRouter::handle_call`, which is itself async
+/// — the same ACL / approval / redaction path a `tools/call` takes. The
+/// `docs://` resources this handler also serves need no `await` internally,
+/// but the signature is shared, so their implementation just wraps a ready
+/// value in `Box::pin(async move { .. })`.
+pub type ReadResourceHandler = Arc<dyn Fn(String) -> ReadResourceFuture + Send + Sync>;
 
 // ---------------------------------------------------------------------------
 // RegistryOrExecutor
@@ -279,6 +289,12 @@ pub struct MCPServer {
     pub(crate) list_resources_handler: Option<Arc<dyn Fn() -> Vec<Resource> + Send + Sync>>,
     /// Handler for `read_resource` requests.
     pub(crate) read_resource_handler: Option<ReadResourceHandler>,
+    /// Handler for `resources/templates/list` requests (aiperceivable/
+    /// apcore-mcp#15(a)) — parameterized resources such as
+    /// `apcore://system.health.module/{module_id}` that a static
+    /// [`Resource`] cannot describe.
+    pub(crate) list_resource_templates_handler:
+        Option<Arc<dyn Fn() -> Vec<ResourceTemplate> + Send + Sync>>,
     /// Registry of live sessions, shared with the [`ExecutionRouter`] that
     /// backs `call_tool_handler`. Populated by
     /// [`MCPServerFactory::register_handlers`]; handed to [`ServerHandler`] so
@@ -306,6 +322,7 @@ impl MCPServer {
             call_tool_handler: None,
             list_resources_handler: None,
             read_resource_handler: None,
+            list_resource_templates_handler: None,
             session_registry: None,
             join_handle: None,
             shutdown_tx: None,
@@ -324,6 +341,7 @@ impl MCPServer {
             call_tool_handler: None,
             list_resources_handler: None,
             read_resource_handler: None,
+            list_resource_templates_handler: None,
             session_registry: None,
             join_handle: None,
             shutdown_tx: None,
@@ -394,12 +412,16 @@ impl MCPServer {
         self.list_resources_handler.as_ref().map(|h| h())
     }
 
-    /// Invoke the read_resource handler if registered.
-    pub fn read_resource(
-        &self,
-        uri: String,
-    ) -> Option<Result<Vec<ReadResourceContents>, FactoryError>> {
+    /// Invoke the read_resource handler if registered. Returns the future to
+    /// `.await` — reading a `system.*` resource dispatches through
+    /// `ExecutionRouter::handle_call` (aiperceivable/apcore-mcp#15(a)).
+    pub fn read_resource(&self, uri: String) -> Option<ReadResourceFuture> {
         self.read_resource_handler.as_ref().map(|h| h(uri))
+    }
+
+    /// Invoke the list_resource_templates handler if registered.
+    pub fn list_resource_templates(&self) -> Option<Vec<ResourceTemplate>> {
+        self.list_resource_templates_handler.as_ref().map(|h| h())
     }
 
     /// Returns true if the server task is currently running.
@@ -455,6 +477,7 @@ impl MCPServer {
                 } else {
                     None
                 },
+                extensions: None,
             },
         };
         let handler: Option<Arc<dyn crate::server::transport::McpHandler>> =
@@ -576,6 +599,7 @@ pub struct ServerHandler {
     call_tool: CallToolHandler,
     list_resources: Option<Arc<dyn Fn() -> Vec<Resource> + Send + Sync>>,
     read_resource: Option<ReadResourceHandler>,
+    list_resource_templates: Option<Arc<dyn Fn() -> Vec<ResourceTemplate> + Send + Sync>>,
     init_options: InitializationOptions,
     /// Optional cancel handler invoked on `notifications/cancelled` with
     /// the session id (or request id, serialised). Used to forward
@@ -601,6 +625,7 @@ impl ServerHandler {
             call_tool,
             list_resources: server.list_resources_handler.clone(),
             read_resource: server.read_resource_handler.clone(),
+            list_resource_templates: server.list_resource_templates_handler.clone(),
             init_options,
             cancel_handler: None,
             session_registry: server.session_registry.clone(),
@@ -701,11 +726,20 @@ impl crate::server::transport::McpHandler for ServerHandler {
         let result = match method.as_str() {
             "initialize" => {
                 self.record_client_capabilities(&message);
-                RpcResult::Success(serde_json::json!({
-                "capabilities": {
+                let mut capabilities = serde_json::json!({
                     "tools": { "listChanged": true },
                     "resources": { "listChanged": false }
-                },
+                });
+                // aiperceivable/apcore-mcp#16: broadcast the
+                // `com.aiperceivable/management` extension when this server
+                // exposes at least one management surface. A client that
+                // never declares support for it is unaffected either way —
+                // this key gates nothing.
+                if let Some(ref extensions) = self.init_options.capabilities.extensions {
+                    capabilities["extensions"] = extensions.clone();
+                }
+                RpcResult::Success(serde_json::json!({
+                "capabilities": capabilities,
                 "serverInfo": {
                     "name": self.init_options.server_name,
                     "version": self.init_options.server_version
@@ -815,7 +849,7 @@ impl crate::server::transport::McpHandler for ServerHandler {
                     }
                 };
                 if let Some(ref handler) = self.read_resource {
-                    match handler(uri) {
+                    match handler(uri).await {
                         Ok(contents) => {
                             let contents_json: Vec<Value> = contents
                                 .iter()
@@ -832,6 +866,24 @@ impl crate::server::transport::McpHandler for ServerHandler {
                     }
                 } else {
                     ServerHandler::rpc_error(-32601, "resources not supported")
+                }
+            }
+            "resources/templates/list" => {
+                if let Some(ref handler) = self.list_resource_templates {
+                    let templates = handler();
+                    let templates_json: Vec<Value> = templates
+                        .iter()
+                        .map(|t| {
+                            serde_json::json!({
+                                "uriTemplate": t.uri_template,
+                                "name": t.name,
+                                "mimeType": t.mime_type
+                            })
+                        })
+                        .collect();
+                    RpcResult::Success(serde_json::json!({ "resourceTemplates": templates_json }))
+                } else {
+                    RpcResult::Success(serde_json::json!({ "resourceTemplates": [] }))
                 }
             }
             "notifications/initialized" => RpcResult::Notification,
@@ -1264,7 +1316,7 @@ mod tests {
         server.list_resources_handler = Some(Arc::new(Vec::new));
         assert!(!server.has_resource_handlers());
 
-        server.read_resource_handler = Some(Arc::new(|_uri| Ok(vec![])));
+        server.read_resource_handler = Some(Arc::new(|_uri| Box::pin(async { Ok(vec![]) })));
         assert!(server.has_resource_handlers());
     }
 
@@ -1457,12 +1509,14 @@ mod tests {
             call_tool,
             list_resources: None,
             read_resource: None,
+            list_resource_templates: None,
             init_options: InitializationOptions {
                 server_name: "test-server".into(),
                 server_version: "1.0.0".into(),
                 capabilities: ServerCapabilities {
                     tools: Some(ToolsCapability { list_changed: true }),
                     resources: None,
+                    extensions: None,
                 },
             },
             cancel_handler: None,

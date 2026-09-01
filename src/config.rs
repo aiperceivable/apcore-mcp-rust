@@ -62,6 +62,15 @@ pub fn get_middleware_config() -> Option<serde_json::Value> {
 /// optional `default_effect`) if an "acl" key exists and is non-null in the
 /// MCP namespace configuration, `None` otherwise. Consumed by
 /// `acl_builder::build_acl_from_config` during `build()`.
+///
+/// **Enabling `sys_modules.enabled` without also configuring `mcp.acl`
+/// leaves the entire `system.*` management surface — health, usage,
+/// manifest, and `system.control.*` (reconfigure, reload, toggle) —
+/// reachable with no authorization check at all.** See the ACL rule
+/// template in `acl_builder`'s module doc comment
+/// (aiperceivable/apcore-mcp#14) for the reference `system.*` rules, and
+/// [`crate::apcore_mcp::APCoreMCP::serve`] for the startup warning this
+/// bridge logs when the control surface is registered but unprotected.
 pub fn get_acl_config() -> Option<serde_json::Value> {
     let config = Config::discover().ok()?;
     config

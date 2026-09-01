@@ -3204,6 +3204,7 @@ mod tests {
                     capabilities: ServerCapabilities {
                         tools: Some(ToolsCapability { list_changed: true }),
                         resources: None,
+                        extensions: None,
                     },
                 },
             )

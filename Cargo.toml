@@ -1,6 +1,6 @@
 [package]
 name = "apcore-mcp"
-version = "0.18.1"
+version = "0.19.0"
 edition = "2021"
 description = "MCP bridge for apcore — expose apcore modules as MCP tools"
 license = "Apache-2.0"
@@ -21,8 +21,15 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
-apcore = "0.27"
-apcore-toolkit = ">=0.10.0"
+# Bounded to the 0.28.x line (not ">=0.28.0", not the previous "0.27" left
+# uncapped-by-accident): a bare version string is cargo's caret syntax, so
+# "0.27" resolved as ">=0.27.0, <0.28.0" and could never pick up 0.28.0 no
+# matter how long `cargo update` was run. Bumping the written minor is a
+# deliberate per-release act of re-vetting against that line's breaking
+# changes, matching the same "raised to ^0.27, and bounded" policy recorded
+# in CHANGELOG.md for the previous bump.
+apcore = "0.28"
+apcore-toolkit = ">=0.10.2"
 mcp-embedded-ui = "0.5"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }

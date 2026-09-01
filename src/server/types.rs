@@ -103,6 +103,19 @@ pub struct ReadResourceContents {
     pub mime_type: String,
 }
 
+/// An MCP Resource Template definition exposed via `resources/templates/
+/// list`. Describes a parameterized resource URI using RFC 6570 syntax
+/// (e.g. `apcore://system.health.module/{module_id}`) for a resource whose
+/// read requires an argument that a static [`Resource`] cannot carry
+/// (aiperceivable/apcore-mcp#15(a), aiperceivable/apcore-mcp-rust#6).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResourceTemplate {
+    pub uri_template: String,
+    pub name: String,
+    pub mime_type: String,
+}
+
 /// Initialization options passed to the MCP server on startup.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InitializationOptions {
@@ -119,6 +132,14 @@ pub struct ServerCapabilities {
     pub tools: Option<ToolsCapability>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resources: Option<ResourcesCapability>,
+    /// Vendor extension capabilities, keyed by extension id (e.g.
+    /// `"com.aiperceivable/management"`, aiperceivable/apcore-mcp#16).
+    /// Carried as a raw JSON object rather than a strongly-typed field per
+    /// extension, since this struct has no MCP SDK to negotiate the shape
+    /// with — any extension's payload can be represented. `None` omits the
+    /// `extensions` key entirely.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extensions: Option<Value>,
 }
 
 /// Tools capability — advertises tool-related features.
@@ -221,6 +242,7 @@ mod tests {
             capabilities: ServerCapabilities {
                 tools: Some(ToolsCapability { list_changed: true }),
                 resources: None,
+                extensions: None,
             },
         };
 
@@ -257,6 +279,51 @@ mod tests {
 
         assert_eq!(serialized["content"], "# Documentation");
         assert_eq!(serialized["mimeType"], "text/plain");
+    }
+
+    #[test]
+    fn test_capabilities_extensions_omitted_when_none() {
+        let caps = ServerCapabilities {
+            tools: None,
+            resources: None,
+            extensions: None,
+        };
+        let serialized = serde_json::to_value(&caps).unwrap();
+        assert!(serialized.get("extensions").is_none());
+    }
+
+    #[test]
+    fn test_capabilities_extensions_serialized_when_present() {
+        let caps = ServerCapabilities {
+            tools: None,
+            resources: None,
+            extensions: Some(json!({
+                "com.aiperceivable/management": {
+                    "surfaces": ["health", "control"],
+                    "protocolVersion": "1.30.0"
+                }
+            })),
+        };
+        let serialized = serde_json::to_value(&caps).unwrap();
+        assert_eq!(
+            serialized["extensions"]["com.aiperceivable/management"]["surfaces"],
+            json!(["health", "control"])
+        );
+    }
+
+    #[test]
+    fn test_resource_template_serializes_to_mcp_json() {
+        let template = ResourceTemplate {
+            uri_template: "apcore://system.health.module/{module_id}".to_string(),
+            name: "system.health.module".to_string(),
+            mime_type: "application/json".to_string(),
+        };
+        let serialized = serde_json::to_value(&template).unwrap();
+        assert_eq!(
+            serialized["uriTemplate"],
+            "apcore://system.health.module/{module_id}"
+        );
+        assert_eq!(serialized["mimeType"], "application/json");
     }
 
     #[test]

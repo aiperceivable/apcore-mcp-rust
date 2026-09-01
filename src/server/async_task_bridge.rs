@@ -1484,6 +1484,9 @@ mod tests {
                 callers: vec!["*".to_string()],
                 targets: vec!["demo.destructive".to_string()],
                 effect: effect.to_string(),
+                // apcore 0.28.0 (apcore#108): `ACLRule` is not
+                // `#[non_exhaustive]`, so every literal now names this field.
+                approval: None,
                 description: Some(format!("{effect} the destructive demo")),
                 conditions: None,
             }],
