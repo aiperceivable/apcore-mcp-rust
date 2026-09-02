@@ -34,21 +34,21 @@ struct Fixture {
     resource_templates: Vec<TemplateEntry>,
 }
 
+// The fixture entries also carry `module_id` (and a `note` on one template).
+// Serde ignores JSON keys with no matching field, so only what these
+// assertions actually compare is declared here.
 #[derive(Deserialize)]
 struct ToolEntry {
-    module_id: String,
     name: String,
 }
 
 #[derive(Deserialize)]
 struct ResourceEntry {
-    module_id: String,
     uri: String,
 }
 
 #[derive(Deserialize)]
 struct TemplateEntry {
-    module_id: String,
     uri_template: String,
 }
 
@@ -68,8 +68,13 @@ fn real_registry_and_executor() -> (Arc<Registry>, Executor) {
     (registry, executor)
 }
 
+/// The `system.*` tool set must equal the fixture's exactly — not merely
+/// contain it. A subset assertion would let an adapter emit an *extra*
+/// management tool and still pass, which is the divergence direction this
+/// fixture exists to catch (aiperceivable/apcore-mcp#15 asks for a
+/// byte-identical `tools/list` across the three bridges, not "at least these").
 #[test]
-fn system_control_modules_are_tools() {
+fn system_control_modules_are_tools_and_nothing_else_is() {
     let Some(fixture) = common::load_fixture::<Fixture>("system_surface.json") else {
         return;
     };
@@ -79,15 +84,17 @@ fn system_control_modules_are_tools() {
     let tools = factory
         .build_tools(&registry, None, None)
         .expect("build_tools should not fail");
-    let tool_names: HashSet<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+    let system_tool_names: HashSet<&str> = tools
+        .iter()
+        .map(|t| t.name.as_str())
+        .filter(|name| name.starts_with("system."))
+        .collect();
+    let expected: HashSet<&str> = fixture.tools.iter().map(|t| t.name.as_str()).collect();
 
-    for expected in &fixture.tools {
-        assert!(
-            tool_names.contains(expected.name.as_str()),
-            "{} missing from tools/list (got {tool_names:?})",
-            expected.module_id
-        );
-    }
+    assert_eq!(
+        system_tool_names, expected,
+        "system.* tools/list set mismatch (extra or missing entries)"
+    );
 }
 
 #[test]
@@ -131,26 +138,36 @@ fn readonly_system_modules_are_resources_and_templates() {
     let resources = server
         .list_resources()
         .expect("list_resources handler should be registered");
-    let resource_uris: HashSet<&str> = resources.iter().map(|r| r.uri.as_str()).collect();
+    // Only the `apcore://` scheme is this fixture's contract; `docs://`
+    // resources legitimately vary with how many modules carry documentation.
+    let apcore_uris: HashSet<&str> = resources
+        .iter()
+        .map(|r| r.uri.as_str())
+        .filter(|uri| uri.starts_with("apcore://"))
+        .collect();
+    let expected_uris: HashSet<&str> = fixture.resources.iter().map(|r| r.uri.as_str()).collect();
 
-    for expected in &fixture.resources {
-        assert!(
-            resource_uris.contains(expected.uri.as_str()),
-            "{} missing from resources/list (got {resource_uris:?})",
-            expected.module_id
-        );
-    }
+    assert_eq!(
+        apcore_uris, expected_uris,
+        "apcore:// resources/list set mismatch (extra or missing entries)"
+    );
 
     let templates = server
         .list_resource_templates()
         .expect("list_resource_templates handler should be registered");
-    let template_uris: HashSet<&str> = templates.iter().map(|t| t.uri_template.as_str()).collect();
+    let template_uris: HashSet<&str> = templates
+        .iter()
+        .map(|t| t.uri_template.as_str())
+        .filter(|uri| uri.starts_with("apcore://"))
+        .collect();
+    let expected_templates: HashSet<&str> = fixture
+        .resource_templates
+        .iter()
+        .map(|t| t.uri_template.as_str())
+        .collect();
 
-    for expected in &fixture.resource_templates {
-        assert!(
-            template_uris.contains(expected.uri_template.as_str()),
-            "{} missing from resources/templates/list (got {template_uris:?})",
-            expected.module_id
-        );
-    }
+    assert_eq!(
+        template_uris, expected_templates,
+        "apcore:// resources/templates/list set mismatch (extra or missing entries)"
+    );
 }

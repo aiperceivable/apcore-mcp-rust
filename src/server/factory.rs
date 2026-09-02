@@ -111,28 +111,33 @@ fn format_intent_label(key: &str) -> String {
         .join(" ")
 }
 
-/// The three read-only `system.*` module family prefixes that are exposed as
-/// MCP resources instead of tools (aiperceivable/apcore-mcp#15,
-/// aiperceivable/apcore-mcp-rust#6). `system.control.*` is deliberately not
-/// among them — those modules mutate state and stay tools.
-const READONLY_SYSTEM_RESOURCE_PREFIXES: &[&str] =
-    &["system.health.", "system.usage.", "system.manifest."];
-
-/// Whether `module_id` belongs to one of apcore's read-only `system.*`
-/// module families (`system.health.*`, `system.usage.*`,
-/// `system.manifest.*`).
+/// Whether `module_id` is projected as an MCP resource rather than a tool.
 ///
 /// These modules answer a GET-shaped question with no side effects — the
 /// MCP `resources/*` primitive, not `tools/*`, is the correct fit
 /// (aiperceivable/apcore-mcp#15(a)). [`MCPServerFactory::build_tools`] uses
 /// this to exclude them from the tool list; [`MCPServerFactory::
-/// register_resource_handlers`] uses the same prefixes to expose them as
-/// resources / resource templates instead. `system.control.*` (the
-/// mutating management modules) is unaffected and stays a tool.
+/// register_resource_handlers`] builds resources / resource templates from
+/// the same canonical ids. `system.control.*` (the mutating management
+/// modules) is unaffected and stays a tool.
+///
+/// Matches the six canonical ids exactly rather than the three family
+/// prefixes (`system.health.`, `system.usage.`, `system.manifest.`) that
+/// PROTOCOL_SPEC §6.6.2 classifies by. The two agree for every registry
+/// `register_sys_modules` produces, and differ only for a read-only
+/// `system.*` id this adapter has no resource for — a seventh module added
+/// by a future apcore, or one a host registered through `register_internal`
+/// itself. A prefix match would drop such a module from `tools/list` while
+/// `register_resource_handlers` gave it no resource either, so it would
+/// vanish from both discovery surfaces at once. Keeping it a tool is the
+/// safer failure: visible and callable, merely classified as a tool until
+/// this adapter learns its resource shape. Discovery is all that is at stake
+/// — `tools/call` dispatches by id and never consulted this list.
 pub fn is_readonly_system_resource_module_id(module_id: &str) -> bool {
-    READONLY_SYSTEM_RESOURCE_PREFIXES
+    SYSTEM_RESOURCE_MODULES
         .iter()
-        .any(|prefix| module_id.starts_with(prefix))
+        .chain(SYSTEM_RESOURCE_TEMPLATE_MODULES.iter())
+        .any(|(canonical_id, ..)| *canonical_id == module_id)
 }
 
 /// The `com.aiperceivable/management` MCP initialization extension id
@@ -2580,6 +2585,29 @@ mod tests {
             assert!(
                 !is_readonly_system_resource_module_id(id),
                 "{id} must NOT be classified as a read-only system resource"
+            );
+        }
+    }
+
+    /// An unrecognised read-only `system.*` id stays a tool rather than
+    /// vanishing from both discovery surfaces.
+    ///
+    /// `register_resource_handlers` builds resources from the six canonical
+    /// ids, so classifying by bare prefix would drop such a module from
+    /// `tools/list` while giving it no resource either. A seventh module added
+    /// by a future apcore, or one a host registered through `register_internal`,
+    /// must stay visible as a tool until this adapter learns its resource shape.
+    #[test]
+    fn unrecognised_readonly_system_id_stays_a_tool() {
+        for id in [
+            "system.health.history",
+            "system.usage.trend",
+            "system.manifest.diff",
+        ] {
+            assert!(
+                !is_readonly_system_resource_module_id(id),
+                "{id} has no resource projection, so it must remain a tool rather \
+                 than disappear from tools/list and resources/list at once"
             );
         }
     }

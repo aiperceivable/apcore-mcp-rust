@@ -4468,4 +4468,94 @@ mod tests {
              put to a human — gating it would be the over-refusal §6.1.7 exists to prevent"
         );
     }
+
+    // ── ACL enforcement on apcore:// management resource reads ──────────────
+    //
+    // aiperceivable/apcore-mcp#15 claims every `apcore://system.*` read
+    // dispatches through `ExecutionRouter::handle_call` — never directly
+    // against the registry — so ACL and audit apply identically to
+    // `tools/call` and `resources/read`. The resource tests in
+    // `server/factory.rs` all drive a stub router, so they prove the read is
+    // *routed*; none proves the ACL actually *refuses*. A bypass here would be
+    // a management-surface disclosure, so it is asserted directly.
+
+    /// Register the management resources over a real executor whose ACL
+    /// carries a single `system.*` rule with `effect`.
+    fn system_resource_server(effect: &str) -> crate::server::server::MCPServer {
+        let registry = Arc::new(apcore::registry::registry::Registry::default());
+        let mut config = Config::default();
+        config.set("sys_modules.enabled", json!(true));
+        config.set("sys_modules.events.enabled", json!(true));
+        let mut executor = Executor::new(Arc::clone(&registry), Arc::new(Config::default()));
+
+        apcore::sys_modules::register_sys_modules(Arc::clone(&registry), &executor, &config, None)
+            .expect("register_sys_modules should succeed");
+
+        executor.set_acl(
+            apcore::ACL::try_new(
+                vec![apcore::ACLRule {
+                    callers: vec!["*".to_string()],
+                    targets: vec!["system.*".to_string()],
+                    effect: effect.to_string(),
+                    approval: None,
+                    description: None,
+                    conditions: None,
+                }],
+                "deny",
+                None,
+            )
+            .expect("ACL should build"),
+        );
+
+        let adapter = ApcoreExecutorAdapter {
+            inner: Arc::new(executor),
+            strategy: None,
+        };
+        let router = Arc::new(crate::server::router::ExecutionRouter::new(
+            Box::new(adapter),
+            false,
+            None,
+        ));
+
+        let factory = MCPServerFactory::new();
+        let mut server = factory
+            .create_server("acl-resource-read-test", "1.0.0")
+            .expect("create_server");
+        factory.register_resource_handlers(&mut server, &registry, router);
+        server
+    }
+
+    /// Control: an ACL that permits `system.*` lets the read through.
+    ///
+    /// Without this, the denial test below would pass just as happily against
+    /// an adapter that never served the resource at all.
+    #[tokio::test]
+    async fn test_acl_allows_management_resource_read() {
+        let server = system_resource_server("allow");
+        let result = server
+            .read_resource("apcore://system.health.summary".to_string())
+            .expect("read_resource handler registered")
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "an allowed caller must reach the management resource: {:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_acl_denial_blocks_management_resource_read() {
+        let server = system_resource_server("deny");
+        let result = server
+            .read_resource("apcore://system.health.summary".to_string())
+            .expect("read_resource handler registered")
+            .await;
+
+        assert!(
+            result.is_err(),
+            "an ACL that denies system.* MUST refuse the resource read — reading a \
+             management resource must not bypass the gate a tools/call passes"
+        );
+    }
 }
