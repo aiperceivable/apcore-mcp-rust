@@ -581,6 +581,21 @@ The namespace, prefix, and defaults are also available as importable constants:
 use apcore_mcp::{MCP_NAMESPACE, MCP_ENV_PREFIX, mcp_defaults, register_mcp_namespace};
 ```
 
+> **Security note — `system.*` management modules.** Enabling apcore's
+> `sys_modules.enabled` registers `system.health.*` / `system.usage.*` /
+> `system.manifest.*` (served here as MCP resources) and, with
+> `sys_modules.events.enabled`, `system.control.*` (served as tools) into the
+> registry this server exposes — but enabling it does **not** by itself protect
+> them. With no `mcp.acl` section configured, `ACL::discover()` finds no `acl/`
+> directory and returns nothing, which is indistinguishable from "no ACL was
+> ever configured": every caller can read health/usage/manifest and, more
+> importantly, invoke `system.control.*` (reload modules, change runtime config,
+> toggle features). Always pair `sys_modules.enabled: true` with an `mcp.acl`
+> section — see the copy-pasteable rule template in `acl_builder`'s module
+> documentation (aiperceivable/apcore-mcp#14, #15). `serve()` / `async_serve()`
+> log a loud startup warning via `Executor::governance_state()` when this gap is
+> detected, but the warning is advisory and does not block startup.
+
 ## How It Works
 
 ### Mapping: apcore to MCP
