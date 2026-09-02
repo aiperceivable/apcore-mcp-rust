@@ -28,7 +28,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 # deliberate per-release act of re-vetting against that line's breaking
 # changes, matching the same "raised to ^0.27, and bounded" policy recorded
 # in CHANGELOG.md for the previous bump.
-apcore = "0.28"
+apcore = ">=0.28"
 apcore-toolkit = ">=0.10.2"
 mcp-embedded-ui = "0.5"
 tokio = { version = "1", features = ["full"] }
