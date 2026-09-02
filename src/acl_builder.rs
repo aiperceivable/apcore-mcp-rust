@@ -67,12 +67,20 @@ const ALLOWED_RULE_KEYS: &[&str] = &[
     "description",
     "conditions",
 ];
-/// The only accepted string value for the `approval` rule key. Anything
-/// else (including the technically-valid `"not_required"` — the same
-/// meaning as omitting the key) is rejected: `mcp.acl` should have exactly
-/// one spelling for "no approval requirement here", which is not writing
-/// the key at all.
-const APPROVAL_REQUIRED: &str = "required";
+/// The accepted string values for the `approval` rule key — the same closed
+/// set `apcore::ApprovalRequirement` deserializes (PROTOCOL_SPEC §6.1.6),
+/// where `not_required` is both a spec-sanctioned value and the default.
+///
+/// This bridge deliberately does **not** narrow the set. An earlier version
+/// accepted only `"required"`, on the reasoning that `mcp.acl` should have
+/// exactly one spelling for "no approval requirement here". That made the
+/// bridge stricter than the schema it bridges: a rule that loads fine from
+/// apcore's own `acl/` directory failed at startup when the identical rule
+/// was carried through the Config Bus instead. Rejecting `not_required`
+/// prevents no misconfiguration — `ACLRule::approval_required()` treats
+/// `Some(NotRequired)` and `None` identically — while breaking a valid
+/// configuration, so the redundant spelling is accepted and passed through.
+const ALLOWED_APPROVALS: &[&str] = &["required", "not_required"];
 
 /// Construct an `apcore::ACL` from a Config Bus `mcp.acl` value.
 ///
@@ -193,18 +201,19 @@ pub fn build_acl_from_config(acl_config: Option<&Value>) -> Result<Option<ACL>, 
         }
 
         // apcore 0.28.0 argument-scoped approval (spec §6.1.6, apcore#108):
-        // an `allow` rule can additionally require a human decision. The only
-        // accepted spelling is the string "required"; the field is otherwise
-        // absent — there is no separate "not_required" the operator should
-        // ever need to write. `deny` + `approval: required` has no meaning
-        // and is rejected below at `ACL::try_new`, which is also where the
-        // rule index and offending value get named in the error.
+        // an `allow` rule can additionally require a human decision. Both
+        // spellings apcore itself accepts are accepted here — see
+        // `ALLOWED_APPROVALS` for why this bridge must not narrow the set.
+        // `deny` + `approval: required` has no meaning and is rejected below
+        // at `ACL::try_new`, which is also where the rule index and offending
+        // value get named in the error.
         let approval = match entry_obj.get("approval") {
             None | Some(Value::Null) => None,
-            Some(Value::String(s)) if s == APPROVAL_REQUIRED => Some(ApprovalRequirement::Required),
+            Some(Value::String(s)) if s == "required" => Some(ApprovalRequirement::Required),
+            Some(Value::String(s)) if s == "not_required" => Some(ApprovalRequirement::NotRequired),
             Some(other) => {
                 return Err(APCoreMCPError::Config(format!(
-                    "mcp.acl.rules[{idx}] 'approval' must be the string \"required\" \
+                    "mcp.acl.rules[{idx}] 'approval' must be one of {ALLOWED_APPROVALS:?} \
                      (or omitted), got {other}"
                 )));
             }
@@ -430,17 +439,19 @@ mod tests {
         });
         let err = build_acl_from_config(Some(&cfg)).unwrap_err();
         assert!(
-            format!("{err}").contains("'approval' must be the string"),
+            format!("{err}").contains("'approval' must be one of"),
             "got: {err}"
         );
     }
 
     #[test]
-    fn approval_not_required_spelling_is_rejected() {
-        // Only "required" is accepted; the explicit "not_required" spelling
-        // (apcore's own serde form for the absent key) is refused so there is
-        // exactly one way to write "no approval requirement here": omit the
-        // key.
+    fn approval_not_required_spelling_is_accepted() {
+        // `not_required` is spec-sanctioned (PROTOCOL_SPEC §6.1.6) and is
+        // apcore's own `ApprovalRequirement::default()`, so a rule carrying it
+        // loads fine from apcore's `acl/` directory. This bridge previously
+        // rejected it as a redundant spelling, which meant the identical rule
+        // failed at startup when carried through the Config Bus instead — a
+        // bridge must not narrow the schema it bridges.
         let cfg = json!({
             "rules": [
                 {
@@ -451,11 +462,13 @@ mod tests {
                 }
             ]
         });
-        let err = build_acl_from_config(Some(&cfg)).unwrap_err();
-        assert!(
-            format!("{err}").contains("'approval' must be the string"),
-            "got: {err}"
+        let acl = build_acl_from_config(Some(&cfg)).unwrap().unwrap();
+        assert_eq!(
+            acl.rules()[0].approval,
+            Some(apcore::ApprovalRequirement::NotRequired)
         );
+        // ...and it composes to the same verdict as omitting the key.
+        assert!(!acl.rules()[0].approval_required());
     }
 
     #[test]

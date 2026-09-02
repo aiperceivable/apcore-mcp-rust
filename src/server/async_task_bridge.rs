@@ -835,11 +835,22 @@ impl AsyncTaskBridge {
         Ok(json!({
             "valid": preflight.valid,
             // Reported verbatim, as apcore-python's and apcore-typescript's
-            // bridges both do. It is a property of the module's annotations
-            // rather than of the caller's authorization, and apcore resolves it
-            // *before* the §12.8.5.1 gate — so masking it on a denial made this
-            // the one SDK of three answering `false` where the others answer
-            // `true`, for a bit that discloses nothing about the call.
+            // bridges both do.
+            //
+            // Since apcore 0.28.0 (spec §6.9 row 3) this bit is no longer a
+            // property of the module's annotations alone: it is the *union* of
+            // the annotation, any `ExecutionPolicy` override, and the ACL's
+            // verdict for this caller with these arguments (§6.1.6). What makes
+            // returning it verbatim safe on a denial is narrower than the
+            // earlier "it is unrelated to authorization" reasoning, which no
+            // longer holds: the ACL component is constant `false` on the deny
+            // path. `deny` + `approval: required` is rejected at load
+            // (§6.1.6 rule 2) and a denial clears any pending requirement
+            // (§6.1.4 rule 5), so `AccessDecision::approval_required` is always
+            // `false` when `access == "deny"`. A denied caller therefore reads
+            // only the policy/annotation half and learns nothing about the ACL
+            // policy. Masking it anyway would make this the one SDK of three
+            // answering `false` where the others answer `true`.
             "requires_approval": preflight.requires_approval,
             "predicted_changes": predicted,
             "checks": checks,

@@ -4282,4 +4282,190 @@ mod tests {
             rendered(&content)
         );
     }
+
+    // ── ACL-sourced approval gating, end to end ─────────────────────────────
+    //
+    // Every other `approval` test in this crate stops at the Config Bus parsing
+    // layer — they prove the key is *accepted*, not that it *does* anything.
+    // These drive a real `ACL` + real approval handler + real module through
+    // `ExecutionRouter::handle_call`, the exact path a `tools/call` takes, and
+    // pin the claim this crate's 0.19.0 CHANGELOG makes: "gating the call on a
+    // human decision even though the ACL itself allows it".
+    //
+    // The module's own `requires_approval` annotation is FALSE, so the ACL rule
+    // is the only possible source of a requirement; the rule is argument-scoped
+    // (`conditions.arguments.has_key`), so the same module is gated or not
+    // depending on what the call carries.
+    //
+    // Cross-language counterparts: `tests/test_acl_approval_gating_e2e.py`
+    // (Python) and `tests/acl-approval-gating-e2e.test.ts` (TypeScript).
+
+    /// Approves everything, but records what it was asked about.
+    #[derive(Debug)]
+    struct RecordingApprovalHandler {
+        seen: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl apcore::approval::ApprovalHandler for RecordingApprovalHandler {
+        async fn request_approval(
+            &self,
+            request: &apcore::approval::ApprovalRequest,
+        ) -> Result<apcore::approval::ApprovalResult, apcore::errors::ModuleError> {
+            self.seen
+                .lock()
+                .expect("approval sink")
+                .push(request.module_id.clone());
+            Ok(apcore::approval::ApprovalResult::approved("test"))
+        }
+
+        async fn check_approval(
+            &self,
+            approval_id: &str,
+        ) -> Result<apcore::approval::ApprovalResult, apcore::errors::ModuleError> {
+            let mut result = apcore::approval::ApprovalResult::approved("test");
+            result.approval_id = Some(approval_id.to_string());
+            Ok(result)
+        }
+    }
+
+    /// A module that asks for no approval on its own account.
+    #[derive(Debug)]
+    struct UngatedDeleteModule;
+
+    #[async_trait::async_trait]
+    impl Module for UngatedDeleteModule {
+        fn input_schema(&self) -> Value {
+            json!({"type": "object", "properties": {"path": {"type": "string"}}})
+        }
+        fn output_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+        fn description(&self) -> &str {
+            "deletes a path"
+        }
+        async fn execute(
+            &self,
+            _inputs: Value,
+            _ctx: &apcore::Context<Value>,
+        ) -> Result<Value, apcore::errors::ModuleError> {
+            Ok(json!({"deleted": true}))
+        }
+    }
+
+    /// A real executor whose only approval source is an argument-scoped ACL rule.
+    fn acl_gated_router(
+        seen: Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> crate::server::router::ExecutionRouter {
+        let registry = Arc::new(apcore::registry::registry::Registry::default());
+        let descriptor = ModuleDescriptor {
+            module_id: "files.delete".to_string(),
+            name: None,
+            description: "deletes a path".to_string(),
+            documentation: None,
+            input_schema: json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+            output_schema: json!({"type": "object"}),
+            version: "1.0.0".to_string(),
+            tags: vec![],
+            // Deliberately false: any requirement observed below can only have
+            // come from the ACL rule, which is the whole point.
+            annotations: Some(ModuleAnnotations {
+                requires_approval: false,
+                ..Default::default()
+            }),
+            examples: vec![],
+            metadata: std::collections::HashMap::new(),
+            display: None,
+            sunset_date: None,
+            dependencies: vec![],
+            enabled: true,
+        };
+        registry
+            .register("files.delete", Box::new(UngatedDeleteModule), descriptor)
+            .expect("register module");
+
+        let acl = apcore::ACL::try_new(
+            vec![
+                // Narrow rule first (first-match-wins, §6.3): a recursive
+                // delete is allowed but must be put to a human.
+                apcore::ACLRule {
+                    callers: vec!["*".to_string()],
+                    targets: vec!["files.delete".to_string()],
+                    effect: "allow".to_string(),
+                    approval: Some(apcore::ApprovalRequirement::Required),
+                    description: None,
+                    conditions: Some(json!({"arguments": {"has_key": ["recursive"]}})),
+                },
+                // Broad rule: everything else this caller does is allowed.
+                apcore::ACLRule {
+                    callers: vec!["*".to_string()],
+                    targets: vec!["*".to_string()],
+                    effect: "allow".to_string(),
+                    approval: None,
+                    description: None,
+                    conditions: None,
+                },
+            ],
+            "deny",
+            None,
+        )
+        .expect("ACL should build");
+
+        let mut executor = Executor::new(registry, Arc::new(Config::default()));
+        executor.set_acl(acl);
+        executor.set_approval_handler(Box::new(RecordingApprovalHandler { seen }));
+
+        let adapter = ApcoreExecutorAdapter {
+            inner: Arc::new(executor),
+            strategy: None,
+        };
+        crate::server::router::ExecutionRouter::new(Box::new(adapter), false, None)
+    }
+
+    #[tokio::test]
+    async fn test_acl_approval_rule_gates_a_matching_tools_call() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = acl_gated_router(Arc::clone(&seen));
+
+        let (content, is_error, _) = router
+            .handle_call(
+                "files.delete",
+                &json!({"path": "/tmp/x", "recursive": true}),
+                None,
+            )
+            .await;
+
+        assert!(
+            !is_error,
+            "approved call should succeed: {}",
+            rendered(&content)
+        );
+        assert_eq!(
+            seen.lock().expect("approval sink").as_slice(),
+            ["files.delete"],
+            "a call carrying `recursive` matches the rule's conditions.arguments.has_key \
+             and MUST reach the approval handler"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_acl_approval_rule_does_not_gate_a_non_matching_tools_call() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = acl_gated_router(Arc::clone(&seen));
+
+        let (content, is_error, _) = router
+            .handle_call("files.delete", &json!({"path": "/tmp/x"}), None)
+            .await;
+
+        assert!(
+            !is_error,
+            "ungated call should succeed: {}",
+            rendered(&content)
+        );
+        assert!(
+            seen.lock().expect("approval sink").is_empty(),
+            "a call without `recursive` does not match the approval rule and MUST NOT be \
+             put to a human — gating it would be the over-refusal §6.1.7 exists to prevent"
+        );
+    }
 }
