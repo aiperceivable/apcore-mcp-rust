@@ -72,7 +72,10 @@ fn to_options(raw: &HashMap<String, Value>) -> OpenAPIBackendOptions {
         .get("additional_backend_source")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    o.base_url = raw.get("base_url").and_then(Value::as_str).map(String::from);
+    o.base_url = raw
+        .get("base_url")
+        .and_then(Value::as_str)
+        .map(String::from);
     o.prefix = raw.get("prefix").and_then(Value::as_str).map(String::from);
     o.include = raw.get("include").and_then(Value::as_str).map(String::from);
     o.exclude = raw.get("exclude").and_then(Value::as_str).map(String::from);
@@ -117,8 +120,12 @@ async fn conformance_modules() {
         for want in &case.expected_modules {
             let definition = registry
                 .get_definition(&want.module_id)
-                .unwrap_or_else(|_| panic!("case {}: no definition for {}", case.id, want.module_id))
-                .unwrap_or_else(|| panic!("case {}: no definition for {}", case.id, want.module_id));
+                .unwrap_or_else(|_| {
+                    panic!("case {}: no definition for {}", case.id, want.module_id)
+                })
+                .unwrap_or_else(|| {
+                    panic!("case {}: no definition for {}", case.id, want.module_id)
+                });
             let annotations = definition.annotations.clone().unwrap_or_default();
 
             if let Some(hints) = &want.mcp_annotations {
@@ -163,7 +170,10 @@ fn conformance_spec_resolution() {
         if resolved.is_none() {
             // Discarded: the caller falls through to the next configuration tier.
             let next = case.spec_value_next_tier.as_deref().unwrap_or_else(|| {
-                panic!("case {}: value discarded but no next tier declared", case.id)
+                panic!(
+                    "case {}: value discarded but no next tier declared",
+                    case.id
+                )
             });
             resolved = resolve_spec_location(next, Some(&case.project_root));
         }
@@ -188,10 +198,18 @@ async fn conformance_error_cases() {
             common::register_stub(&registry, module_id);
         }
 
-        let err = match openapi_backend(&case.document, Arc::clone(&registry), to_options(&case.options)).await
+        let err = match openapi_backend(
+            &case.document,
+            Arc::clone(&registry),
+            to_options(&case.options),
+        )
+        .await
         {
             Err(e) => format!("{e}"),
-            Ok(_) => panic!("case {}: expected a rejection but the build succeeded", case.id),
+            Ok(_) => panic!(
+                "case {}: expected a rejection but the build succeeded",
+                case.id
+            ),
         };
         for fragment in &case.expected_error_substrings {
             assert!(

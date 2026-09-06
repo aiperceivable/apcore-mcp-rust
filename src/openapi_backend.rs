@@ -197,15 +197,22 @@ pub async fn openapi_backend_from_spec(
     registry: Arc<Registry>,
     options: OpenAPIBackendOptions,
 ) -> Result<Arc<Registry>, APCoreMCPError> {
-    let resolved = resolve_spec_location(spec, options.project_root.as_deref()).ok_or_else(|| {
-        APCoreMCPError::Config("mcp.openapi.spec is required and resolved to nothing.".to_string())
-    })?;
+    let resolved =
+        resolve_spec_location(spec, options.project_root.as_deref()).ok_or_else(|| {
+            APCoreMCPError::Config(
+                "mcp.openapi.spec is required and resolved to nothing.".to_string(),
+            )
+        })?;
 
     // `load_spec` handles both branches (URL vs local path) and both
     // JSON/YAML parsing internally — no need to duplicate that here.
     let document = apcore_toolkit::openapi_scanner::load_spec(&resolved)
         .await
-        .map_err(|e| APCoreMCPError::Config(format!("mcp.openapi: failed to load spec '{resolved}': {e}")))?;
+        .map_err(|e| {
+            APCoreMCPError::Config(format!(
+                "mcp.openapi: failed to load spec '{resolved}': {e}"
+            ))
+        })?;
 
     openapi_backend(&document, registry, options).await
 }
@@ -237,16 +244,24 @@ pub async fn build_openapi_backend_from_config(
             value_type_name(openapi_config)
         ))
     })?;
-    let spec = obj
-        .get("spec")
-        .ok_or_else(|| APCoreMCPError::Config("mcp.openapi.spec is required when mcp.openapi is configured".to_string()))?;
+    let spec = obj.get("spec").ok_or_else(|| {
+        APCoreMCPError::Config(
+            "mcp.openapi.spec is required when mcp.openapi is configured".to_string(),
+        )
+    })?;
 
     let options = OpenAPIBackendOptions {
-        base_url: obj.get("base_url").and_then(Value::as_str).map(String::from),
+        base_url: obj
+            .get("base_url")
+            .and_then(Value::as_str)
+            .map(String::from),
         prefix: obj.get("prefix").and_then(Value::as_str).map(String::from),
         include: obj.get("include").and_then(Value::as_str).map(String::from),
         exclude: obj.get("exclude").and_then(Value::as_str).map(String::from),
-        include_deprecated: obj.get("include_deprecated").and_then(Value::as_bool).unwrap_or(true),
+        include_deprecated: obj
+            .get("include_deprecated")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
         auth_header_factory: None,
         timeout_secs: obj.get("timeout").and_then(Value::as_f64).unwrap_or(30.0),
         has_other_backend_source,
@@ -310,26 +325,27 @@ pub async fn openapi_backend(
     scan_options.exclude = options.exclude.clone();
     scan_options.base_path_prefix = options.prefix.clone();
     scan_options.include_deprecated = options.include_deprecated;
-    scan_options.transform_module = Some(Box::new(move |module: ScannedModule| {
-        match project_module_id(&module.module_id) {
-            Some(projected) => Some(ScannedModule {
-                module_id: projected,
-                ..module
-            }),
-            None => {
-                let lowered = module.module_id.to_ascii_lowercase().replace('-', "_");
-                let bad = lowered
-                    .split('.')
-                    .find(|s| !is_legal_segment(s))
-                    .unwrap_or(&module.module_id)
-                    .to_string();
-                if let Ok(mut guard) = skipped_hook.lock() {
-                    guard.push((module.module_id.clone(), bad));
+    scan_options.transform_module =
+        Some(Box::new(
+            move |module: ScannedModule| match project_module_id(&module.module_id) {
+                Some(projected) => Some(ScannedModule {
+                    module_id: projected,
+                    ..module
+                }),
+                None => {
+                    let lowered = module.module_id.to_ascii_lowercase().replace('-', "_");
+                    let bad = lowered
+                        .split('.')
+                        .find(|s| !is_legal_segment(s))
+                        .unwrap_or(&module.module_id)
+                        .to_string();
+                    if let Ok(mut guard) = skipped_hook.lock() {
+                        guard.push((module.module_id.clone(), bad));
+                    }
+                    None
                 }
-                None
-            }
-        }
-    }));
+            },
+        ));
 
     let modules = OpenAPIScanner::new()
         .scan(document, &scan_options)
@@ -446,7 +462,8 @@ fn warn_if_writes_have_no_approval_path(modules: &[ScannedModule]) {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_ascii_uppercase();
-            WRITE_METHODS.contains(&method.as_str()) && !m.annotations.as_ref().is_some_and(|a| a.requires_approval)
+            WRITE_METHODS.contains(&method.as_str())
+                && !m.annotations.as_ref().is_some_and(|a| a.requires_approval)
         })
         .count();
     if writes == 0 {

@@ -184,10 +184,7 @@ pub fn build_acl_from_config(acl_config: Option<&Value>) -> Result<Option<ACL>, 
 
         // §6.2.1 puts `approval` second, ahead of the pattern fields.
         if let Some(raw) = entry_obj.get("approval") {
-            let ok = raw.is_null()
-                || raw
-                    .as_str()
-                    .is_some_and(|s| ALLOWED_APPROVALS.contains(&s));
+            let ok = raw.is_null() || raw.as_str().is_some_and(|s| ALLOWED_APPROVALS.contains(&s));
             if !ok {
                 return Err(APCoreMCPError::Config(format!(
                     "mcp.acl.rules[{idx}] 'approval' must be one of {ALLOWED_APPROVALS:?} \
@@ -276,9 +273,7 @@ pub fn build_acl_from_config(acl_config: Option<&Value>) -> Result<Option<ACL>, 
         // only way to learn which rule was at fault while we still know its
         // real position.
         if let Err(e) = ACL::try_new(vec![rule.clone()], default_effect.clone(), None) {
-            return Err(APCoreMCPError::Config(format!(
-                "mcp.acl.rules[{idx}] {e}"
-            )));
+            return Err(APCoreMCPError::Config(format!("mcp.acl.rules[{idx}] {e}")));
         }
         rules.push(rule);
     }
@@ -342,7 +337,10 @@ mod tests {
 
     impl std::io::Write for CaptureWriter {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().expect("capture buffer lock").extend_from_slice(buf);
+            self.0
+                .lock()
+                .expect("capture buffer lock")
+                .extend_from_slice(buf);
             Ok(buf.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {

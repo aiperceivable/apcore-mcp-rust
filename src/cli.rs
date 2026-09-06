@@ -346,7 +346,8 @@ fn validate_args(args: &CliArgs) -> Result<(), CliError> {
             ));
         }
     }
-    if args.extensions_dir.is_some() && args.from_openapi.is_some() && args.openapi_prefix.is_none() {
+    if args.extensions_dir.is_some() && args.from_openapi.is_some() && args.openapi_prefix.is_none()
+    {
         return Err(CliError::InvalidArgs(
             "--openapi-prefix is required when --extensions-dir and --from-openapi are \
              combined, so the two module-ID spaces cannot collide"
@@ -500,9 +501,10 @@ pub async fn run() -> Result<(), CliError> {
             project_root: None,
             acknowledge_unapproved_writes: false,
         };
-        let registry = crate::openapi_backend::openapi_backend_from_spec(spec, base_registry, options)
-            .await
-            .map_err(|e| CliError::StartupFailure(format!("{e}")))?;
+        let registry =
+            crate::openapi_backend::openapi_backend_from_spec(spec, base_registry, options)
+                .await
+                .map_err(|e| CliError::StartupFailure(format!("{e}")))?;
         builder = builder.backend(registry);
     }
 

@@ -2981,7 +2981,10 @@ mod tests {
 
     impl std::io::Write for CaptureWriter {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().expect("capture buffer lock").extend_from_slice(buf);
+            self.0
+                .lock()
+                .expect("capture buffer lock")
+                .extend_from_slice(buf);
             Ok(buf.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
@@ -3036,9 +3039,18 @@ mod tests {
             output.contains("mcp.acl.rules[0]"),
             "expected a tier-2 warning naming the rule; got: {output}"
         );
-        assert!(output.contains("'targets'"), "expected the condition_path; got: {output}");
-        assert!(output.contains("'deny' rule protects nothing"), "expected the effect and reason; got: {output}");
-        assert!(!output.contains("'?'"), "the exact prior bug: a missing field defaulting to '?'; got: {output}");
+        assert!(
+            output.contains("'targets'"),
+            "expected the condition_path; got: {output}"
+        );
+        assert!(
+            output.contains("'deny' rule protects nothing"),
+            "expected the effect and reason; got: {output}"
+        );
+        assert!(
+            !output.contains("'?'"),
+            "the exact prior bug: a missing field defaulting to '?'; got: {output}"
+        );
     }
 
     #[test]
@@ -3054,7 +3066,11 @@ mod tests {
         let reg = Registry::new();
         let exec = Arc::new(Executor::new(reg, Config::default()));
         let acl = ACL::new(
-            vec![ACLRule::new(vec!["*".to_string()], vec!["*".to_string()], "allow")],
+            vec![ACLRule::new(
+                vec!["*".to_string()],
+                vec!["*".to_string()],
+                "allow",
+            )],
             "deny",
             None,
         );
@@ -3070,7 +3086,10 @@ mod tests {
 
         let output = String::from_utf8(buffer.lock().expect("capture buffer lock").clone())
             .expect("captured tracing output must be valid UTF-8");
-        assert!(!output.contains("mcp.acl.rules"), "expected no tier-2 warning; got: {output}");
+        assert!(
+            !output.contains("mcp.acl.rules"),
+            "expected no tier-2 warning; got: {output}"
+        );
     }
 
     #[test]
@@ -4585,7 +4604,11 @@ mod tests {
                     // `ACLRule` is #[non_exhaustive] as of apcore 0.29.0 — a struct
                     // literal no longer compiles from outside that crate.
                     #[allow(unused_mut)]
-                    let mut rule = apcore::ACLRule::new(vec!["*".to_string()], vec!["*".to_string()], "allow".to_string());
+                    let mut rule = apcore::ACLRule::new(
+                        vec!["*".to_string()],
+                        vec!["*".to_string()],
+                        "allow".to_string(),
+                    );
                     rule
                 },
             ],
@@ -4676,15 +4699,17 @@ mod tests {
 
         executor.set_acl(
             apcore::ACL::try_new(
-                vec![
-                {
+                vec![{
                     // `ACLRule` is #[non_exhaustive] as of apcore 0.29.0 — a struct
                     // literal no longer compiles from outside that crate.
                     #[allow(unused_mut)]
-                    let mut rule = apcore::ACLRule::new(vec!["*".to_string()], vec!["system.*".to_string()], effect.to_string());
+                    let mut rule = apcore::ACLRule::new(
+                        vec!["*".to_string()],
+                        vec!["system.*".to_string()],
+                        effect.to_string(),
+                    );
                     rule
-                }
-                ],
+                }],
                 "deny",
                 None,
             )

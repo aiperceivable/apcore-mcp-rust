@@ -69,9 +69,10 @@ async fn openapi_backend_from_spec_builds_from_a_local_file() {
 
 #[tokio::test]
 async fn openapi_backend_from_spec_empty_value_errors() {
-    let err = openapi_backend_from_spec("", Arc::new(Registry::new()), OpenAPIBackendOptions::new())
-        .await
-        .unwrap_err();
+    let err =
+        openapi_backend_from_spec("", Arc::new(Registry::new()), OpenAPIBackendOptions::new())
+            .await
+            .unwrap_err();
     assert!(format!("{err}").contains("resolved to nothing"));
 }
 
@@ -86,22 +87,33 @@ async fn build_openapi_backend_from_config_translates_the_config_bus_mapping() {
         .expect("build_openapi_backend_from_config should succeed");
 
     let ids = registry.list(None, None, Some(&["public", "hidden"]));
-    assert!(ids.contains(&"petstore.listpets".to_string()), "got: {ids:?}");
+    assert!(
+        ids.contains(&"petstore.listpets".to_string()),
+        "got: {ids:?}"
+    );
 }
 
 #[tokio::test]
 async fn build_openapi_backend_from_config_missing_spec_key_errors() {
-    let err = build_openapi_backend_from_config(&json!({"prefix": "x"}), Arc::new(Registry::new()), false)
-        .await
-        .unwrap_err();
+    let err = build_openapi_backend_from_config(
+        &json!({"prefix": "x"}),
+        Arc::new(Registry::new()),
+        false,
+    )
+    .await
+    .unwrap_err();
     assert!(format!("{err}").contains("mcp.openapi.spec is required"));
 }
 
 #[tokio::test]
 async fn build_openapi_backend_from_config_non_mapping_errors() {
-    let err = build_openapi_backend_from_config(&json!("not-a-mapping"), Arc::new(Registry::new()), false)
-        .await
-        .unwrap_err();
+    let err = build_openapi_backend_from_config(
+        &json!("not-a-mapping"),
+        Arc::new(Registry::new()),
+        false,
+    )
+    .await
+    .unwrap_err();
     assert!(format!("{err}").contains("must be a mapping"));
 }
 

@@ -12,7 +12,6 @@
 #![allow(clippy::upper_case_acronyms)]
 
 pub mod acl_builder;
-pub mod openapi_backend;
 pub mod adapters;
 pub mod apcore_mcp;
 pub mod approval_store;
@@ -29,6 +28,7 @@ pub mod helpers;
 /// signal per token than a one-line summary. apcore-toolkit 0.6+.
 pub mod markdown;
 pub mod middleware_builder;
+pub mod openapi_backend;
 pub mod server;
 /// Crate version, kept in sync with Cargo.toml.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
