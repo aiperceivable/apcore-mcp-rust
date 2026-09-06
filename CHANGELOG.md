@@ -5,6 +5,191 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.20.1] - 2026-09-06
+
+Bugfix release from a `/apcore-skills:sync` pass across all three bridges. 0.20.0's tests all passed
+and `openapi_backend`/`acl_builder`'s own logic worked exactly as documented — but neither module was
+ever *called* from this crate's CLI or builder, and the ACL tier-2 diagnostic (FR-ACL-004) had never
+been attempted here at all. This release closes those gaps. 1026 lib + 75 integration tests pass
+across 17 integration binaries, 1101 total (was 1017 lib + 47 integration) — the integration count
+grew because this release's own new coverage (`tests/openapi_backend_wiring.rs`, 6 tests; plus the
+CLI/ACL/config test additions listed below) landed as integration tests, not because anything
+regressed.
+
+### Fixed
+
+- **`openapi_backend` was never invoked from any entry point in this crate — not the CLI, not
+  `APCoreMCPBuilder::build()`, nowhere.** `src/cli.rs` had zero `openapi`-related flags at all
+  before this release (confirmed by grep). The module's own `openapi_backend(document: &Value, ...)`
+  additionally only ever accepted an already-parsed document, unlike Python's and TypeScript's
+  single polymorphic `spec` parameter — so even a caller holding a spec URL string had no function
+  to call. Added:
+  - `openapi_backend_from_spec(spec: &str, ...)` — resolves the location and fetches/parses via
+    `apcore_toolkit::load_spec` (which already handles both the URL and local-path branches
+    internally, plus JSON/YAML parsing), then delegates to `openapi_backend`.
+  - `build_openapi_backend_from_config(openapi_config: &Value, ...)` — translates a raw `mcp.openapi`
+    Config Bus mapping into `OpenAPIBackendOptions`, mirroring `acl_builder::build_acl_from_config`.
+  - `CliArgs::extensions_dir` changed from `PathBuf` (required) to `Option<PathBuf>`; seven new
+    flags (`--from-openapi`, `--openapi-base-url`, `--openapi-prefix`, `--openapi-include`,
+    `--openapi-exclude`, `--openapi-header` (repeatable `Vec<String>`), `--openapi-no-deprecated`);
+    `validate_args` now enforces the backend-source rule (at least one of `--extensions-dir` /
+    `--from-openapi` / `mcp.openapi` on the Config Bus; combining the first two requires
+    `--openapi-prefix`; malformed `--openapi-header` rejected).
+
+- **`mcp.openapi.spec` set on the Config Bus alone now starts a server (PRD F-054 Acceptance
+  Criterion 1) — via a new async builder method, because the synchronous one structurally cannot.**
+  `mcp_defaults()` published an `openapi` key that nothing ever read back. Unlike `mcp.acl` /
+  `mcp.middleware` (pure, synchronous, in-memory parsing), resolving `mcp.openapi.spec` means
+  fetching and parsing a document, and `apcore-toolkit-rust`'s `load_spec` is built on async
+  `reqwest` with no synchronous fallback — unlike Python, where `httpx.get` blocks synchronously by
+  design and a plain `__init__` can resolve this inline. `APCoreMCPBuilder::build()` stays
+  synchronous and unchanged; new `APCoreMCPBuilder::build_async()` resolves `mcp.openapi.spec` from
+  the Config Bus when no backend was explicitly given, then delegates to `build()`. The CLI now
+  calls `build_async()` unconditionally. A caller constructing `APCoreMCP` directly and relying
+  purely on `apcore.yaml`'s `mcp.openapi.spec` (no CLI, no explicit backend) must call
+  `build_async()` — calling the plain `build()` in that situation still returns
+  `APCoreMCPError::BackendResolution`, exactly as it always has.
+
+- **FR-ACL-004 (the §6.2.1 tier-2 "rules that protect nothing" startup diagnostic) had never been
+  implemented in this crate at all.** Zero hits for `validate_rules`/`never_matches`/
+  `protect_nothing` anywhere in `src/`, `tests/`, or this CHANGELOG before this release — not dead
+  code (TypeScript's state before its own fix), simply never attempted, and never disclosed as
+  missing despite the rest of the §6.2.1 work being covered in detail in 0.20.0's entry above.
+  `apcore::ACL::validate_rules()` was available and unused. New
+  `APCoreMCP::warn_acl_rules_that_protect_nothing`, called from `build_server_components` next to
+  the existing `warn_if_control_surface_unprotected`, reading `Executor::acl`'s real
+  `RuleValidationFinding` shape (`rule_index`/`condition_path`/`condition_key`/`effect` — there is
+  no free-text reason field; the message is constructed here, matching Python and TypeScript's
+  wording exactly after their own field-name fixes below).
+
+- **`mcp_defaults()` never got an `openapi` key**, and the crate's own
+  `test_mcp_defaults_key_set_matches_peer_sdks` parity test had a stale hardcoded expected list that
+  didn't include it either — so the test was asserting parity with Python and TypeScript against an
+  expectation that predated even Python's `openapi` key, and stayed green throughout. Both fixed;
+  TypeScript's `MCP_DEFAULTS` also gained the same key in the same pass (see that repo's CHANGELOG).
+
+- **`mcp.openapi.acknowledge_unapproved_writes` was documented as the suppression for the "nothing
+  will ask for approval" warning (FR-OPENAPI-005) in the warning's own message text, but nothing
+  ever read it.** New `OpenAPIBackendOptions::acknowledge_unapproved_writes: bool` field, gating the
+  `warn_if_writes_have_no_approval_path` call; `build_openapi_backend_from_config` reads it from the
+  Config Bus mapping.
+
+### Tests
+
+- `tests/openapi_backend_wiring.rs` (6 cases, new file) — `openapi_backend_from_spec` and
+  `build_openapi_backend_from_config` against real local (no network) OpenAPI documents, plus
+  `build_async`'s no-backend-no-Config-Bus error path.
+- `src/apcore_mcp.rs` — 2 new cases for the tier-2 diagnostic, using a `tracing_subscriber`
+  `MakeWriter` capture buffer (no existing infrastructure in this crate asserted on `tracing::warn!`
+  output before this — `warn_if_control_surface_unprotected`'s own content was likewise never
+  directly asserted). Confirms the real field names and that `'?'` — the exact prior-bug string —
+  never appears.
+- `src/acl_builder.rs` — 2 new cases for the success log, same capture technique.
+- `src/cli.rs` — 7 new `validate_args` / `CliArgs` cases for the relaxed backend-source rule.
+- `tests/cli_integration.rs` — `missing_extensions_dir_exits_nonzero` renamed and rewritten:
+  clap no longer rejects an empty invocation (exit 2); `validate_args` does (exit 1), with the
+  backend-source message asserted on stderr.
+
+### Documentation
+
+- `docs/features/openapi-backend.md`'s `## Contract: openapi_backend` Returns section and
+  `docs/srs-apcore-mcp.md`'s FR-OPENAPI-001 both claimed registered-module `metadata` visibility as
+  universal. Measured directly: only this crate's writer (`apcore-toolkit-rust`'s
+  `HTTPProxyRegistryWriter`, which builds a full `ModuleDescriptor`) preserves it; Python's and
+  TypeScript's both drop it — an upstream (apcore-toolkit) inconsistency, now stated as Rust-only
+  in both documents.
+- `docs/srs-apcore-mcp.md`'s FR-OPENAPI-002 heading corrected from "projects unchanged onto both
+  protocol surfaces" to "is projected, then reaches both protocol surfaces unchanged".
+
+## [0.20.0] - 2026-09-06
+
+Feature release: the **OpenAPI backend** — point the bridge at an OpenAPI 3.0/3.1 document and every
+operation becomes an MCP tool, proxied over HTTP — plus the `mcp.acl` half of apcore 0.29.0's
+PROTOCOL_SPEC §6.2.1 pattern-array closure. Raises `apcore` to `">=0.30"` and `apcore-toolkit` to
+`">=0.11.1"`. 1017 lib + 47 integration tests pass.
+
+**This release absorbs a compile break.** apcore 0.29.0 made `ACLRule` `#[non_exhaustive]`, so every
+`ACLRule { .. }` struct literal in this crate stopped compiling — five of them, all but one in
+tests. See *Fixed* below.
+
+### Added
+
+- **`src/openapi_backend.rs` — a third backend source, and the first with full parity.**
+  `openapi_backend(document, registry, options)` composes apcore-toolkit's shipped pieces
+  (`OpenAPIScanner::scan` → `HTTPProxyRegistryWriter::write`) into a populated `Registry`: no
+  scanning logic, no schema conversion and no new execution path. Directory auto-discovery is
+  Python/TypeScript-only because apcore's public Rust API has no runtime directory discovery — an
+  OpenAPI document needs no discoverer, so this is the first backend source that works here without
+  the caveat qualifying every `--extensions-dir` sentence in this crate's documentation.
+
+- **A module-ID projection, without which the backend serves nothing.** apcore-toolkit's
+  `derive_module_id` sanitizes to `[A-Za-z0-9_.-]`; apcore's registry accepts only
+  `^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)*$` and enforces it at `Registry::register` **and** at
+  `Executor::call`. Of nine realistic operation shapes only two register unrepaired, and the
+  canonical Swagger Petstore (`listPets`, `createPets`, `showPetById`) is entirely in the rejected
+  set. `project_module_id` lowercases and maps `-` to `_` (`is_legal_segment` checks the per-segment
+  pattern without pulling in a regex dependency); a segment that still does not begin with a
+  lowercase letter (`/v1/2fa`) is **skipped with a `tracing::warn!`** rather than repaired, because
+  completing it means inventing a character. The projection runs after any caller-supplied
+  `transform_module` and before the scanner's `deduplicate_ids`.
+
+- **A pre-write collision preflight**, fatal and atomic, naming every colliding ID; and a mandatory
+  `prefix` when the OpenAPI backend is combined with another backend source.
+
+- **A startup warning that nothing will ask for approval before a write.** Reports the absence of an
+  approval path, never the presence of protection — an attached ACL does not suppress it, following
+  the rule apcore states on `GovernanceState::unprotected_control_surface`.
+
+- **`resolve_spec_location`** for the path-typed `mcp.openapi.spec` value: an `http(s)://` value
+  verbatim, a set-but-empty value discarded with a warning so resolution falls through, and a
+  relative path resolved against `Config::project_root` lexically (`.`/`..` normalized without
+  touching the filesystem, so the result is comparable across the three SDKs for a path that need
+  not exist). apcore 0.30.0's own §9.2.1 protections do not reach a consumer namespace:
+  `Config::path_typed_keys()` is a fixed set of apcore's own keys and never consults a namespace
+  registered through `Config::register_namespace`.
+
+### Changed
+
+- **`build_acl_from_config` validates in PROTOCOL_SPEC §6.2.1's normative order** — `effect` →
+  `approval` → `callers` → `targets`, with `default_effect` ahead of the rule loop and the
+  unknown-key check ahead of all four. This builder ran it in reverse, so a rule wrong in both
+  `effect` and `callers` was refused for `callers` here and for `effect` by apcore's own doors.
+
+- **`build_acl_from_config` validates rule by rule.** `ACL::try_new` validates the whole list and
+  apcore exports no per-rule validator, so a throwaway single-rule `try_new` is the only way to
+  learn which rule was at fault while the builder still knows its real index. Its refusal is
+  re-raised as `APCoreMCPError::Config` prefixed `mcp.acl.rules[i]`, apcore's message preserved
+  verbatim after the prefix.
+
+- **Required floors: `apcore = ">=0.30"`, `apcore-toolkit = ">=0.11.1"`.** apcore **0.29.0** is the
+  correctness floor; apcore-toolkit **0.11.0** the capability floor — and also where this crate's
+  `HTTPProxyRegistryWriter` stopped rejecting `HEAD`/`OPTIONS`/`TRACE` before any network call, a
+  defect that would have made the Rust OpenAPI path quietly broken for those three methods.
+  **0.11.1** changes no API and forces apcore **0.30.0**, independently needed for
+  `Config::project_root`.
+
+### Fixed
+
+- **`ACLRule` became `#[non_exhaustive]` in apcore 0.29.0 — five struct literals stopped
+  compiling.** All are rewritten to `ACLRule::new(callers, targets, effect)` plus field assignment,
+  the form apcore's own api-surface-conventions §9.3 names as the one that compiles downstream. Note
+  the comment two of them carried — *"`ACLRule` is not `#[non_exhaustive]`, so every literal now
+  names this field"*, added in 0.19.0 — was true until 0.29.0 and is now corrected in place.
+
+### Tests
+
+- `tests/openapi_backend_conformance.rs` drives the new shared fixture `openapi_backend.json`
+  (module cases, spec-resolution cases, error cases), with `tests/common::register_stub` seeding the
+  target registry so the collision preflight is reachable.
+- `tests/acl_conformance.rs` drives `acl_config.json` at `contract_version` 1.2 and understands the
+  1.2 additions `expected_error_substrings`, `expected_error_names_field` and `must_not_contain`.
+  The field assertion is on the **bare** name: apcore-python and apcore-js write `'callers'` while
+  apcore-rust writes `'callers[1]'`, naming the offending element, and the bare token is the only
+  spelling all three share. This driver also caught a fixture case that defeated its own
+  `default_effect` probe — `["$not", "banned.*"]` matches almost every module ID, so a `*` caller
+  fired the rule on the probe; the shared case now names a literal caller.
+
+
 ## [0.19.0] - 2026-09-01
 
 ### Fixed

@@ -12,6 +12,7 @@
 #![allow(clippy::upper_case_acronyms)]
 
 pub mod acl_builder;
+pub mod openapi_backend;
 pub mod adapters;
 pub mod apcore_mcp;
 pub mod approval_store;

@@ -115,9 +115,40 @@ pub fn init_tracing(level: &LogLevel) {
     about = "Launch an MCP server that exposes apcore modules as tools."
 )]
 pub struct CliArgs {
-    /// Path to apcore extensions directory.
+    /// Path to apcore extensions directory. Required unless --from-openapi
+    /// is given, or mcp.openapi.spec is configured on the Config Bus.
     #[arg(long)]
-    pub extensions_dir: PathBuf,
+    pub extensions_dir: Option<PathBuf>,
+
+    /// OpenAPI 3.0/3.1 spec URL or path — serve a remote API as MCP tools.
+    #[arg(long)]
+    pub from_openapi: Option<String>,
+
+    /// Base URL for proxied requests (default: the document's servers[0].url).
+    #[arg(long)]
+    pub openapi_base_url: Option<String>,
+
+    /// Prepended to every derived module ID. Required when combined with
+    /// --extensions-dir.
+    #[arg(long)]
+    pub openapi_prefix: Option<String>,
+
+    /// Scanner include filter.
+    #[arg(long)]
+    pub openapi_include: Option<String>,
+
+    /// Scanner exclude filter.
+    #[arg(long)]
+    pub openapi_exclude: Option<String>,
+
+    /// Header for the spec fetch only, repeatable (KEY:VALUE). Never sent
+    /// with proxied calls.
+    #[arg(long)]
+    pub openapi_header: Vec<String>,
+
+    /// Skip operations marked deprecated: true.
+    #[arg(long, default_value_t = false)]
+    pub openapi_no_deprecated: bool,
 
     /// Transport type.
     #[arg(long, value_enum, default_value_t = Transport::Stdio)]
@@ -296,18 +327,52 @@ fn parse_jwt_algorithm(alg: &str) -> jsonwebtoken::Algorithm {
 }
 
 /// Validate CLI arguments beyond what clap enforces.
+///
+/// Backend-source rule: at least one of `--extensions-dir` / `--from-openapi`
+/// is required, both are allowed, and combining them requires
+/// `--openapi-prefix` so the two module-ID spaces cannot collide. A third
+/// route — `mcp.openapi.spec` configured on the Config Bus alone, with
+/// neither CLI flag — also counts (PRD F-054 Acceptance Criterion 1);
+/// `APCoreMCPBuilder::build` resolves that case, so this function's own job
+/// is only to not reject it before the builder ever sees it.
 fn validate_args(args: &CliArgs) -> Result<(), CliError> {
-    if !args.extensions_dir.exists() {
-        return Err(CliError::InvalidArgs(format!(
-            "--extensions-dir '{}' does not exist",
-            args.extensions_dir.display()
-        )));
+    if args.extensions_dir.is_none() && args.from_openapi.is_none() {
+        let has_config_bus_openapi = crate::config::get_openapi_config().is_some();
+        if !has_config_bus_openapi {
+            return Err(CliError::InvalidArgs(
+                "a backend source is required — pass --extensions-dir, --from-openapi, set \
+                 mcp.openapi.spec on the Config Bus, or combine them"
+                    .to_string(),
+            ));
+        }
     }
-    if !args.extensions_dir.is_dir() {
-        return Err(CliError::InvalidArgs(format!(
-            "--extensions-dir '{}' is not a directory",
-            args.extensions_dir.display()
-        )));
+    if args.extensions_dir.is_some() && args.from_openapi.is_some() && args.openapi_prefix.is_none() {
+        return Err(CliError::InvalidArgs(
+            "--openapi-prefix is required when --extensions-dir and --from-openapi are \
+             combined, so the two module-ID spaces cannot collide"
+                .to_string(),
+        ));
+    }
+    if let Some(ref dir) = args.extensions_dir {
+        if !dir.exists() {
+            return Err(CliError::InvalidArgs(format!(
+                "--extensions-dir '{}' does not exist",
+                dir.display()
+            )));
+        }
+        if !dir.is_dir() {
+            return Err(CliError::InvalidArgs(format!(
+                "--extensions-dir '{}' is not a directory",
+                dir.display()
+            )));
+        }
+    }
+    for header in &args.openapi_header {
+        if !header.contains(':') {
+            return Err(CliError::InvalidArgs(format!(
+                "--openapi-header must be KEY:VALUE, got '{header}'"
+            )));
+        }
     }
     // CHARACTERS, not UTF-8 bytes — same counting unit as
     // `APCoreMCPBuilder::build` and `MCPServerFactory::create_server`, and as
@@ -392,9 +457,56 @@ pub async fn run() -> Result<(), CliError> {
     // Resolve server version.
     let version = args.version.unwrap_or_else(|| crate::VERSION.to_string());
 
-    // Build APCoreMCP via builder pattern.
-    let mut builder = crate::APCoreMCPBuilder::default()
-        .backend(args.extensions_dir)
+    // Resolve the backend source. The union is assembled in a fixed order —
+    // extensions directory first, then OpenAPI operations — so a collision
+    // report names the OpenAPI side, which is the one the operator can
+    // rename with a prefix. Neither flag given: leave the builder's backend
+    // unset entirely and call `build_async` below, which resolves
+    // `mcp.openapi.spec` from the Config Bus alone (PRD F-054 Acceptance
+    // Criterion 1) — never a stand-in empty Registry, which would be
+    // mistaken for a second, explicit backend source and wrongly require
+    // `--openapi-prefix`.
+    let mut builder = crate::APCoreMCPBuilder::default();
+    if let Some(ref dir) = args.extensions_dir {
+        builder = builder.backend(dir.clone());
+    }
+    if let Some(ref spec) = args.from_openapi {
+        // `BackendSource::ExtensionsDir` always builds an EMPTY registry in
+        // Rust ([L-1]: no runtime directory discovery via apcore's public
+        // API) — so when `--extensions-dir` was also given, its own
+        // `.backend(dir)` call above contributed zero real modules, and
+        // replacing it here with the OpenAPI-populated registry unions
+        // correctly rather than dropping anything. In the two-flag case this
+        // is therefore observably a union of "nothing" and "the OpenAPI
+        // operations", which is why Rust has no separate `--extensions-dir`
+        // module count to merge in, unlike Python/TypeScript.
+        let base_registry = Arc::new(apcore::registry::registry::Registry::new());
+        let mut headers = std::collections::HashMap::new();
+        for raw in &args.openapi_header {
+            let (key, value) = raw
+                .split_once(':')
+                .expect("validate_args already rejected malformed --openapi-header values");
+            headers.insert(key.trim().to_string(), value.trim().to_string());
+        }
+        let options = crate::openapi_backend::OpenAPIBackendOptions {
+            base_url: args.openapi_base_url.clone(),
+            prefix: args.openapi_prefix.clone(),
+            include: args.openapi_include.clone(),
+            exclude: args.openapi_exclude.clone(),
+            include_deprecated: !args.openapi_no_deprecated,
+            auth_header_factory: None,
+            timeout_secs: 30.0,
+            has_other_backend_source: args.extensions_dir.is_some(),
+            project_root: None,
+            acknowledge_unapproved_writes: false,
+        };
+        let registry = crate::openapi_backend::openapi_backend_from_spec(spec, base_registry, options)
+            .await
+            .map_err(|e| CliError::StartupFailure(format!("{e}")))?;
+        builder = builder.backend(registry);
+    }
+
+    let mut builder = builder
         .name(&args.name)
         .version(&version)
         .transport(transport_to_str(&args.transport))
@@ -438,8 +550,13 @@ pub async fn run() -> Result<(), CliError> {
         builder = builder.observability(true);
     }
 
+    // `build_async` (not `build`) so that "neither --extensions-dir nor
+    // --from-openapi" can still resolve mcp.openapi.spec from the Config Bus
+    // (PRD F-054 Acceptance Criterion 1) — validate_args only checked that
+    // the section EXISTS; build_async is what actually fetches and applies it.
     let mcp = builder
-        .build()
+        .build_async()
+        .await
         .map_err(|e| CliError::StartupFailure(e.to_string()))?;
 
     // Start the server on the ambient runtime (runs until shutdown).
@@ -599,7 +716,7 @@ mod tests {
     #[test]
     fn cli_args_minimal_defaults() {
         let args = parse_args(&["apcore-mcp", "--extensions-dir", "/tmp/ext"]).unwrap();
-        assert_eq!(args.extensions_dir, PathBuf::from("/tmp/ext"));
+        assert_eq!(args.extensions_dir, Some(PathBuf::from("/tmp/ext")));
         assert_eq!(args.transport, Transport::Stdio);
         assert_eq!(args.host, "127.0.0.1");
         assert_eq!(args.port, 8000);
@@ -670,7 +787,7 @@ mod tests {
         ])
         .unwrap();
 
-        assert_eq!(args.extensions_dir, PathBuf::from("/opt/ext"));
+        assert_eq!(args.extensions_dir, Some(PathBuf::from("/opt/ext")));
         assert_eq!(args.transport, Transport::StreamableHttp);
         assert_eq!(args.host, "0.0.0.0");
         assert_eq!(args.port, 9090);
@@ -697,9 +814,14 @@ mod tests {
     }
 
     #[test]
-    fn cli_args_missing_extensions_dir_errors() {
+    fn cli_args_missing_extensions_dir_no_longer_a_clap_error() {
+        // Reversal: --extensions-dir is no longer the only backend source
+        // (--from-openapi and mcp.openapi on the Config Bus both count now —
+        // PRD F-054 Acceptance Criterion 1), so clap itself must accept its
+        // absence. The backend-source rule moved entirely into
+        // validate_args — see validate_args_no_backend_source_at_all below.
         let result = parse_args(&["apcore-mcp"]);
-        assert!(result.is_err());
+        assert!(result.is_ok());
     }
 
     #[test]
@@ -806,6 +928,72 @@ mod tests {
     }
 
     // ── validate_args tests ───────────────────────────────────────────
+
+    #[test]
+    fn validate_args_no_backend_source_at_all() {
+        // No --extensions-dir, no --from-openapi, and (in this bare test
+        // environment) no apcore.yaml carrying mcp.openapi either.
+        let args = parse_args(&["apcore-mcp"]).unwrap();
+        let err = validate_args(&args).unwrap_err();
+        assert_eq!(err.exit_code(), 1);
+        assert!(err.to_string().contains("a backend source is required"));
+    }
+
+    #[test]
+    fn validate_args_extensions_dir_and_from_openapi_without_prefix_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = parse_args(&[
+            "apcore-mcp",
+            "--extensions-dir",
+            dir.path().to_str().unwrap(),
+            "--from-openapi",
+            "https://api.example.com/openapi.json",
+        ])
+        .unwrap();
+        let err = validate_args(&args).unwrap_err();
+        assert!(err.to_string().contains("openapi-prefix is required"));
+    }
+
+    #[test]
+    fn validate_args_extensions_dir_and_from_openapi_with_prefix_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = parse_args(&[
+            "apcore-mcp",
+            "--extensions-dir",
+            dir.path().to_str().unwrap(),
+            "--from-openapi",
+            "https://api.example.com/openapi.json",
+            "--openapi-prefix",
+            "petstore",
+        ])
+        .unwrap();
+        assert!(validate_args(&args).is_ok());
+    }
+
+    #[test]
+    fn validate_args_from_openapi_alone_needs_no_extensions_dir() {
+        let args = parse_args(&[
+            "apcore-mcp",
+            "--from-openapi",
+            "https://api.example.com/openapi.json",
+        ])
+        .unwrap();
+        assert!(validate_args(&args).is_ok());
+    }
+
+    #[test]
+    fn validate_args_malformed_openapi_header_rejected() {
+        let args = parse_args(&[
+            "apcore-mcp",
+            "--from-openapi",
+            "https://api.example.com/openapi.json",
+            "--openapi-header",
+            "not-a-key-value-pair",
+        ])
+        .unwrap();
+        let err = validate_args(&args).unwrap_err();
+        assert!(err.to_string().contains("openapi-header must be KEY:VALUE"));
+    }
 
     #[test]
     fn validate_args_nonexistent_extensions_dir() {

@@ -80,6 +80,22 @@ pub fn get_acl_config() -> Option<serde_json::Value> {
         .filter(|v| !v.is_null())
 }
 
+/// Read the `mcp.openapi` Config Bus section, or `None` when absent.
+///
+/// PRD F-054 Acceptance Criterion 1: `mcp.openapi.spec` alone, with no CLI
+/// flag and no explicit `openapi_backend` call, must start a server. Before
+/// this existed, `mcp.openapi` was published in [`mcp_defaults`] as a round-
+/// tripping key but nothing ever read it back.
+#[must_use]
+pub fn get_openapi_config() -> Option<serde_json::Value> {
+    let config = Config::discover().ok()?;
+    config
+        .namespace(MCP_NAMESPACE)
+        .get("openapi")
+        .cloned()
+        .filter(|v| !v.is_null())
+}
+
 /// Scalar Config Bus values consumed by the convenience [`crate::serve`] /
 /// [`crate::async_serve`] functions. Mirrors the 9 scalar keys declared in
 /// [`mcp_defaults`] and the corresponding TypeScript `ConfigBusDefaults` so
@@ -178,7 +194,14 @@ pub fn mcp_defaults() -> serde_json::Value {
         "middleware": [],
         // Declarative ACL — { default_effect: "deny"|"allow", rules: [ACLRule...] }.
         // `null` or missing means "no ACL" (allow all). See `acl_builder::build_acl_from_config`.
-        "acl": null
+        "acl": null,
+        // OpenAPI backend — { spec, base_url, prefix, include, exclude,
+        // include_deprecated, timeout, headers, acknowledge_unapproved_writes }.
+        // `spec` is the FIRST path-typed key in this namespace and is
+        // explicitly NOT covered by apcore 0.30.0's `Config::path_typed_keys()`
+        // — see `openapi_backend::resolve_spec_location`, which owns its own
+        // empty/URL/relative-path rules instead.
+        "openapi": null
     })
 }
 
@@ -215,6 +238,7 @@ mod tests {
             "require_auth",
             "middleware",
             "acl",
+            "openapi",
         ];
 
         let defaults = mcp_defaults();

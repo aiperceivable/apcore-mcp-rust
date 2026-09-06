@@ -35,7 +35,23 @@ struct SuccessExpected {
 struct ErrorCase {
     id: String,
     input: Value,
-    expected_error_substring: String,
+    /// contract_version 1.0/1.1 form: a single fragment.
+    #[serde(default)]
+    expected_error_substring: Option<String>,
+    /// contract_version 1.2 form: every fragment must appear. It exists
+    /// because a §6.2.1 shape case has to pin BOTH the bridge's
+    /// `mcp.acl.rules[i]` prefix and the axis named by the reason.
+    #[serde(default)]
+    expected_error_substrings: Vec<String>,
+    /// The offending field. Pinned INSTEAD of a reason phrase: the reason is
+    /// apcore's, and apcore-rust, apcore-js and apcore-python word the same
+    /// fault entirely differently.
+    #[serde(default)]
+    expected_error_names_field: Option<String>,
+    /// Asserts a fragment is ABSENT — how the ordering case separates "named
+    /// the right axis" from "rejected something".
+    #[serde(default)]
+    must_not_contain: Option<String>,
 }
 
 #[test]
@@ -87,17 +103,52 @@ fn conformance_error_cases() {
         let result = build_acl_from_config(Some(&case.input));
         let err = match result {
             Err(e) => format!("{e}"),
-            Ok(_) => panic!(
-                "case {}: expected error containing {:?} but build succeeded",
-                case.id, case.expected_error_substring
-            ),
+            Ok(_) => panic!("case {}: expected a rejection but build succeeded", case.id),
         };
+
+        let mut expected: Vec<&str> = Vec::new();
+        if let Some(single) = case.expected_error_substring.as_deref() {
+            expected.push(single);
+        }
+        expected.extend(case.expected_error_substrings.iter().map(String::as_str));
         assert!(
-            err.contains(&case.expected_error_substring),
-            "case {}: error message {:?} missing substring {:?}",
-            case.id,
-            err,
-            case.expected_error_substring,
+            !expected.is_empty(),
+            "case {}: fixture case carries no expectation",
+            case.id
         );
+        for fragment in expected {
+            assert!(
+                err.contains(fragment),
+                "case {}: error message {:?} missing substring {:?}",
+                case.id,
+                err,
+                fragment,
+            );
+        }
+
+        if let Some(field) = case.expected_error_names_field.as_deref() {
+            // The BARE name, not the quoted form: apcore-python and apcore-js
+            // write `'callers'` while apcore-rust writes `'callers[1]'`,
+            // naming the offending element. The bare token is the only
+            // spelling all three share.
+            assert!(
+                err.contains(field),
+                "case {}: error message {:?} does not name the field {:?}",
+                case.id,
+                err,
+                field,
+            );
+        }
+
+        if let Some(forbidden) = case.must_not_contain.as_deref() {
+            assert!(
+                !err.contains(forbidden),
+                "case {}: error message {:?} contains {:?}, which means the wrong validation \
+                 axis was reported (PROTOCOL_SPEC §6.2.1 order)",
+                case.id,
+                err,
+                forbidden,
+            );
+        }
     }
 }

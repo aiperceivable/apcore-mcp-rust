@@ -168,3 +168,43 @@ pub fn load_fixture<T: serde::de::DeserializeOwned>(name: &str) -> Option<T> {
     );
     None
 }
+
+/// Register a minimal module so a preflight has something to collide with.
+///
+/// Used by `openapi_backend_conformance` to seed the target registry before
+/// the OpenAPI backend scans, which is how the `id_collision_against_registry`
+/// case reaches the pre-write preflight at all.
+#[allow(dead_code)]
+pub fn register_stub(registry: &apcore::Registry, module_id: &str) {
+    use apcore::module::ModuleAnnotations;
+    use apcore::registry::ModuleDescriptor;
+    use apcore::FunctionModule;
+    use std::collections::HashMap;
+
+    let module = FunctionModule::new::<_, ()>(
+        ModuleAnnotations::default(),
+        serde_json::json!({"type": "object"}),
+        serde_json::json!({"type": "object"}),
+        |_args, _ctx| Box::pin(async move { Ok(serde_json::json!({})) }),
+    );
+    let descriptor = ModuleDescriptor {
+        module_id: module_id.to_string(),
+        name: None,
+        description: "stub".to_string(),
+        documentation: None,
+        input_schema: serde_json::json!({"type": "object"}),
+        output_schema: serde_json::json!({"type": "object"}),
+        version: "1.0.0".to_string(),
+        tags: vec![],
+        annotations: Some(ModuleAnnotations::default()),
+        examples: vec![],
+        metadata: HashMap::new(),
+        display: None,
+        sunset_date: None,
+        dependencies: vec![],
+        enabled: true,
+    };
+    registry
+        .register(module_id, Box::new(module), descriptor)
+        .unwrap_or_else(|e| panic!("stub {module_id} failed to register: {e}"));
+}

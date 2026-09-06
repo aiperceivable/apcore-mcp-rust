@@ -1491,15 +1491,19 @@ mod tests {
             .expect("register destructive module");
 
         let acl = apcore::ACL::new(
-            vec![apcore::ACLRule {
-                callers: vec!["*".to_string()],
-                targets: vec!["demo.destructive".to_string()],
-                effect: effect.to_string(),
-                // apcore 0.28.0 (apcore#108): `ACLRule` is not
-                // `#[non_exhaustive]`, so every literal now names this field.
-                approval: None,
-                description: Some(format!("{effect} the destructive demo")),
-                conditions: None,
+            vec![{
+                // apcore 0.29.0 made `ACLRule` `#[non_exhaustive]`, so a struct
+                // literal no longer compiles from outside that crate —
+                // `ACLRule::new` takes the three required fields and the rest
+                // are assigned on the returned value. (The comment this
+                // replaces said the opposite, and was true until 0.29.0.)
+                let mut rule = apcore::ACLRule::new(
+                    vec!["*".to_string()],
+                    vec!["demo.destructive".to_string()],
+                    effect.to_string(),
+                );
+                rule.description = Some(format!("{effect} the destructive demo"));
+                rule
             }],
             "allow",
             None,

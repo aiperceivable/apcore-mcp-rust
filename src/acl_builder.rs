@@ -159,7 +159,43 @@ pub fn build_acl_from_config(acl_config: Option<&Value>) -> Result<Option<ACL>, 
             )));
         }
 
-        // Validate callers/targets/effect shape before handing to serde.
+        // PROTOCOL_SPEC §6.2.1 (apcore 0.29.0, spec v1.31.0) fixes the order in
+        // which a rule bad on more than one axis is refused: `effect` ->
+        // `approval` -> `callers` -> `targets`, with the rule index dominating.
+        // This builder used to run it in reverse, so a rule wrong in both
+        // `effect` and `callers` was refused for `callers` here and for
+        // `effect` by apcore's own doors — the same file, two answers,
+        // depending on which door it reached first. The unknown-key check above
+        // stays ahead of all four: a Config-Bus shape fault with no apcore
+        // counterpart. `default_effect` is judged ahead of the rule loop.
+        let effect = entry_obj
+            .get("effect")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                APCoreMCPError::Config(format!(
+                    "mcp.acl.rules[{idx}] 'effect' must be 'allow' or 'deny'"
+                ))
+            })?;
+        if !ALLOWED_EFFECTS.contains(&effect) {
+            return Err(APCoreMCPError::Config(format!(
+                "mcp.acl.rules[{idx}] 'effect' must be 'allow' or 'deny', got {effect:?}"
+            )));
+        }
+
+        // §6.2.1 puts `approval` second, ahead of the pattern fields.
+        if let Some(raw) = entry_obj.get("approval") {
+            let ok = raw.is_null()
+                || raw
+                    .as_str()
+                    .is_some_and(|s| ALLOWED_APPROVALS.contains(&s));
+            if !ok {
+                return Err(APCoreMCPError::Config(format!(
+                    "mcp.acl.rules[{idx}] 'approval' must be one of {ALLOWED_APPROVALS:?} \
+                     (or omitted), got {raw}"
+                )));
+            }
+        }
+
         let callers = entry_obj
             .get("callers")
             .and_then(Value::as_array)
@@ -178,19 +214,6 @@ pub fn build_acl_from_config(acl_config: Option<&Value>) -> Result<Option<ACL>, 
                     "mcp.acl.rules[{idx}] 'targets' must be a non-empty list"
                 ))
             })?;
-        let effect = entry_obj
-            .get("effect")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                APCoreMCPError::Config(format!(
-                    "mcp.acl.rules[{idx}] 'effect' must be 'allow' or 'deny'"
-                ))
-            })?;
-        if !ALLOWED_EFFECTS.contains(&effect) {
-            return Err(APCoreMCPError::Config(format!(
-                "mcp.acl.rules[{idx}] 'effect' must be 'allow' or 'deny', got {effect:?}"
-            )));
-        }
 
         if let Some(conds) = entry_obj.get("conditions") {
             if !conds.is_null() && !conds.is_object() {
@@ -237,22 +260,42 @@ pub fn build_acl_from_config(acl_config: Option<&Value>) -> Result<Option<ACL>, 
             .filter(|v| !v.is_null())
             .cloned();
 
-        rules.push(ACLRule {
-            callers: callers_vec,
-            targets: targets_vec,
-            effect: effect.to_string(),
-            approval,
-            description,
-            conditions,
-        });
+        // `ACLRule` is `#[non_exhaustive]` as of apcore 0.29.0, so a struct
+        // literal no longer compiles from outside that crate. `ACLRule::new`
+        // takes the three required fields and the rest are assigned on the
+        // returned value — the form apcore's own api-surface-conventions §9.3
+        // names as the one that compiles downstream.
+        let mut rule = ACLRule::new(callers_vec, targets_vec, effect);
+        rule.approval = approval;
+        rule.description = description;
+        rule.conditions = conditions;
+
+        // Attribute apcore's own refusal to THIS rule. `ACL::try_new` validates
+        // the whole list and names an index within it; apcore exports no
+        // per-rule validator, so a throwaway single-rule construction is the
+        // only way to learn which rule was at fault while we still know its
+        // real position.
+        if let Err(e) = ACL::try_new(vec![rule.clone()], default_effect.clone(), None) {
+            return Err(APCoreMCPError::Config(format!(
+                "mcp.acl.rules[{idx}] {e}"
+            )));
+        }
+        rules.push(rule);
     }
 
     // `try_new` (not `new`): `new` panics on an invalid rule (e.g.
     // `approval: required` on a `deny` effect, apcore#108 §6.1.6 rule 2), and
     // this function's contract is to fail loudly via `Err`, not via a panic
     // that unwinds through a config-loading call site.
-    let acl = ACL::try_new(rules, default_effect, None)
+    let rule_count = rules.len();
+    let acl = ACL::try_new(rules, default_effect.clone(), None)
         .map_err(|e| APCoreMCPError::Config(format!("mcp.acl: {e}")))?;
+    // Cross-language parity: the spec's `## Contract: build_acl_from_config`
+    // Properties row states "logs at INFO on success" as a cross-language
+    // guarantee. Only the Python bridge did this before now — TypeScript and
+    // Rust were both silent, an operator debugging via logs saw confirmation
+    // on Python only.
+    tracing::info!("Built ACL with {rule_count} rule(s), default_effect={default_effect}");
     Ok(Some(acl))
 }
 
@@ -289,6 +332,74 @@ mod tests {
         });
         let acl = build_acl_from_config(Some(&cfg)).unwrap().unwrap();
         assert_eq!(acl.rules().len(), 1);
+    }
+
+    /// A `MakeWriter` that appends every write into a shared buffer, so a
+    /// test can assert on `tracing::info!` output without a global
+    /// subscriber leaking into other tests.
+    #[derive(Clone, Default)]
+    struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("capture buffer lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+        type Writer = CaptureWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn logs_at_info_on_success_cross_language_parity_with_python_a_004() {
+        // The spec's `## Contract: build_acl_from_config` Properties row
+        // states "logs at INFO on success" as a cross-language guarantee.
+        // Before this fix, only the Python bridge did — TypeScript and Rust
+        // were both silent, so an operator debugging via logs saw
+        // confirmation on Python only despite an identical config on all
+        // three bridges.
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(CaptureWriter(std::sync::Arc::clone(&buffer)))
+            .with_ansi(false)
+            .finish();
+
+        let cfg = json!({
+            "default_effect": "deny",
+            "rules": [{"callers": ["*"], "targets": ["public.*"], "effect": "allow"}]
+        });
+        tracing::subscriber::with_default(subscriber, || {
+            build_acl_from_config(Some(&cfg)).unwrap();
+        });
+
+        let output = String::from_utf8(buffer.lock().expect("capture buffer lock").clone())
+            .expect("captured tracing output must be valid UTF-8");
+        assert!(output.contains("Built ACL with 1 rule(s)"), "got: {output}");
+        assert!(output.contains("default_effect=deny"), "got: {output}");
+    }
+
+    #[test]
+    fn does_not_log_when_the_section_is_absent() {
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(CaptureWriter(std::sync::Arc::clone(&buffer)))
+            .with_ansi(false)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            build_acl_from_config(None).unwrap();
+        });
+
+        let output = String::from_utf8(buffer.lock().expect("capture buffer lock").clone())
+            .expect("captured tracing output must be valid UTF-8");
+        assert!(output.is_empty(), "expected no log output, got: {output}");
     }
 
     #[test]

@@ -42,7 +42,12 @@ fn help_exits_zero() {
 }
 
 #[test]
-fn missing_extensions_dir_exits_nonzero() {
+fn missing_backend_source_exits_nonzero() {
+    // Reversal: --extensions-dir is no longer clap-required (--from-openapi
+    // and mcp.openapi on the Config Bus both count now — PRD F-054
+    // Acceptance Criterion 1), so clap itself accepts zero args. The
+    // backend-source rule moved into validate_args, which reports it as an
+    // InvalidArgs error (exit 1), not a clap parse error (exit 2).
     let output = Command::new(binary_path())
         .output()
         .expect("failed to run binary");
@@ -51,8 +56,12 @@ fn missing_extensions_dir_exits_nonzero() {
         "expected non-zero exit, got {:?}",
         output.status.code()
     );
-    // clap exits with code 2 for missing required args
-    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("a backend source is required"),
+        "expected the backend-source message, got: {stderr}"
+    );
 }
 
 #[test]

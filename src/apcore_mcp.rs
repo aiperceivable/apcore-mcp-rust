@@ -636,7 +636,44 @@ impl APCoreMCP {
         // started listening yet.
         self.warn_if_control_surface_unprotected();
 
+        // FR-ACL-004 / PROTOCOL_SPEC §6.2.1 tier 2: rules that load cleanly
+        // and can protect nothing. Same placement as the check above — the
+        // ACL is fully assembled and no transport has started listening yet.
+        self.warn_acl_rules_that_protect_nothing();
+
         Ok((server, router, tools, init_options, version, Some(bridge)))
+    }
+
+    /// Log a loud, actionable warning for each `ACL::validate_rules()`
+    /// finding — a `callers` / `targets` pattern array that closed §6.2.1's
+    /// shape but still matches no legal module ID (e.g. `["$not", "*"]`),
+    /// leaving the rule inert. Diagnostics only (PROTOCOL_SPEC §6.1.3): a
+    /// finding never fails startup and never changes what the rule decides.
+    ///
+    /// Field names are `RuleValidationFinding`'s real ones —
+    /// `rule_index` / `condition_path` / `condition_key` / `effect`. There is
+    /// no free-text reason field; the message is built here, matching the
+    /// Python and TypeScript bridges' wording exactly.
+    fn warn_acl_rules_that_protect_nothing(&self) {
+        let Some(acl) = self.executor.acl.as_ref() else {
+            return;
+        };
+        for finding in acl.validate_rules() {
+            let key_suffix = finding
+                .condition_key
+                .as_deref()
+                .map(|k| format!(" ({k})"))
+                .unwrap_or_default();
+            tracing::warn!(
+                "mcp.acl.rules[{}] '{}'{}: this pattern is well-formed but matches no legal \
+                 module ID, so the '{}' rule protects nothing. It still loads and still changes \
+                 no decision (PROTOCOL_SPEC §6.1.3) — rewrite the pattern or remove the rule.",
+                finding.rule_index,
+                finding.condition_path,
+                key_suffix,
+                finding.effect,
+            );
+        }
     }
 
     /// Log a loud, actionable warning when `system.control.*` modules are
@@ -1543,6 +1580,44 @@ impl APCoreMCPBuilder {
     pub fn observability(mut self, enable: bool) -> Self {
         self.config.observability = enable;
         self
+    }
+
+    /// Async counterpart to [`build`](Self::build) — the only entry point
+    /// that resolves `mcp.openapi.spec` from the Config Bus alone, with no
+    /// backend given (PRD F-054 Acceptance Criterion 1).
+    ///
+    /// `build()` is deliberately synchronous — it matches every other
+    /// language's constructor shape and every OTHER Config Bus section
+    /// (`mcp.acl`, `mcp.middleware`) is pure, synchronous, in-memory parsing.
+    /// `mcp.openapi` is not: resolving it means fetching and parsing a
+    /// document, and `apcore-toolkit-rust`'s `load_spec` is built on async
+    /// `reqwest`, with no synchronous fallback (unlike Python's `httpx.get`,
+    /// which blocks synchronously by choice and is why Python's plain,
+    /// synchronous `__init__` can do this same resolution inline). A caller
+    /// with no explicit backend and no CLI flag, relying purely on
+    /// `mcp.openapi.spec` in `apcore.yaml`, must call `build_async` — calling
+    /// the plain `build()` in that situation still returns
+    /// `APCoreMCPError::BackendResolution`, exactly as before this method
+    /// existed.
+    ///
+    /// # Errors
+    ///
+    /// Returns every error [`build`](Self::build) can raise, plus
+    /// [`APCoreMCPError::Config`] when `mcp.openapi.spec` cannot be fetched
+    /// or parsed.
+    pub async fn build_async(mut self) -> Result<APCoreMCP, APCoreMCPError> {
+        if self.backend.is_none() {
+            if let Some(openapi_config) = crate::config::get_openapi_config() {
+                let registry = crate::openapi_backend::build_openapi_backend_from_config(
+                    &openapi_config,
+                    Arc::new(Registry::new()),
+                    false,
+                )
+                .await?;
+                self.backend = Some(BackendSource::Registry(registry));
+            }
+        }
+        self.build()
     }
 
     /// Consume the builder and produce an [`APCoreMCP`] instance.
@@ -2870,17 +2945,11 @@ mod tests {
         let reg = Registry::new();
         let exec = Arc::new(Executor::new(reg, Config::default()));
         let acl = ACL::new(
-            vec![ACLRule {
-                callers: vec!["role:admin".to_string()],
-                targets: vec!["sys.*".to_string()],
-                effect: "allow".to_string(),
-                // apcore 0.28.0 (apcore#108): `ACLRule` is not
-                // `#[non_exhaustive]`, so every literal now names this field.
-                // `None` keeps this rule's pre-0.28.0 meaning exactly.
-                approval: None,
-                description: None,
-                conditions: None,
-            }],
+            vec![ACLRule::new(
+                vec!["role:admin".to_string()],
+                vec!["sys.*".to_string()],
+                "allow",
+            )],
             "deny",
             None,
         );
@@ -2892,6 +2961,116 @@ mod tests {
         let installed = mcp.executor().acl.as_ref();
         assert!(installed.is_some(), "expected ACL on executor");
         assert_eq!(installed.unwrap().rules().len(), 1);
+    }
+
+    // ── FR-ACL-004 / §6.2.1 tier 2: rules that load cleanly and can protect
+    // nothing. Before this fix, this bridge had no implementation at all —
+    // zero hits for validate_rules/never_matches/tier-2 anywhere in src/,
+    // tests/, or CHANGELOG.md. This test proves both that the diagnostic
+    // fires and that its message uses RuleValidationFinding's real field
+    // names (rule_index/condition_path/condition_key/effect — there is no
+    // free-text reason field), which is the same shape bug that made the
+    // Python bridge's already-wired warning render as `'?': ` before this
+    // sync pass fixed it too.
+
+    /// A `MakeWriter` that appends every write into a shared buffer, so a
+    /// test can assert on `tracing::warn!` output without a global
+    /// subscriber leaking into other tests.
+    #[derive(Clone, Default)]
+    struct CaptureWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("capture buffer lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+        type Writer = CaptureWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn build_server_components_warns_on_inert_acl_rule_with_real_field_names() {
+        use apcore::{ACLRule, ACL};
+
+        let buffer = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(CaptureWriter(Arc::clone(&buffer)))
+            .with_ansi(false)
+            .finish();
+
+        let reg = Registry::new();
+        let exec = Arc::new(Executor::new(reg, Config::default()));
+        // ["$not", "*"] has legal §6.2.1 arity (exactly one operand) and
+        // matches nothing — the identical fail-open the shape closure alone
+        // does not catch, which is exactly what tier 2 exists to report.
+        let acl = ACL::new(
+            vec![ACLRule::new(
+                vec!["*".to_string()],
+                vec!["$not".to_string(), "*".to_string()],
+                "deny",
+            )],
+            "allow",
+            None,
+        );
+        let mcp = APCoreMCP::builder()
+            .backend(BackendSource::Executor(exec))
+            .acl(acl)
+            .build()
+            .expect("build should succeed");
+
+        tracing::subscriber::with_default(subscriber, || {
+            mcp.build_server_components().expect("components");
+        });
+
+        let output = String::from_utf8(buffer.lock().expect("capture buffer lock").clone())
+            .expect("captured tracing output must be valid UTF-8");
+        assert!(
+            output.contains("mcp.acl.rules[0]"),
+            "expected a tier-2 warning naming the rule; got: {output}"
+        );
+        assert!(output.contains("'targets'"), "expected the condition_path; got: {output}");
+        assert!(output.contains("'deny' rule protects nothing"), "expected the effect and reason; got: {output}");
+        assert!(!output.contains("'?'"), "the exact prior bug: a missing field defaulting to '?'; got: {output}");
+    }
+
+    #[test]
+    fn build_server_components_is_silent_when_every_acl_rule_matches_something() {
+        use apcore::{ACLRule, ACL};
+
+        let buffer = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(CaptureWriter(Arc::clone(&buffer)))
+            .with_ansi(false)
+            .finish();
+
+        let reg = Registry::new();
+        let exec = Arc::new(Executor::new(reg, Config::default()));
+        let acl = ACL::new(
+            vec![ACLRule::new(vec!["*".to_string()], vec!["*".to_string()], "allow")],
+            "deny",
+            None,
+        );
+        let mcp = APCoreMCP::builder()
+            .backend(BackendSource::Executor(exec))
+            .acl(acl)
+            .build()
+            .expect("build should succeed");
+
+        tracing::subscriber::with_default(subscriber, || {
+            mcp.build_server_components().expect("components");
+        });
+
+        let output = String::from_utf8(buffer.lock().expect("capture buffer lock").clone())
+            .expect("captured tracing output must be valid UTF-8");
+        assert!(!output.contains("mcp.acl.rules"), "expected no tier-2 warning; got: {output}");
     }
 
     #[test]
@@ -4388,22 +4567,26 @@ mod tests {
             vec![
                 // Narrow rule first (first-match-wins, §6.3): a recursive
                 // delete is allowed but must be put to a human.
-                apcore::ACLRule {
-                    callers: vec!["*".to_string()],
-                    targets: vec!["files.delete".to_string()],
-                    effect: "allow".to_string(),
-                    approval: Some(apcore::ApprovalRequirement::Required),
-                    description: None,
-                    conditions: Some(json!({"arguments": {"has_key": ["recursive"]}})),
+                {
+                    // `ACLRule` is #[non_exhaustive] as of apcore 0.29.0 — a struct
+                    // literal no longer compiles from outside that crate.
+                    #[allow(unused_mut)]
+                    let mut rule = apcore::ACLRule::new(
+                        vec!["*".to_string()],
+                        vec!["files.delete".to_string()],
+                        "allow",
+                    );
+                    rule.approval = Some(apcore::ApprovalRequirement::Required);
+                    rule.conditions = Some(json!({"arguments": {"has_key": ["recursive"]}}));
+                    rule
                 },
                 // Broad rule: everything else this caller does is allowed.
-                apcore::ACLRule {
-                    callers: vec!["*".to_string()],
-                    targets: vec!["*".to_string()],
-                    effect: "allow".to_string(),
-                    approval: None,
-                    description: None,
-                    conditions: None,
+                {
+                    // `ACLRule` is #[non_exhaustive] as of apcore 0.29.0 — a struct
+                    // literal no longer compiles from outside that crate.
+                    #[allow(unused_mut)]
+                    let mut rule = apcore::ACLRule::new(vec!["*".to_string()], vec!["*".to_string()], "allow".to_string());
+                    rule
                 },
             ],
             "deny",
@@ -4493,14 +4676,15 @@ mod tests {
 
         executor.set_acl(
             apcore::ACL::try_new(
-                vec![apcore::ACLRule {
-                    callers: vec!["*".to_string()],
-                    targets: vec!["system.*".to_string()],
-                    effect: effect.to_string(),
-                    approval: None,
-                    description: None,
-                    conditions: None,
-                }],
+                vec![
+                {
+                    // `ACLRule` is #[non_exhaustive] as of apcore 0.29.0 — a struct
+                    // literal no longer compiles from outside that crate.
+                    #[allow(unused_mut)]
+                    let mut rule = apcore::ACLRule::new(vec!["*".to_string()], vec!["system.*".to_string()], effect.to_string());
+                    rule
+                }
+                ],
                 "deny",
                 None,
             )
