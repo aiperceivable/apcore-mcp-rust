@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.20.1] - 2026-09-06
+## [0.20.0] - 2026-09-06
 
 Bugfix release from a `/apcore-skills:sync` pass across all three bridges. 0.20.0's tests all passed
 and `openapi_backend`/`acl_builder`'s own logic worked exactly as documented — but neither module was
@@ -100,8 +100,6 @@ regressed.
   in both documents.
 - `docs/srs-apcore-mcp.md`'s FR-OPENAPI-002 heading corrected from "projects unchanged onto both
   protocol surfaces" to "is projected, then reaches both protocol surfaces unchanged".
-
-## [0.20.0] - 2026-09-06
 
 Feature release: the **OpenAPI backend** — point the bridge at an OpenAPI 3.0/3.1 document and every
 operation becomes an MCP tool, proxied over HTTP — plus the `mcp.acl` half of apcore 0.29.0's
