@@ -5,6 +5,90 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.21.0] - 2026-09-07
+
+Bugfix release for three OpenAPI-backend defects in this crate, found in a cross-SDK sweep that
+compared all three bridges line by line against `docs/features/openapi-backend.md`. Two of the
+fixes are breaking — see **Changed** — which is why this is a minor bump rather than a patch.
+Released together with `apcore-mcp-typescript` 0.21.0 and `apcore-mcp-python` 0.21.0. 1110 tests pass (was 1101).
+
+### Changed
+
+- **BREAKING: `OpenAPIBackendOptions` gained a `headers` field.** The struct is public, has no
+  `#[non_exhaustive]`, and every field is `pub`, so any downstream code constructing it with a
+  struct literal now fails to compile until it adds `headers` (or switches to
+  `..OpenAPIBackendOptions::new()`). The field is what makes the `--openapi-header` fix below
+  possible — see **Fixed**.
+
+- **BREAKING: `mcp.openapi.timeout` now bounds the spec fetch, not proxied calls.** It previously
+  configured `HTTPProxyRegistryWriter`'s per-request timeout, which is the opposite of the
+  documented contract. A deployment that set a short `timeout` was — whether it knew it or not —
+  shortening every proxied tool call; after this release those calls take the fixed 60 s default
+  and the value bounds only the startup spec fetch. Configurations relying on the old behaviour
+  have no replacement key: the proxy budget is not configurable through `mcp.openapi` in any of
+  the three SDKs. See **Fixed** for why the old behaviour was a defect.
+
+### Added
+
+- **`mcp.openapi.headers` is now validated at startup.** A non-mapping value, or a mapping with a
+  non-string value, fails with a message naming the offending key and how to fix it (`X-Version:
+  "1.0"` — quote it so YAML does not parse it as a number). The three SDKs cannot agree on what an
+  unquoted `X-Version: 1.0` means — Python's httpx raises `TypeError: Header value must be str or
+  bytes`, TypeScript's `fetch` quietly coerces it to `"1"` — so Rust follows Python, the reference
+  implementation. The one option ruled out is dropping the header silently, which is this key's own
+  bug report (#8) reproduced by a different route. No existing configuration can break: `headers`
+  was never read here before this release.
+
+- `tests/openapi_backend_option_plumbing.rs` (9 tests) — all three defects above were invisible to
+  the existing suite, which hands `openapi_backend` an already-parsed document and calls
+  `resolve_spec_location` directly with an explicit `project_root`: it covers the pure functions
+  and never the wiring between them. These tests run a local HTTP server (recording the headers it
+  receives, answering after 120 ms) and a temporary `Config::project_root`, so they exercise a real
+  fetch, a real proxied call, and a real resolution. Each was confirmed to fail against the
+  pre-fix code.
+
+### Fixed
+
+- **`--openapi-header` / `mcp.openapi.headers` built a header map and never passed it**
+  ([#8](https://github.com/aiperceivable/apcore-mcp-rust/issues/8)). `cli.rs` parsed every
+  `KEY:VALUE` into a `HashMap` that was then dropped on the floor: `OpenAPIBackendOptions` had no
+  `headers` field to receive it, and `build_openapi_backend_from_config` never read the config key
+  either. No compiler warning fired, because `headers.insert(...)` counts as a use. A spec URL
+  behind an API key failed to fetch with the key sitting right there on the command line — and the
+  same command worked in Python and TypeScript, which both honour it. `OpenAPIBackendOptions` now
+  carries `headers`, both routes populate it, and the fetch uses
+  `apcore_toolkit::openapi_scanner::load_spec_with_options` instead of the zero-option `load_spec`,
+  which silently discarded it. Per `docs/features/openapi-backend.md` these headers are spec-fetch
+  only; `auth_header_factory` remains the proxied-call credential and is deliberately not forwarded
+  to the fetch.
+
+- **`mcp.openapi.timeout` configured the proxy timeout instead of the spec fetch**
+  ([#9](https://github.com/aiperceivable/apcore-mcp-rust/issues/9)) — the opposite of
+  `docs/features/openapi-backend.md` line 379, "Spec fetch only; not the per-call proxy timeout".
+  The field was declared as `/// Proxy request timeout in seconds`, read from the documented key,
+  and handed to `HTTPProxyRegistryWriter::new`, while the spec fetch ran on apcore-toolkit's own
+  default with no way to configure it. An operator setting a short `timeout` to fail fast on an
+  unreachable spec host instead got a short timeout on every proxied tool call — a production
+  behaviour change rather than a startup one. `timeout_secs` is now the spec-fetch budget and
+  reaches `load_spec_with_options`; proxied calls take the new `PROXY_TIMEOUT_SECS` (60 s), which
+  is the value Python and TypeScript already get by omitting the argument and letting
+  apcore-toolkit's default apply. Rust needs it spelled out because `HTTPProxyRegistryWriter::new`
+  takes the timeout positionally, has no default, and rejects a non-positive value. The CLI has no
+  `--openapi-timeout` flag (none is in the documented CLI contract) and so takes the documented
+  30 s spec-fetch default, matching the other two CLIs.
+
+- **The Config Bus and CLI routes never resolved `Config::project_root`**
+  ([apcore-mcp#19](https://github.com/aiperceivable/apcore-mcp/issues/19)). `resolve_spec_location`
+  implemented the rule correctly, but `build_openapi_backend_from_config` and `cli.rs` both passed
+  a hardcoded `project_root: None`, so a relative `mcp.openapi.spec` fell back to the process CWD —
+  precisely the population `docs/features/openapi-backend.md` requirement 3 was written for (a
+  supervisor spawning a worker, a container whose entrypoint chdirs, a CLI invoked from a
+  subdirectory). The lookup now happens once inside `openapi_backend_from_spec`, so every route
+  reaches it — the Config Bus, the CLI, and a direct call — rather than each call site having to
+  remember. `OpenAPIBackendOptions::project_root` becomes an override: `None` reads
+  `Config::project_root`, mirroring Python's `_resolve_project_root`. A `Config` that cannot be
+  discovered or fails validation degrades to CWD rather than aborting startup.
+
 ## [0.20.0] - 2026-09-06
 
 Bugfix release from a `/apcore-skills:sync` pass across all three bridges. 0.20.0's tests all passed

@@ -29,6 +29,17 @@ const WRITE_METHODS: [&str; 4] = ["POST", "PUT", "PATCH", "DELETE"];
 
 const URL_SCHEMES: [&str; 2] = ["http://", "https://"];
 
+/// Proxy request timeout, in seconds, applied to every derived module.
+///
+/// `mcp.openapi.timeout` is spec-fetch only (`docs/features/openapi-backend.md`
+/// line 379), so the proxy side is not configurable and takes a fixed default.
+/// Python and TypeScript get theirs by omitting the argument entirely and
+/// letting apcore-toolkit's own default apply (60.0 s / `60_000` ms);
+/// `HTTPProxyRegistryWriter::new` in Rust takes the timeout positionally, has
+/// no default, and rejects a non-positive value, so the same number is spelled
+/// out here to keep the three SDKs on one value.
+const PROXY_TIMEOUT_SECS: f64 = 60.0;
+
 /// Options for [`openapi_backend`].
 #[derive(Default)]
 pub struct OpenAPIBackendOptions {
@@ -42,13 +53,21 @@ pub struct OpenAPIBackendOptions {
     pub exclude: Option<String>,
     /// When `false`, `deprecated: true` operations are skipped. Default `true`.
     pub include_deprecated: bool,
+    /// Extra headers for the **spec fetch only** — never sent with proxied
+    /// calls. `mcp.openapi.headers` on the Config Bus, `--openapi-header` on
+    /// the CLI.
+    pub headers: Option<HashMap<String, String>>,
     /// Per-request auth headers for proxied calls (never the spec fetch).
     pub auth_header_factory: Option<Box<dyn Fn() -> HashMap<String, String> + Send + Sync>>,
-    /// Proxy request timeout in seconds.
+    /// Spec-fetch timeout in seconds — `mcp.openapi.timeout`. **Not** the
+    /// per-call proxy timeout, which is fixed at [`PROXY_TIMEOUT_SECS`].
     pub timeout_secs: f64,
     /// True when another backend source is configured; makes `prefix` required.
     pub has_other_backend_source: bool,
-    /// `Config::project_root` (apcore 0.30.0). A relative `spec` resolves here.
+    /// Overrides the base a relative `spec` resolves against. `None` — the
+    /// normal case, including both the Config Bus and CLI routes — reads
+    /// `Config::project_root` (apcore 0.30.0) in
+    /// [`openapi_backend_from_spec`] instead.
     pub project_root: Option<String>,
     /// Suppresses the "nothing will ask for approval" warning when the
     /// operator has deliberately reviewed and accepted it.
@@ -197,22 +216,36 @@ pub async fn openapi_backend_from_spec(
     registry: Arc<Registry>,
     options: OpenAPIBackendOptions,
 ) -> Result<Arc<Registry>, APCoreMCPError> {
-    let resolved =
-        resolve_spec_location(spec, options.project_root.as_deref()).ok_or_else(|| {
-            APCoreMCPError::Config(
-                "mcp.openapi.spec is required and resolved to nothing.".to_string(),
-            )
-        })?;
+    // `Config::project_root` is resolved HERE rather than at each call site: a
+    // relative `spec` must resolve against the project root on every route (the
+    // Config Bus, the CLI, and a direct call), and every route but a caller
+    // passing `project_root` explicitly reaches this one function. Resolving
+    // per call site is what left the Config Bus and CLI routes on CWD.
+    let project_root = options.project_root.clone().or_else(config_project_root);
+    let resolved = resolve_spec_location(spec, project_root.as_deref()).ok_or_else(|| {
+        APCoreMCPError::Config("mcp.openapi.spec is required and resolved to nothing.".to_string())
+    })?;
 
-    // `load_spec` handles both branches (URL vs local path) and both
-    // JSON/YAML parsing internally — no need to duplicate that here.
-    let document = apcore_toolkit::openapi_scanner::load_spec(&resolved)
-        .await
-        .map_err(|e| {
-            APCoreMCPError::Config(format!(
-                "mcp.openapi: failed to load spec '{resolved}': {e}"
-            ))
-        })?;
+    // `load_spec_with_options` handles both branches (URL vs local path) and
+    // both JSON/YAML parsing internally — no need to duplicate that here. The
+    // options-taking variant is the one that carries `headers` and the
+    // spec-fetch `timeout`; the zero-argument `load_spec` silently drops both.
+    // `auth_header_factory` is deliberately NOT forwarded: it is the proxied-
+    // call credential, and the spec fetch takes `headers` only — matching
+    // Python (`openapi_backend.py:202`) and TypeScript (`openapi-backend.ts`).
+    let load_options = apcore_toolkit::openapi_scanner::LoadSpecOptions {
+        headers: options.headers.clone(),
+        auth_header_factory: None,
+        timeout_secs: options.timeout_secs,
+    };
+    let document =
+        apcore_toolkit::openapi_scanner::load_spec_with_options(&resolved, &load_options)
+            .await
+            .map_err(|e| {
+                APCoreMCPError::Config(format!(
+                    "mcp.openapi: failed to load spec '{resolved}': {e}"
+                ))
+            })?;
 
     openapi_backend(&document, registry, options).await
 }
@@ -262,6 +295,7 @@ pub async fn build_openapi_backend_from_config(
             .get("include_deprecated")
             .and_then(Value::as_bool)
             .unwrap_or(true),
+        headers: headers_from_config(obj.get("headers")).map_err(APCoreMCPError::Config)?,
         auth_header_factory: None,
         timeout_secs: obj.get("timeout").and_then(Value::as_f64).unwrap_or(30.0),
         has_other_backend_source,
@@ -275,6 +309,61 @@ pub async fn build_openapi_backend_from_config(
     match spec {
         Value::String(s) => openapi_backend_from_spec(s, registry, options).await,
         document => openapi_backend(document, registry, options).await,
+    }
+}
+
+/// Read a Config Bus `headers` mapping into the option field.
+///
+/// A non-string value is a startup error, not a silent drop and not a guess at
+/// its spelling. `X-Version: 1.0` in YAML is a *number*, and the three SDKs
+/// cannot agree on what it means: Python's httpx raises `TypeError: Header
+/// value must be str or bytes`, and TypeScript's `fetch` quietly coerces it to
+/// `"1"` — changing the value the operator wrote. Failing here matches Python,
+/// which is the reference implementation, and above all avoids the third
+/// option: dropping the header while the operator watches an authenticated
+/// spec fetch fail with the key sitting right there in `apcore.yaml`. That is
+/// the exact failure this key's own bug report was about (#8).
+fn headers_from_config(value: Option<&Value>) -> Result<Option<HashMap<String, String>>, String> {
+    let Some(value) = value.filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    let obj = value.as_object().ok_or_else(|| {
+        format!(
+            "mcp.openapi.headers must be a mapping, got {}",
+            value_type_name(value)
+        )
+    })?;
+
+    let mut map = HashMap::with_capacity(obj.len());
+    for (key, raw) in obj {
+        let text = raw.as_str().ok_or_else(|| {
+            format!(
+                "mcp.openapi.headers.{key} must be a string, got {} — quote it in YAML                  (`{key}: \"...\"`) so it is not parsed as a number or boolean",
+                value_type_name(raw)
+            )
+        })?;
+        map.insert(key.clone(), text.to_string());
+    }
+    Ok(if map.is_empty() { None } else { Some(map) })
+}
+
+/// Read `Config::project_root` (apcore 0.30.0), or `None` to fall back to CWD.
+///
+/// Mirrors Python's `_resolve_project_root` (`openapi_backend.py:128-141`):
+/// the Config Bus route owns this lookup, because a caller reaching it holds
+/// no `Config` of its own. Any failure degrades to CWD rather than aborting
+/// startup — the base is a convenience, and a spec that resolves under CWD is
+/// what every pre-0.30.0 deployment already had.
+fn config_project_root() -> Option<String> {
+    match apcore::config::Config::discover() {
+        Ok(config) => {
+            let root = config.project_root();
+            root.to_str().filter(|s| !s.is_empty()).map(str::to_string)
+        }
+        Err(e) => {
+            tracing::debug!("Config::project_root unavailable ({e}); falling back to CWD");
+            None
+        }
     }
 }
 
@@ -404,16 +493,9 @@ pub async fn openapi_backend(
         })?;
 
     // --- Write -------------------------------------------------------------
-    let writer = HTTPProxyRegistryWriter::new(
-        base_url,
-        options.auth_header_factory,
-        if options.timeout_secs > 0.0 {
-            options.timeout_secs
-        } else {
-            30.0
-        },
-    )
-    .map_err(|e| APCoreMCPError::Config(format!("mcp.openapi: {e}")))?;
+    let writer =
+        HTTPProxyRegistryWriter::new(base_url, options.auth_header_factory, PROXY_TIMEOUT_SECS)
+            .map_err(|e| APCoreMCPError::Config(format!("mcp.openapi: {e}")))?;
 
     for result in writer.write(&modules, &registry) {
         if let Some(err) = result.verification_error {

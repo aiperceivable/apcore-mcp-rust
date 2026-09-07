@@ -495,7 +495,16 @@ pub async fn run() -> Result<(), CliError> {
             include: args.openapi_include.clone(),
             exclude: args.openapi_exclude.clone(),
             include_deprecated: !args.openapi_no_deprecated,
+            headers: if headers.is_empty() {
+                None
+            } else {
+                Some(headers)
+            },
             auth_header_factory: None,
+            // No `--openapi-timeout` flag exists in the CLI contract
+            // (`docs/features/openapi-backend.md` line 385ff), so the CLI route
+            // takes the documented spec-fetch default, exactly as Python's and
+            // TypeScript's CLIs do by omitting the argument.
             timeout_secs: 30.0,
             has_other_backend_source: args.extensions_dir.is_some(),
             project_root: None,
