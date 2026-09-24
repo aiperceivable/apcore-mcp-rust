@@ -1005,9 +1005,10 @@ mod tests {
             if path.is_file() {
                 let raw = std::fs::read_to_string(&path)
                     .unwrap_or_else(|e| panic!("fixture {} unreadable: {e}", path.display()));
-                return Some(serde_json::from_str(&raw).unwrap_or_else(|e| {
-                    panic!("fixture {} is malformed: {e}", path.display())
-                }));
+                return Some(
+                    serde_json::from_str(&raw)
+                        .unwrap_or_else(|e| panic!("fixture {} is malformed: {e}", path.display())),
+                );
             }
         }
 
@@ -1039,9 +1040,8 @@ mod tests {
 
         for case in fixture["test_cases"].as_array().expect("test_cases") {
             let id = case["id"].as_str().expect("case id");
-            let result =
-                SchemaConverter::convert_input_schema_strict(&case["input_schema"], false)
-                    .unwrap_or_else(|e| panic!("case {id}: unexpected error: {e}"));
+            let result = SchemaConverter::convert_input_schema_strict(&case["input_schema"], false)
+                .unwrap_or_else(|e| panic!("case {id}: unexpected error: {e}"));
             assert_eq!(
                 result, case["expected_inlined_schema"],
                 "case {id}: inlined schema mismatch"

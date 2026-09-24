@@ -349,7 +349,10 @@ impl AsyncTaskBridge {
     /// 0.31.0, D-81): a store outage is now an `Err`, never silently
     /// reported as "not found". `Ok(None)` still means the store answered
     /// and has no such task.
-    pub fn get_status(&self, task_id: &str) -> Result<Option<TaskInfo>, apcore::errors::ModuleError> {
+    pub fn get_status(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<TaskInfo>, apcore::errors::ModuleError> {
         let Some(mut info) = self.manager.get_status(task_id)? else {
             return Ok(None);
         };
@@ -396,10 +399,7 @@ impl AsyncTaskBridge {
     /// Propagates the underlying `AsyncTaskManager`'s store error (apcore
     /// 0.31.0, D-81) — the cancellation OUTCOME is still the boolean;
     /// `Ok(false)` means an unknown or already-terminal task.
-    pub async fn cancel(
-        &self,
-        task_id: &str,
-    ) -> Result<bool, apcore::errors::ModuleError> {
+    pub async fn cancel(&self, task_id: &str) -> Result<bool, apcore::errors::ModuleError> {
         let result = self.manager.cancel(task_id).await;
         {
             let mut guard = self
