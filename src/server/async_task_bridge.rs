@@ -335,15 +335,24 @@ impl AsyncTaskBridge {
         }
     }
 
-    /// Retrieve the current `TaskInfo` for a task id.
+    /// Retrieve the current `TaskInfo` for a task id, or `None` if unknown.
     ///
     /// When the task is in `Completed` state, the embedded `result` is
     /// redacted via the module's registered output schema (if any). If the
     /// redactor panics, the unredacted result is returned and the panic is
     /// logged at debug level — matches apcore-mcp-python and
     /// apcore-mcp-typescript try/except behaviour.
-    pub fn get_status(&self, task_id: &str) -> Option<TaskInfo> {
-        let mut info = self.manager.get_status(task_id)?;
+    ///
+    /// # Errors
+    ///
+    /// Propagates the underlying `AsyncTaskManager`'s store error (apcore
+    /// 0.31.0, D-81): a store outage is now an `Err`, never silently
+    /// reported as "not found". `Ok(None)` still means the store answered
+    /// and has no such task.
+    pub fn get_status(&self, task_id: &str) -> Result<Option<TaskInfo>, apcore::errors::ModuleError> {
+        let Some(mut info) = self.manager.get_status(task_id)? else {
+            return Ok(None);
+        };
         if info.status == TaskStatus::Completed {
             if let Some(result) = &info.result {
                 if let Some(schema) = self.output_schemas.get(&info.module_id) {
@@ -368,7 +377,7 @@ impl AsyncTaskBridge {
                 }
             }
         }
-        Some(info)
+        Ok(Some(info))
     }
 
     /// Cancel a running or pending task.
@@ -376,11 +385,22 @@ impl AsyncTaskBridge {
     /// [D11-103] Order matters here: `manager.cancel` is awaited FIRST so
     /// any progress notification emitted during the cancellation handshake
     /// can still observe the sender/token in our maps. Only after the
-    /// manager has finalised the task do we drop the progress bindings.
-    /// Matches Python (async_task_bridge.py:458-460) and TypeScript
+    /// manager has finalised the task do we drop the progress bindings —
+    /// unconditionally, whether `manager.cancel` succeeded or returned a
+    /// store error, so a failed cancellation never leaks the progress
+    /// sink. Matches Python (async_task_bridge.py:458-460) and TypeScript
     /// (async_task_bridge.ts:590-596).
-    pub async fn cancel(&self, task_id: &str) -> bool {
-        let cancelled = self.manager.cancel(task_id).await;
+    ///
+    /// # Errors
+    ///
+    /// Propagates the underlying `AsyncTaskManager`'s store error (apcore
+    /// 0.31.0, D-81) — the cancellation OUTCOME is still the boolean;
+    /// `Ok(false)` means an unknown or already-terminal task.
+    pub async fn cancel(
+        &self,
+        task_id: &str,
+    ) -> Result<bool, apcore::errors::ModuleError> {
+        let result = self.manager.cancel(task_id).await;
         {
             let mut guard = self
                 .progress_tokens
@@ -395,13 +415,18 @@ impl AsyncTaskBridge {
                 .unwrap_or_else(|p| p.into_inner());
             guard.remove(task_id);
         }
-        cancelled
+        result
     }
 
     /// Cancel every task recorded under the given session key. Used by the
     /// transport layer when a client disconnects or cancels a request.
     ///
-    /// Returns the number of tasks cancelled.
+    /// Best-effort cleanup: a per-task store error is logged at debug level
+    /// and does not abort the remaining cancellations (apcore 0.31.0, D-81,
+    /// surfaced [`Self::cancel`]'s error; a disconnect-triggered cleanup
+    /// has no caller left to report it to).
+    ///
+    /// Returns the number of tasks successfully cancelled.
     pub async fn cancel_session_tasks(&self, session_key: &str) -> usize {
         let ids: Vec<String> = {
             let mut map = self.session_tasks.lock().unwrap_or_else(|p| p.into_inner());
@@ -409,21 +434,41 @@ impl AsyncTaskBridge {
         };
         let mut n = 0;
         for id in &ids {
-            if self.cancel(id).await {
-                n += 1;
+            match self.cancel(id).await {
+                Ok(true) => n += 1,
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::debug!(
+                        task_id = %id,
+                        "cancel during session cleanup failed: {e}"
+                    );
+                }
             }
         }
         n
     }
 
     /// List all tracked tasks, optionally filtered by status.
-    pub fn list_tasks(&self, status: Option<TaskStatus>) -> Vec<TaskInfo> {
+    ///
+    /// # Errors
+    ///
+    /// Propagates the underlying `AsyncTaskManager`'s store error (apcore
+    /// 0.31.0, D-81).
+    pub fn list_tasks(
+        &self,
+        status: Option<TaskStatus>,
+    ) -> Result<Vec<TaskInfo>, apcore::errors::ModuleError> {
         self.manager.list_tasks(status)
     }
 
     /// Cancel all pending/running tasks at server shutdown.
-    pub async fn shutdown(&self) {
-        self.manager.shutdown().await;
+    ///
+    /// # Errors
+    ///
+    /// Propagates the underlying `AsyncTaskManager`'s store error (apcore
+    /// 0.31.0, D-81).
+    pub async fn shutdown(&self) -> Result<(), apcore::errors::ModuleError> {
+        self.manager.shutdown().await
     }
 
     /// Build the four reserved meta-tool definitions.
@@ -652,7 +697,7 @@ impl AsyncTaskBridge {
                     "__apcore_task_status requires a non-empty 'task_id'",
                 )
             })?;
-        match self.get_status(task_id) {
+        match self.get_status(task_id)? {
             Some(info) => Ok(serde_json::to_value(info).unwrap_or(Value::Null)),
             // [D11-014] Align with Python's `_text_response({"error":
             // "ASYNC_TASK_NOT_FOUND", "task_id": ...}, is_error=True)` — return
@@ -683,14 +728,14 @@ impl AsyncTaskBridge {
         // Without this, unknown task_ids silently return `{cancelled: false}` —
         // callers can't distinguish "task existed and is uncancellable" from
         // "task never existed". Mirrors handle_status's existence-check path.
-        if self.get_status(task_id).is_none() {
+        if self.get_status(task_id)?.is_none() {
             return Ok(json!({
                 "error": "ASYNC_TASK_NOT_FOUND",
                 "task_id": task_id,
                 "is_error": true,
             }));
         }
-        let cancelled = self.cancel(task_id).await;
+        let cancelled = self.cancel(task_id).await?;
         Ok(json!({ "task_id": task_id, "cancelled": cancelled }))
     }
 
@@ -720,7 +765,7 @@ impl AsyncTaskBridge {
                 ));
             }
         };
-        let tasks = self.list_tasks(status_filter);
+        let tasks = self.list_tasks(status_filter)?;
         let tasks_json: Vec<Value> = tasks
             .into_iter()
             .map(|t| serde_json::to_value(t).unwrap_or(Value::Null))
@@ -1198,15 +1243,15 @@ mod tests {
         let cancelled = bridge.cancel_session_tasks("sess-a").await;
         assert_eq!(cancelled, 2);
         assert_eq!(
-            bridge.get_status(&t1.task_id).map(|i| i.status),
+            bridge.get_status(&t1.task_id).unwrap().map(|i| i.status),
             Some(TaskStatus::Cancelled)
         );
         assert_eq!(
-            bridge.get_status(&t2.task_id).map(|i| i.status),
+            bridge.get_status(&t2.task_id).unwrap().map(|i| i.status),
             Some(TaskStatus::Cancelled)
         );
         assert!(matches!(
-            bridge.get_status(&t3.task_id).map(|i| i.status),
+            bridge.get_status(&t3.task_id).unwrap().map(|i| i.status),
             Some(TaskStatus::Pending) | Some(TaskStatus::Running) | Some(TaskStatus::Failed)
         ));
     }

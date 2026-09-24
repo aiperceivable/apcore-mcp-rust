@@ -59,72 +59,88 @@ impl RegistryListener {
             let active = Arc::clone(&self.active);
             let factory = Arc::clone(&factory);
             let registry_for_cb = Arc::clone(&registry);
-            registry.on(
-                &RegistryEvent::Register.to_string(),
-                Box::new(
-                    move |module_id: &str, _module: &dyn apcore::module::Module| {
-                        if !active.load(Ordering::SeqCst) {
-                            return;
-                        }
-                        // Fetch the canonical descriptor from the registry — do
-                        // NOT synthesize from the bare Module trait. The
-                        // descriptor stored at registration time carries
-                        // version/tags/metadata/display/sunset_date/dependencies
-                        // that the trait does not expose. [A-D-002]
-                        // apcore 0.22.0: get_definition() returns
-                        // Result<Option<ModuleDescriptor>, ModuleError>; a
-                        // missing descriptor or lookup error both skip the build.
-                        let descriptor = match registry_for_cb.get_definition(module_id) {
-                            Ok(Some(d)) => d,
-                            Ok(None) | Err(_) => {
-                                tracing::warn!(
-                                    "RegistryListener: get_definition returned None for '{}'; \
-                                     skipping tool build",
-                                    module_id
-                                );
+            // apcore 0.31.0 (D-80): `on()` now validates the event name
+            // against the registry's closed event set and returns
+            // `Result<u64, ModuleError>` instead of silently registering
+            // nothing for an unrecognized event. `RegistryEvent::Register`
+            // is one of this crate's own hardcoded constants and always
+            // lowercases to the canonical `"register"`, so an `Err` here
+            // can only mean that literal has drifted out of sync with
+            // apcore's event set — a bug in this crate, not a runtime
+            // condition, so it fails fast rather than silently dropping
+            // the callback the way the pre-0.31.0 API allowed.
+            registry
+                .on(
+                    &RegistryEvent::Register.to_string(),
+                    Box::new(
+                        move |module_id: &str, _module: &dyn apcore::module::Module| {
+                            if !active.load(Ordering::SeqCst) {
                                 return;
                             }
-                        };
-                        let description = descriptor.description.clone();
-
-                        match factory.build_tool(&descriptor, &description, None) {
-                            Ok(tool) => {
-                                if let Ok(mut map) = tools.write() {
-                                    map.insert(module_id.to_string(), tool);
+                            // Fetch the canonical descriptor from the registry — do
+                            // NOT synthesize from the bare Module trait. The
+                            // descriptor stored at registration time carries
+                            // version/tags/metadata/display/sunset_date/dependencies
+                            // that the trait does not expose. [A-D-002]
+                            // apcore 0.22.0: get_definition() returns
+                            // Result<Option<ModuleDescriptor>, ModuleError>; a
+                            // missing descriptor or lookup error both skip the build.
+                            let descriptor = match registry_for_cb.get_definition(module_id) {
+                                Ok(Some(d)) => d,
+                                Ok(None) | Err(_) => {
+                                    tracing::warn!(
+                                        "RegistryListener: get_definition returned None for '{}'; \
+                                         skipping tool build",
+                                        module_id
+                                    );
+                                    return;
                                 }
-                                tracing::info!("Tool registered: {}", module_id);
+                            };
+                            let description = descriptor.description.clone();
+
+                            match factory.build_tool(&descriptor, &description, None) {
+                                Ok(tool) => {
+                                    if let Ok(mut map) = tools.write() {
+                                        map.insert(module_id.to_string(), tool);
+                                    }
+                                    tracing::info!("Tool registered: {}", module_id);
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Failed to build tool for {}: {}", module_id, e);
+                                }
                             }
-                            Err(e) => {
-                                tracing::warn!("Failed to build tool for {}: {}", module_id, e);
-                            }
-                        }
-                    },
-                ),
-            );
+                        },
+                    ),
+                )
+                .expect("RegistryEvent::Register must be a valid apcore registry event name");
         }
 
         // Register "unregister" callback
         {
             let tools = Arc::clone(&self.tools);
             let active = Arc::clone(&self.active);
-            registry.on(
-                &RegistryEvent::Unregister.to_string(),
-                Box::new(
-                    move |module_id: &str, _module: &dyn apcore::module::Module| {
-                        if !active.load(Ordering::SeqCst) {
-                            return;
-                        }
-                        let removed = if let Ok(mut map) = tools.write() {
-                            map.remove(module_id).is_some()
-                        } else {
-                            false
-                        };
-                        if removed {
-                            tracing::info!("Tool unregistered: {}", module_id);
-                        }
-                    },
-                ),
-            );
+            // See the matching comment on the "register" callback above —
+            // same apcore 0.31.0 (D-80) signature change, same reasoning.
+            registry
+                .on(
+                    &RegistryEvent::Unregister.to_string(),
+                    Box::new(
+                        move |module_id: &str, _module: &dyn apcore::module::Module| {
+                            if !active.load(Ordering::SeqCst) {
+                                return;
+                            }
+                            let removed = if let Ok(mut map) = tools.write() {
+                                map.remove(module_id).is_some()
+                            } else {
+                                false
+                            };
+                            if removed {
+                                tracing::info!("Tool unregistered: {}", module_id);
+                            }
+                        },
+                    ),
+                )
+                .expect("RegistryEvent::Unregister must be a valid apcore registry event name");
         }
     }
 

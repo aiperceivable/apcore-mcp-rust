@@ -4464,7 +4464,9 @@ mod tests {
         let mut info = None;
         for _ in 0..200 {
             match bridge.get_status(&task_id) {
-                Some(i) if i.status == TaskStatus::Completed || i.status == TaskStatus::Failed => {
+                Ok(Some(i))
+                    if i.status == TaskStatus::Completed || i.status == TaskStatus::Failed =>
+                {
                     info = Some(i);
                     break;
                 }

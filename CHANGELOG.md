@@ -5,6 +5,95 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.22.0] - 2026-09-24
+
+> **Shipped in all three bridges.** Implemented in `apcore-mcp-python`, `apcore-mcp-typescript` and
+> `apcore-mcp-rust`. See each bridge's own CHANGELOG for its per-language details.
+
+Raises the required floor to apcore 0.31.0 and apcore-toolkit 0.12.0, and fixes a
+credential-disclosure defect found while reviewing what those two releases changed. 1107 tests pass
+(was 1106): 1027 lib + 80 integration (was 1026 lib + 80 integration), plus 4 doc tests (1 ignored,
+unaffected by this release).
+
+### Security
+
+- **`$ref` sibling keys were discarded during `SchemaConverter::inline_refs`, dropping
+  `x-sensitive`** (`src/adapters/schema.rs`; new fixture
+  [`schema_converter.json`](https://github.com/aiperceivable/apcore-mcp/blob/main/conformance/fixtures/schema_converter.json),
+  8 cases + 1 error case). A node like `{"$ref": "#/$defs/Token", "x-sensitive": true}` took the
+  `$ref` branch and returned **only** `Self::resolve_ref(...)`'s recursively-inlined result — the
+  early `return` skipped the loop that would otherwise have copied every sibling key, so
+  `x-sensitive`, `description`, `deprecated`, and anything else written beside the `$ref` vanished
+  silently. This is a credential-disclosure path, not a fidelity nicety: `ExecutionRouter`'s output
+  redaction (`src/server/router.rs::redact_output`, via `apcore::redact_sensitive`) reads
+  `x-sensitive` off the *resolved* output schema to decide what to mask, so a sensitive field behind
+  a `$ref` reached the redactor with nothing to redact on and returned in plaintext.
+
+  `inline_refs` now resolves the `$ref` target, recursively inlines refs within it, and
+  shallow-merges the node's own sibling keys **over** the resolved-and-inlined result — sibling
+  winning on conflict — before returning. A sibling that is itself a subschema (object/array) is
+  independently walked for its own nested `$ref`s rather than cloned verbatim, and a chained
+  `$ref`-to-`$ref` carries siblings from each hop, with the outermost winning on conflict (the merge
+  happens bottom-up as the recursion unwinds). `resolve_ref`'s missing-definition error is
+  unchanged — this only changes what happens to siblings once a reference *does* resolve. See
+  [`docs/features/schema-converter.md#ref-sibling-keys-are-preserved`](https://github.com/aiperceivable/apcore-mcp/blob/main/docs/features/schema-converter.md#ref-sibling-keys-are-preserved).
+
+  Found by reviewing what apcore 0.31.0 (decision D-98/D-124) and apcore-toolkit 0.12.0 changed:
+  both fixed the identical defect in their own `$ref` resolvers. `SchemaConverter::inline_refs` is a
+  fully independent implementation with no shared code path to either, so it was not fixed by
+  bumping the dependency floor and carried the same latent bug.
+
+### Added
+
+- `adapters::schema::tests::conformance_schema_converter_ref_siblings` — loads
+  `conformance/fixtures/schema_converter.json` via a fixture locator mirroring
+  `server::router::tests::conformance_fixture` (duplicated rather than imported: that helper is a
+  private item inside a sibling `#[cfg(test)] mod tests` and not reachable from `schema.rs`, the
+  same tradeoff already recorded next to the `router.rs` copy and in `tests/common`). Drives
+  `SchemaConverter::convert_input_schema_strict(schema, false)` per the fixture's `entry_point`, so
+  `additionalProperties` injection doesn't add noise to the comparison, and asserts every
+  `test_cases[]` entry's `expected_inlined_schema` and every `error_cases[]` entry's
+  `expected_error_substring`.
+
+### Changed — dependency floor
+
+- **`apcore = ">=0.30"` → `">=0.31"`; `apcore-toolkit = ">=0.11.1"` → `">=0.12"`.** apcore 0.31.0 is
+  two joined audit cycles (`PROTOCOL_SPEC` v1.37.0 → v1.59.0) settling 54 cross-language
+  divergences, five of them security defects, none on a surface this crate's public API exposes
+  directly (ACL/`ACLRule`, `Context`/`Identity`/`CancelToken` construction, `Registry`, `Module`,
+  `ModuleError`, `redact_sensitive`/`REDACTED_VALUE`, `Executor`, `config::Config`, `sys_modules`,
+  `ScannedModule`/`load_spec`/`HTTPProxyRegistryWriter` — grepped against every symbol this crate
+  imports and checked against both changelogs' breaking/changed sections). apcore-toolkit 0.12.0
+  adds the Device Authorization Flow (unused here), `BindingLoader.load_with_pattern` (`BindingLoader`
+  is not used by this crate), and a separate `HTTPProxyRegistryWriter::as_async_auth_header_factory()`
+  alongside the existing synchronous constructor this crate calls, whose signature did not change.
+
+  **This floor raise was not code-neutral for Rust**, unlike a simple version bump: apcore 0.31.0's
+  D-81/D-92 ("`TaskStoreError` must reach the caller on every store-touching method") changed
+  `AsyncTaskManager::get_status`/`cancel`/`list_tasks`/`shutdown` from plain returns to
+  `Result<_, ModuleError>`, and D-80 ("the registry event set is closed") changed
+  `Registry::on(...)` from `()` to `Result<u64, ModuleError>`. Neither is named in apcore's own
+  Security section — they're filed under "Changed — specification" — which is why the dependency
+  grep against the breaking/changed sections didn't surface them ahead of time; both were only found
+  by rebuilding against 0.31.0. Fixed here, not papered over:
+  - `AsyncTaskBridge::get_status`/`cancel`/`list_tasks`/`shutdown` (`src/server/async_task_bridge.rs`)
+    now return `Result<_, apcore::errors::ModuleError>`, propagating the store error rather than
+    swallowing it. `handle_status`/`handle_cancel`/`handle_list` propagate via `?`, matching how
+    `submit()` already worked. `cancel_session_tasks` (best-effort disconnect cleanup, still returns
+    a plain `usize`) logs a per-task store error at debug level rather than aborting the remaining
+    cancellations — there's no caller left to report it to on a disconnect path. The two
+    fire-and-forget `AsyncTaskBridge::cancel` call sites in `src/apcore_mcp.rs`'s cancel handlers
+    now explicitly discard the `Result` (`let _ = ...`) for the same reason.
+  - `RegistryListener::start` (`src/server/listener.rs`) now calls `.expect(...)` on
+    `Registry::on(...)`'s `Result`: `RegistryEvent::Register`/`Unregister` are this crate's own
+    hardcoded constants that always lowercase to apcore's canonical `"register"`/`"unregister"`, so
+    an `Err` here can only mean that literal has drifted out of apcore's event set — a bug in this
+    crate to fail fast on, not a runtime condition to swallow silently the way the pre-0.31.0 `()`
+    return allowed.
+
+  No other call site needed a change. `cargo build`/`cargo test --all-targets`/`cargo clippy
+  --all-targets --all-features -- -D warnings` are all clean after the bump.
+
 ## [0.21.0] - 2026-09-07
 
 Bugfix release for three OpenAPI-backend defects in this crate, found in a cross-SDK sweep that

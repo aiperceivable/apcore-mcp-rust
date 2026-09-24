@@ -220,7 +220,47 @@ impl SchemaConverter {
                     new_seen.insert(ref_path.to_string());
 
                     let resolved = Self::resolve_ref(ref_path, defs)?;
-                    return Self::inline_refs(&resolved, defs, &new_seen, depth + 1);
+                    let inlined = Self::inline_refs(&resolved, defs, &new_seen, depth + 1)?;
+
+                    // [security] Keys written beside `$ref` (e.g. `x-sensitive`,
+                    // `description`, `deprecated`) MUST survive resolution — the
+                    // early `return` above used to discard every sibling key,
+                    // which is a credential-disclosure path: the router's output
+                    // redaction reads `x-sensitive` off the *resolved* schema to
+                    // decide what to mask, so a sensitive field behind a `$ref`
+                    // reached the redactor with nothing to redact on. Shallow-
+                    // merge the sibling keys over the resolved-and-inlined
+                    // result, sibling winning on conflict. A sibling that is
+                    // itself a subschema is independently walked for its own
+                    // nested `$ref`s rather than cloned verbatim. On a chained
+                    // `$ref` (a `$defs` entry pointing at another `$ref`), this
+                    // merge happens bottom-up on the way back out of the
+                    // recursion, so the outermost sibling wins on conflict.
+                    let mut result = match inlined {
+                        Value::Object(m) => m,
+                        other => {
+                            // Only `$ref` was present — nothing to merge.
+                            if map.len() == 1 {
+                                return Ok(other);
+                            }
+                            // A $ref resolved to a non-object (e.g. a bare
+                            // boolean schema) yet siblings are present. Not
+                            // representable as a merge onto a non-object;
+                            // fall back to an empty base so siblings are
+                            // still preserved rather than silently dropped.
+                            serde_json::Map::new()
+                        }
+                    };
+
+                    for (key, value) in map {
+                        if key == "$ref" {
+                            continue;
+                        }
+                        let inlined_sibling = Self::inline_refs(value, defs, seen, depth + 1)?;
+                        result.insert(key.clone(), inlined_sibling);
+                    }
+
+                    return Ok(Value::Object(result));
                 }
 
                 // Otherwise, recursively process all values
@@ -915,5 +955,111 @@ mod tests {
             Some(&json!(false)),
             "strict must walk array-valued items; got: {result}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Cross-language conformance: $ref sibling-key preservation (security)
+    // -----------------------------------------------------------------------
+    //
+    // Lives here rather than under `tests/` because it drives `inline_refs`
+    // through the crate's own `convert_input_schema_strict`, and there is no
+    // benefit to widening that surface purely to reach it from an
+    // integration test. `router.rs`'s own conformance test module cannot be
+    // reused from here — its `conformance_fixture` is a private item inside
+    // a sibling `#[cfg(test)] mod tests`, not `pub(crate)` — so the fixture
+    // locator is repeated in miniature below, the same tradeoff recorded
+    // next to that copy and in `tests/common`.
+
+    /// The candidate fixture directories, in resolution order. Mirrors
+    /// `router.rs`'s `conformance_candidates` / `tests/common::candidates`.
+    fn conformance_candidates() -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        let mut dir: std::path::PathBuf = env!("CARGO_MANIFEST_DIR").into();
+        for _ in 0..=4 {
+            out.push(dir.join("apcore-mcp").join("conformance").join("fixtures"));
+            if !dir.pop() {
+                break;
+            }
+        }
+        out
+    }
+
+    /// Locate and parse a shared conformance fixture, honouring
+    /// `APCORE_CONFORMANCE_FIXTURES`. A missing fixture is a skip locally
+    /// (a contributor may not have the spec repo checked out) and a hard
+    /// failure in CI, where the cross-language conformance suite exists to
+    /// catch divergence between the three bridges.
+    fn conformance_fixture(name: &str) -> Option<Value> {
+        let dir = match std::env::var("APCORE_CONFORMANCE_FIXTURES") {
+            Ok(explicit) => {
+                let candidate = std::path::PathBuf::from(explicit);
+                candidate.is_dir().then_some(candidate)
+            }
+            Err(_) => conformance_candidates()
+                .into_iter()
+                .find(|candidate| candidate.is_dir()),
+        };
+
+        if let Some(dir) = dir {
+            let path = dir.join(name);
+            if path.is_file() {
+                let raw = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|e| panic!("fixture {} unreadable: {e}", path.display()));
+                return Some(serde_json::from_str(&raw).unwrap_or_else(|e| {
+                    panic!("fixture {} is malformed: {e}", path.display())
+                }));
+            }
+        }
+
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "conformance fixture {name:?} not found; in CI this is a failure \
+             rather than a skip. The workflow must check out \
+             aiperceivable/apcore-mcp to the `apcore-mcp` path."
+        );
+        eprintln!("skipping: conformance fixture {name:?} not found locally");
+        None
+    }
+
+    /// Pins the sibling-key preservation fix: a key written beside `$ref`
+    /// (e.g. `x-sensitive`) MUST survive resolution rather than being
+    /// discarded when the `$ref` branch is taken. This is a security
+    /// requirement — `ExecutionRouter::redact_output` reads `x-sensitive`
+    /// off the *resolved* schema, so a sensitive field behind a `$ref`
+    /// previously reached the redactor with nothing to redact on. Driven
+    /// with `strict=false` per the fixture's `entry_point`, so
+    /// `additionalProperties` injection doesn't add noise to the
+    /// comparison. See `conformance/fixtures/schema_converter.json` and
+    /// `docs/features/schema-converter.md#ref-sibling-keys-are-preserved`.
+    #[test]
+    fn conformance_schema_converter_ref_siblings() {
+        let Some(fixture) = conformance_fixture("schema_converter.json") else {
+            return;
+        };
+
+        for case in fixture["test_cases"].as_array().expect("test_cases") {
+            let id = case["id"].as_str().expect("case id");
+            let result =
+                SchemaConverter::convert_input_schema_strict(&case["input_schema"], false)
+                    .unwrap_or_else(|e| panic!("case {id}: unexpected error: {e}"));
+            assert_eq!(
+                result, case["expected_inlined_schema"],
+                "case {id}: inlined schema mismatch"
+            );
+        }
+
+        for case in fixture["error_cases"].as_array().expect("error_cases") {
+            let id = case["id"].as_str().expect("case id");
+            let substring = case["expected_error_substring"]
+                .as_str()
+                .expect("expected_error_substring");
+            let err = SchemaConverter::convert_input_schema_strict(&case["input_schema"], false)
+                .expect_err(&format!("case {id}: expected an error"));
+            let message = err.to_string();
+            assert!(
+                message.contains(substring),
+                "case {id}: expected error to contain {substring:?}, got: {message}"
+            );
+        }
     }
 }

@@ -935,7 +935,10 @@ impl APCoreMCP {
                     tokio::spawn(async move {
                         let n = b.cancel_session_tasks(&key).await;
                         if n == 0 {
-                            b.cancel(&key).await;
+                            // Best-effort direct-cancel fallback on client
+                            // disconnect; a store error here has no caller
+                            // left to report it to (apcore 0.31.0, D-81).
+                            let _ = b.cancel(&key).await;
                         }
                     });
                 }
@@ -1107,7 +1110,10 @@ impl APCoreMCP {
                     tokio::spawn(async move {
                         let n = b.cancel_session_tasks(&key).await;
                         if n == 0 {
-                            b.cancel(&key).await;
+                            // Best-effort direct-cancel fallback on client
+                            // disconnect; a store error here has no caller
+                            // left to report it to (apcore 0.31.0, D-81).
+                            let _ = b.cancel(&key).await;
                         }
                     });
                 }
