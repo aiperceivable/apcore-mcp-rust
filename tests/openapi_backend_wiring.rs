@@ -64,7 +64,7 @@ async fn openapi_backend_from_spec_builds_from_a_local_file() {
     .expect("openapi_backend_from_spec should succeed");
 
     let ids = registry.list(None, None, Some(&["public", "hidden"]));
-    assert!(ids.contains(&"listpets".to_string()), "got: {ids:?}");
+    assert!(ids.contains(&"list_pets".to_string()), "got: {ids:?}");
 }
 
 #[tokio::test]
@@ -88,7 +88,7 @@ async fn build_openapi_backend_from_config_translates_the_config_bus_mapping() {
 
     let ids = registry.list(None, None, Some(&["public", "hidden"]));
     assert!(
-        ids.contains(&"petstore.listpets".to_string()),
+        ids.contains(&"petstore.list_pets".to_string()),
         "got: {ids:?}"
     );
 }

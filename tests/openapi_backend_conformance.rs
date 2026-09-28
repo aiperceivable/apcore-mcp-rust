@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use apcore::Registry;
 use apcore_mcp::openapi_backend::{openapi_backend, resolve_spec_location, OpenAPIBackendOptions};
+use apcore_mcp::ModuleIDNormalizer;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -32,15 +33,29 @@ struct ModuleCase {
     #[serde(default)]
     options: HashMap<String, Value>,
     expected_modules: Vec<ExpectedModule>,
+    #[serde(default)]
+    expected_skipped: Vec<ExpectedSkip>,
 }
 
 #[derive(Deserialize)]
 struct ExpectedModule {
     module_id: String,
     #[serde(default)]
+    mcp_tool_name: Option<String>,
+    #[serde(default)]
+    openai_function_name: Option<String>,
+    #[serde(default)]
     mcp_annotations: Option<HashMap<String, bool>>,
     #[serde(default)]
     requires_approval: Option<bool>,
+    #[serde(default)]
+    warnings_contain: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ExpectedSkip {
+    derived_module_id: String,
+    reason_substring: String,
 }
 
 #[derive(Deserialize)]
@@ -98,11 +113,15 @@ async fn conformance_modules() {
         return;
     };
 
+    let (logs, _guard) = common::capture_logs();
     for case in &fixture.test_cases {
+        logs.clear();
         let registry = Arc::new(Registry::new());
         let registry = openapi_backend(&case.document, registry, to_options(&case.options))
             .await
             .unwrap_or_else(|e| panic!("case {}: unexpected error: {e}", case.id));
+        let warnings = logs.at(tracing::Level::WARN);
+        let errors = logs.at(tracing::Level::ERROR);
 
         let mut expected: Vec<String> = case
             .expected_modules
@@ -127,6 +146,35 @@ async fn conformance_modules() {
                     panic!("case {}: no definition for {}", case.id, want.module_id)
                 });
             let annotations = definition.annotations.clone().unwrap_or_default();
+
+            // The MCP tool name is the module ID verbatim; OpenAI is dash-normalized.
+            if let Some(tool_name) = &want.mcp_tool_name {
+                assert_eq!(
+                    &want.module_id, tool_name,
+                    "case {}/{}: MCP tool name",
+                    case.id, want.module_id
+                );
+            }
+            if let Some(function_name) = &want.openai_function_name {
+                assert_eq!(
+                    &ModuleIDNormalizer::normalize(&want.module_id).unwrap_or_else(|e| panic!(
+                        "case {}/{}: OpenAI name: {e}",
+                        case.id, want.module_id
+                    )),
+                    function_name,
+                    "case {}/{}: OpenAI function name",
+                    case.id,
+                    want.module_id
+                );
+            }
+            if let Some(fragment) = &want.warnings_contain {
+                assert!(
+                    warnings.iter().any(|w| w.contains(fragment.as_str())),
+                    "case {}/{}: expected a warning containing {fragment:?}, got {warnings:?}",
+                    case.id,
+                    want.module_id
+                );
+            }
 
             if let Some(hints) = &want.mcp_annotations {
                 // The MCP camelCase projection of apcore's annotations.
@@ -155,6 +203,36 @@ async fn conformance_modules() {
                     case.id, want.module_id
                 );
             }
+        }
+
+        // `notes.expected_skipped` in the fixture: a warning naming the emitted
+        // ID and the segment is necessary but, since apcore-toolkit 0.13.0
+        // appends its own legality warning, no longer sufficient. What proves
+        // the skip is that the module never reached the writer — no ERROR-level
+        // event names it.
+        for skip in &case.expected_skipped {
+            assert!(
+                warnings
+                    .iter()
+                    .any(|w| w.contains(skip.derived_module_id.as_str())
+                        && w.contains(skip.reason_substring.as_str())),
+                "case {}: no WARN event named the skipped module {:?} together with the \
+                 offending segment {:?}; got {warnings:?}",
+                case.id,
+                skip.derived_module_id,
+                skip.reason_substring
+            );
+            let reached_writer: Vec<&String> = errors
+                .iter()
+                .filter(|e| e.contains(skip.derived_module_id.as_str()))
+                .collect();
+            assert!(
+                reached_writer.is_empty(),
+                "case {}: {:?} reached the writer and failed there ({reached_writer:?}); the \
+                 bridge must skip it BEFORE HTTPProxyRegistryWriter::write",
+                case.id,
+                skip.derived_module_id
+            );
         }
     }
 }

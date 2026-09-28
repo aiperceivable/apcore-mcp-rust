@@ -208,3 +208,101 @@ pub fn register_stub(registry: &apcore::Registry, module_id: &str) {
         .register(module_id, Box::new(module), descriptor)
         .unwrap_or_else(|e| panic!("stub {module_id} failed to register: {e}"));
 }
+
+/// `tracing` events captured while a test runs: `(level, message)` pairs.
+///
+/// The OpenAPI backend reports skips and write failures through `tracing`, not
+/// through its return value, so an assertion about them has to read the log.
+#[derive(Clone, Default)]
+pub struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>);
+
+impl CapturedLogs {
+    /// Every captured message at exactly `level`.
+    pub fn at(&self, level: tracing::Level) -> Vec<String> {
+        self.0
+            .lock()
+            .expect("capture lock")
+            .iter()
+            .filter(|(l, _)| *l == level)
+            .map(|(_, m)| m.clone())
+            .collect()
+    }
+
+    /// Discard everything captured so far (one capture reused across cases).
+    pub fn clear(&self) {
+        self.0.lock().expect("capture lock").clear();
+    }
+}
+
+thread_local! {
+    static ACTIVE_CAPTURE: std::cell::RefCell<Option<CapturedLogs>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Records each event into the capture active on the thread that emitted it.
+struct ThreadCaptureLayer;
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ThreadCaptureLayer {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        struct Message(String);
+        impl tracing::field::Visit for Message {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = format!("{value:?}");
+                }
+            }
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                if field.name() == "message" {
+                    self.0 = value.to_string();
+                }
+            }
+        }
+        ACTIVE_CAPTURE.with(|active| {
+            if let Some(logs) = active.borrow().as_ref() {
+                let mut message = Message(String::new());
+                event.record(&mut message);
+                logs.0
+                    .lock()
+                    .expect("capture lock")
+                    .push((*event.metadata().level(), message.0));
+            }
+        });
+    }
+}
+
+/// Ends the current thread's capture when dropped.
+pub struct CaptureGuard;
+
+impl Drop for CaptureGuard {
+    fn drop(&mut self) {
+        ACTIVE_CAPTURE.with(|active| *active.borrow_mut() = None);
+    }
+}
+
+/// Capture the `tracing` events emitted on the current thread until the guard
+/// drops. Under `#[tokio::test]`'s current-thread runtime every poll of the
+/// future under test runs on that thread.
+///
+/// The subscriber is a **global** default installed once per test binary, not
+/// a thread-local `set_default`. tracing caches each callsite's interest
+/// globally, and a parallel test hitting the same callsite with no subscriber
+/// on its own thread races that cache — measured here as a capture that saw no
+/// events on roughly every other run. A permanent global subscriber is always
+/// interested, and events from threads with no active capture are dropped.
+pub fn capture_logs() -> (CapturedLogs, CaptureGuard) {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        use tracing_subscriber::layer::SubscriberExt;
+        tracing::subscriber::set_global_default(
+            tracing_subscriber::registry().with(ThreadCaptureLayer),
+        )
+        .expect("no other global tracing subscriber in a capturing test binary");
+    });
+    let logs = CapturedLogs::default();
+    ACTIVE_CAPTURE.with(|active| *active.borrow_mut() = Some(logs.clone()));
+    (logs, CaptureGuard)
+}

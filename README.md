@@ -50,7 +50,7 @@ cargo add apcore-mcp
 cargo install apcore-mcp
 ```
 
-Requires Rust 1.75+ and `apcore >= 0.21.0` + `apcore-toolkit >= 0.6.0`.
+Requires Rust 1.75+ and `apcore >= 0.31` + `apcore-toolkit >= 0.13`. 0.13 is the toolkit floor because the OpenAPI backend registers the module IDs its `OpenAPIScanner` emits, and only 0.13+ emits them in apcore's Canonical ID alphabet.
 
 ## Quick Start
 

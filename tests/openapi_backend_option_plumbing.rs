@@ -132,7 +132,7 @@ async fn config_headers_reach_the_spec_fetch() {
     .await
     .expect("backend builds");
 
-    assert!(registry_ids(&registry).contains(&"listpets".to_string()));
+    assert!(registry_ids(&registry).contains(&"list_pets".to_string()));
 
     let seen = server.seen_headers.lock().unwrap();
     assert_eq!(
@@ -225,7 +225,7 @@ async fn documented_default_timeout_fetches_a_slow_spec() {
     )
     .await
     .expect("backend builds on the 30s default");
-    assert!(registry_ids(&registry).contains(&"listpets".to_string()));
+    assert!(registry_ids(&registry).contains(&"list_pets".to_string()));
 }
 
 #[tokio::test]
@@ -272,9 +272,9 @@ async fn a_short_timeout_does_not_shrink_the_proxy_timeout() {
     .expect("an already-parsed document needs no fetch");
 
     let module = registry
-        .get("listpets")
+        .get("list_pets")
         .expect("registry lookup")
-        .expect("listpets registered");
+        .expect("list_pets registered");
     let ctx = Context::create(None, None, None, None, json!({}), None);
     let result = module.execute(json!({}), &ctx).await;
     assert!(
@@ -324,7 +324,7 @@ async fn relative_spec_resolves_against_config_project_root() {
     unsafe { std::env::remove_var("APCORE_CONFIG_FILE") };
 
     let registry = result.expect("the spec sits under project_root, not the CWD");
-    assert!(registry_ids(&registry).contains(&"listpets".to_string()));
+    assert!(registry_ids(&registry).contains(&"list_pets".to_string()));
 }
 
 #[tokio::test]
@@ -344,5 +344,5 @@ async fn explicit_project_root_still_wins_over_config() {
     unsafe { std::env::remove_var("APCORE_CONFIG_FILE") };
 
     let registry = result.expect("an explicit project_root overrides Config");
-    assert!(registry_ids(&registry).contains(&"listpets".to_string()));
+    assert!(registry_ids(&registry).contains(&"list_pets".to_string()));
 }

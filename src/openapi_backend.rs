@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use apcore::Registry;
 use apcore_toolkit::openapi_scanner::{OpenAPIScanner, ScanOptions};
@@ -101,23 +101,24 @@ pub fn is_legal_segment(segment: &str) -> bool {
     chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
-/// Map a scanner-derived module ID into apcore's legal alphabet, or `None`.
+/// Map a module ID into apcore's legal alphabet, or `None`.
 ///
-/// apcore-toolkit's `derive_module_id` sanitizes to `[A-Za-z0-9_.-]`. apcore's
-/// registry accepts only lowercase, digits, underscores and dots — "no
-/// hyphens" — so the two alphabets differ and the scanner's output is not
-/// directly registrable. Measured against apcore 0.30.0 and apcore-toolkit
-/// 0.11.1, only two of nine realistic operation shapes register unrepaired,
-/// and the canonical Swagger Petstore (`listPets`, `createPets`,
-/// `showPetById`) is entirely in the rejected set: it scans cleanly, fails
-/// registration on every operation as a per-module `WriteResult`, and yields an
-/// **empty registry**.
+/// The projection is lowercase, then `-` -> `_`. A segment that still does not
+/// begin with a lowercase letter (`v1.2fa.post`) cannot be repaired without
+/// inventing a character, so the result is `None`.
 ///
-/// The projection is lowercase, then `-` -> `_`. Both are mechanical and
-/// lossless up to case. It deliberately stops there: a segment that still does
-/// not begin with a lowercase letter (`/v1/2fa` -> `v1.2fa.post`) can only be
-/// repaired by *inventing* a character, which is a naming decision that belongs
-/// to the operator's own hook rather than to a silent default.
+/// Deprecated: apcore-toolkit >= 0.13.0 emits every `module_id` in apcore's
+/// Canonical ID alphabet itself — camelCase split into words (`listPets` ->
+/// `list_pets`), `-` and other characters replaced with `_`, a legal ID never
+/// rewritten — so this projection is no longer needed, and nothing in
+/// apcore-mcp calls it any more. It is kept, with its behaviour unchanged, for
+/// callers that imported it, and will be removed in a later minor release.
+/// It does NOT agree with the toolkit: it lowercases without splitting words
+/// (`listPets` -> `listpets`).
+#[deprecated(
+    note = "apcore-toolkit >= 0.13.0 emits every module ID in apcore's Canonical ID alphabet, so \
+            the projection is no longer needed; it will be removed in a later minor release"
+)]
 #[must_use]
 pub fn project_module_id(module_id: &str) -> Option<String> {
     let candidate = module_id.to_ascii_lowercase().replace('-', "_");
@@ -129,6 +130,13 @@ pub fn project_module_id(module_id: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// The first segment of `module_id` apcore's registry would refuse, or `None`
+/// when every segment is legal. An empty ID yields the empty segment, which is
+/// illegal too.
+fn illegal_segment(module_id: &str) -> Option<&str> {
+    module_id.split('.').find(|s| !is_legal_segment(s))
 }
 
 /// Resolve the `mcp.openapi.spec` value.
@@ -401,54 +409,42 @@ pub async fn openapi_backend(
     }
 
     // --- Scan -------------------------------------------------------------
-    // Caller hook first, projection last. The order is normative: running the
-    // projection last makes the invariant *every registered module ID is
-    // apcore-legal* hold unconditionally. It also runs BEFORE the scanner's
-    // `deduplicate_ids` — which happens after this callback — because
-    // lowercasing can CREATE a collision the document did not have.
-    let skipped: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
-    let skipped_hook = Arc::clone(&skipped);
-
+    // apcore-toolkit >= 0.13.0 normalises every module ID into apcore's
+    // Canonical ID alphabet itself — after `base_path_prefix` and both
+    // ID-affecting hooks, and before its own `deduplicate_ids` — so the bridge
+    // applies no projection of its own and installs no hook.
     let mut scan_options = ScanOptions::new();
     scan_options.include = options.include.clone();
     scan_options.exclude = options.exclude.clone();
     scan_options.base_path_prefix = options.prefix.clone();
     scan_options.include_deprecated = options.include_deprecated;
-    scan_options.transform_module =
-        Some(Box::new(
-            move |module: ScannedModule| match project_module_id(&module.module_id) {
-                Some(projected) => Some(ScannedModule {
-                    module_id: projected,
-                    ..module
-                }),
-                None => {
-                    let lowered = module.module_id.to_ascii_lowercase().replace('-', "_");
-                    let bad = lowered
-                        .split('.')
-                        .find(|s| !is_legal_segment(s))
-                        .unwrap_or(&module.module_id)
-                        .to_string();
-                    if let Ok(mut guard) = skipped_hook.lock() {
-                        guard.push((module.module_id.clone(), bad));
-                    }
-                    None
-                }
-            },
-        ));
 
-    let modules = OpenAPIScanner::new()
+    let scanned = OpenAPIScanner::new()
         .scan(document, &scan_options)
         .await
         .map_err(|e| APCoreMCPError::Config(format!("mcp.openapi: {e}")))?;
 
-    if let Ok(guard) = skipped.lock() {
-        for (derived, segment) in guard.iter() {
-            tracing::warn!(
-                "OpenAPI operation skipped: derived module ID '{derived}' is not a legal apcore \
-                 module ID — the segment '{segment}' does not match \
-                 ^[a-z][a-z0-9_]*$. apcore's registry would refuse it. Supply a derive_module_id \
-                 or transform_module hook to name this operation yourself."
-            );
+    // --- Skip what apcore's registry would refuse (FR-OPENAPI-008) --------
+    // Normalisation cannot repair a segment that begins with a digit
+    // (`/v1/2fa` -> `v1.2fa.post`) or an empty ID from a hook; the scanner
+    // still emits such a module, with a legality warning. The check runs
+    // HERE, on the ID `scan` returned — never inside `transform_module`, which
+    // sees the ID before the toolkit's final normalisation (a `PetStore`
+    // prefix is still to be normalised there) — and before the preflight and
+    // the writer, so a skipped module never becomes a failed WriteResult. Its
+    // scan warnings, the toolkit's legality warning among them, are superseded
+    // by the one skip warning below.
+    let mut modules: Vec<ScannedModule> = Vec::with_capacity(scanned.len());
+    for module in scanned {
+        match illegal_segment(&module.module_id) {
+            None => modules.push(module),
+            Some(segment) => tracing::warn!(
+                "OpenAPI operation skipped: module ID '{}' is not a legal apcore module ID — the \
+                 segment '{segment}' does not match ^[a-z][a-z0-9_]*$. apcore's registry would \
+                 refuse it. Supply a derive_module_id or transform_module hook to name this \
+                 operation yourself.",
+                module.module_id
+            ),
         }
     }
     for module in &modules {
