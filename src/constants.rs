@@ -58,7 +58,7 @@ pub enum ErrorCode {
     ConfigEnvMapConflict,
     PipelineAbort,
     StepNotFound,
-    // New error codes introduced by apcore 0.19.0 (DECLARATIVE_CONFIG_SPEC §7.1
+    // New error codes introduced by apcore 0.19.0 (protocol-spec §5.12.8
     // and PROTOCOL_SPEC §5.3 / §5.15.2). Surfaced here for cross-SDK parity.
     DependencyNotFound,
     DependencyVersionMismatch,
