@@ -322,7 +322,9 @@ fn attach_ai_guidance(error: &ModuleError, resp: &mut McpErrorResponse) {
 /// Format schema validation field-level errors into a readable message.
 ///
 /// Extracts the `"errors"` array from details and formats each entry as
-/// `"field: message"`. Returns a fallback if no errors are present.
+/// `"location: message"`. A string JSON Pointer `path` takes precedence over
+/// the legacy `field`; an empty pointer is displayed as `<root>`.
+/// Returns a fallback if no errors are present.
 fn format_validation_errors(details: &std::collections::HashMap<String, Value>) -> String {
     let errors = match details.get("errors") {
         Some(Value::Array(arr)) => arr,
@@ -336,7 +338,11 @@ fn format_validation_errors(details: &std::collections::HashMap<String, Value>) 
     let lines: Vec<String> = errors
         .iter()
         .map(|e| {
-            let field = e.get("field").and_then(Value::as_str).unwrap_or("unknown");
+            let field = match e.get("path").and_then(Value::as_str) {
+                Some("") => "<root>",
+                Some(path) => path,
+                None => e.get("field").and_then(Value::as_str).unwrap_or("unknown"),
+            };
             let msg = e
                 .get("message")
                 .and_then(Value::as_str)
@@ -570,6 +576,50 @@ mod tests {
         assert!(resp.message.contains("name: required"));
         assert!(resp.message.contains("age: must be positive"));
         assert!(resp.details.is_some());
+    }
+
+    #[test]
+    fn test_schema_validation_json_pointer() {
+        for (entry, location) in [
+            (
+                serde_json::json!({"path": "/items/0/a~1b~0c", "keyword": "type", "message": "invalid"}),
+                "/items/0/a~1b~0c",
+            ),
+            (
+                serde_json::json!({"path": "", "keyword": "required", "message": "invalid"}),
+                "<root>",
+            ),
+            (
+                serde_json::json!({"path": "/", "keyword": "type", "message": "invalid"}),
+                "/",
+            ),
+            (
+                serde_json::json!({"path": null, "field": "legacy", "message": "invalid"}),
+                "legacy",
+            ),
+            (
+                serde_json::json!({"path": 42, "field": "legacy", "message": "invalid"}),
+                "legacy",
+            ),
+            (
+                serde_json::json!({"path": "/name", "field": "legacy", "keyword": "type", "message": "invalid"}),
+                "/name",
+            ),
+        ] {
+            let mut details = HashMap::new();
+            details.insert("errors".to_string(), serde_json::json!([entry]));
+            let err = make_error_with_details(
+                ApcoreErrorCode::SchemaValidationError,
+                "Validation failed",
+                details.clone(),
+            );
+            let resp = ErrorMapper::to_mcp_error(&err);
+            assert_eq!(
+                resp.message,
+                format!("Schema validation failed:\n  {location}: invalid")
+            );
+            assert_eq!(resp.details, Some(serde_json::to_value(details).unwrap()));
+        }
     }
 
     #[test]
