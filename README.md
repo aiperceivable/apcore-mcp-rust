@@ -661,3 +661,31 @@ cargo test                       # comprehensive test suite spanning unit + inte
 ## License
 
 Apache-2.0
+
+## Structured MCP results (0.23.0, pending publication)
+
+The common structured-output validation subset is Draft-07, Draft 2019-09 and
+Draft 2020-12 (default). Mixed-draft embedded schemas and other declared drafts
+are rejected rather than reinterpreted; repeating the same draft is allowed.
+Numeric JSON text is promoted only when parsing and serialization preserve its
+decimal value. Rounded/underflowed values return a payload-free error when an
+output schema is advertised, otherwise the original text remains unchanged.
+Runtime integer ranges differ; use JSON strings for portable arbitrary-size IDs.
+
+The development implementation negotiates MCP `2025-06-18`, preserves legacy
+`2024-11-05` and `2025-03-26`, advertises object `outputSchema` and returns redacted
+`structuredContent` together with JSON text. Results are validated after
+redaction against the raw advertised schema with its declared draft. Format
+keywords remain annotations; local definitions are resolved, while external
+HTTP/file retrieval is disabled. Schema failures discard result metadata as
+well as the payload. An advertised object schema requires a primary JSON object text
+result. Additional text and trace diagnostics remain intact. Stdio/SSE negotiation is session-scoped; stateless HTTP uses each
+request's `MCP-Protocol-Version` header and defaults to legacy when absent.
+Present unsupported or malformed protocol headers return HTTP 400 on POST,
+GET and DELETE. The Rust implementation supports `2024-11-05`, `2025-03-26`
+and `2025-06-18`;
+other initialize versions receive one of these supported alternatives. Native
+Python and TypeScript MCP SDKs can negotiate additional protocol revisions. Legacy
+responses omit structured fields even when a custom handler provides them.
+Authentication, approvals and executor governance retain their existing paths.
+The prepared 0.23.0 SDK and its corrected apcore dependency must be published before consumers can use these additions.

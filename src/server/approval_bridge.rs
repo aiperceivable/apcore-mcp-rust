@@ -25,6 +25,7 @@ impl ApprovalBridge {
 
     pub fn build_meta_tools() -> Vec<Tool> {
         vec![Tool {
+            output_schema: None,
             name: "__apcore_approval_check".to_string(),
             description: "Poll the status of a pending approval request. Returns \
                 {approval_id, status, reason}. status is 'pending', 'approved', or 'rejected'. \

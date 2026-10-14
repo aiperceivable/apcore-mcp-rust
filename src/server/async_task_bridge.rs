@@ -162,8 +162,10 @@ impl AsyncTaskBridge {
         // Match Python's case-insensitive comparison so YAML-round-tripped
         // hint values ("True", "TRUE", "TrUe") dispatch identically across
         // SDKs. [A-003 cross-lang fix]
-        let is_truthy_async_string =
-            |v: &Value| v.as_str().is_some_and(|s| s.eq_ignore_ascii_case("true"));
+        let is_truthy_async_string = |v: &Value| {
+            v.as_str()
+                .is_some_and(|s| s.trim().eq_ignore_ascii_case("true"))
+        };
         if let Some(v) = metadata.get("async") {
             if v.as_bool() == Some(true) || is_truthy_async_string(v) {
                 return true;
@@ -475,6 +477,7 @@ impl AsyncTaskBridge {
     pub fn build_meta_tools() -> Vec<Tool> {
         vec![
             Tool {
+            output_schema: None,
                 name: META_TOOL_SUBMIT.to_string(),
                 description:
                     "Submit a module for asynchronous execution via apcore's AsyncTaskManager."
@@ -496,6 +499,7 @@ impl AsyncTaskBridge {
                 meta: Some(json!({ "reserved": true })),
             },
             Tool {
+            output_schema: None,
                 name: META_TOOL_STATUS.to_string(),
                 description:
                     "Query the TaskInfo projection for a previously submitted task."
@@ -512,6 +516,7 @@ impl AsyncTaskBridge {
                 meta: Some(json!({ "reserved": true })),
             },
             Tool {
+            output_schema: None,
                 name: META_TOOL_CANCEL.to_string(),
                 description: "Cancel a pending or running async task.".to_string(),
                 input_schema: json!({
@@ -526,6 +531,7 @@ impl AsyncTaskBridge {
                 meta: Some(json!({ "reserved": true })),
             },
             Tool {
+            output_schema: None,
                 name: META_TOOL_LIST.to_string(),
                 description:
                     "List all tracked tasks, optionally filtered by status (pending/running/completed/failed/cancelled)."
@@ -544,6 +550,7 @@ impl AsyncTaskBridge {
                 meta: Some(json!({ "reserved": true })),
             },
             Tool {
+            output_schema: None,
                 name: META_TOOL_PREVIEW.to_string(),
                 description:
                     "Preview a module call: predict state changes, validate inputs, and \
@@ -1319,6 +1326,19 @@ mod tests {
     }
 
     // -- Issue D10-005: is_async_module_descriptor facade --------------------
+
+    #[test]
+    fn test_async_string_hints_trim_whitespace_for_both_sources() {
+        for (hint, expected) in [(" true ", true), ("\tTrUe\n", true), (" false ", false)] {
+            let metadata = HashMap::from([("async".into(), serde_json::json!(hint))]);
+            assert_eq!(AsyncTaskBridge::is_async_module(&metadata, None), expected);
+            let extra = HashMap::from([("mcp_async".into(), serde_json::json!(hint))]);
+            assert_eq!(
+                AsyncTaskBridge::is_async_module(&HashMap::new(), Some(&extra)),
+                expected
+            );
+        }
+    }
 
     #[test]
     fn is_async_module_descriptor_detects_async_in_metadata() {

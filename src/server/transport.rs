@@ -816,11 +816,45 @@ struct StreamableHttpState {
     session_id: String,
 }
 
+#[derive(Debug, thiserror::Error)]
+enum HttpProtocolError {
+    #[error("Unsupported MCP-Protocol-Version")]
+    UnsupportedVersion,
+}
+
+impl IntoResponse for HttpProtocolError {
+    fn into_response(self) -> axum::response::Response {
+        (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error":self.to_string()})),
+        )
+            .into_response()
+    }
+}
+
+/// Validate a protocol header consistently on every MCP HTTP method.
+fn http_protocol_version(headers: &axum::http::HeaderMap) -> Result<&str, HttpProtocolError> {
+    let version = match headers.get("mcp-protocol-version") {
+        None => "2025-03-26",
+        Some(value) => value.to_str().unwrap_or_default(),
+    };
+    if !matches!(version, "2024-11-05" | "2025-03-26" | "2025-06-18") {
+        return Err(HttpProtocolError::UnsupportedVersion);
+    }
+    Ok(version)
+}
+
 /// POST /mcp — accept a JSON-RPC request and return a JSON-RPC response.
 async fn streamable_http_post_handler(
     axum::extract::State(state): axum::extract::State<StreamableHttpState>,
-    axum::Json(body): axum::Json<Value>,
+    headers: axum::http::HeaderMap,
+    axum::Json(mut body): axum::Json<Value>,
 ) -> axum::response::Response {
+    let version = match http_protocol_version(&headers) {
+        Ok(version) => version,
+        Err(error) => return error.into_response(),
+    };
+    stamp_http_protocol(&mut body, version);
     match state.handler.handle_message(body).await {
         Some(response) => (
             StatusCode::OK,
@@ -850,7 +884,11 @@ async fn streamable_http_post_handler(
 /// prevented clients from receiving any server-initiated messages.
 async fn streamable_http_get_handler(
     axum::extract::State(state): axum::extract::State<StreamableHttpState>,
+    headers: axum::http::HeaderMap,
 ) -> axum::response::Response {
+    if let Err(error) = http_protocol_version(&headers) {
+        return error.into_response();
+    }
     use axum::response::sse::{Event, KeepAlive, Sse};
     use std::time::Duration;
 
@@ -889,8 +927,12 @@ async fn streamable_http_get_handler(
 /// DELETE /mcp — session termination.
 async fn streamable_http_delete_handler(
     axum::extract::State(_state): axum::extract::State<StreamableHttpState>,
-) -> StatusCode {
-    StatusCode::OK
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    if let Err(error) = http_protocol_version(&headers) {
+        return error.into_response();
+    }
+    StatusCode::OK.into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -1043,19 +1085,24 @@ struct SseMessageQuery {
 /// could name — and mass-cancel — another connection's tasks. The write is
 /// therefore an unconditional **overwrite**, never a default-if-absent.
 ///
-/// Messages whose `params` is absent or is not a JSON object are left alone:
-/// the handler reads `params._meta` by key, so such a message can neither
-/// carry a session id nor smuggle one in.
+/// Requests with absent `params` receive an empty object so list operations
+/// retain connection-scoped protocol negotiation. Malformed non-object params
+/// are left untouched for the handler to reject.
 fn stamp_session_id(message: &mut Value, session_id: &str) {
     let Some(object) = message.as_object_mut() else {
         return;
     };
-    let Some(params) = object.get_mut("params").and_then(Value::as_object_mut) else {
+    let Some(params) = object
+        .entry("params")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+    else {
         return;
     };
     match params.get_mut("_meta") {
         // Preserve sibling keys such as `progressToken`.
         Some(Value::Object(meta)) => {
+            meta.remove("mcpProtocolVersion");
             meta.insert(
                 "sessionId".to_string(),
                 Value::String(session_id.to_string()),
@@ -1069,6 +1116,28 @@ fn stamp_session_id(message: &mut Value, session_id: &str) {
                 serde_json::json!({ "sessionId": session_id }),
             );
         }
+    }
+}
+
+/// HTTP remains stateless and cannot elicit; only the request header controls
+/// result capabilities. Never accept a caller-supplied live session identity.
+fn stamp_http_protocol(message: &mut Value, version: &str) {
+    let Some(object) = message.as_object_mut() else {
+        return;
+    };
+    let Some(params) = object
+        .entry("params")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+    else {
+        return;
+    };
+    if !params.get("_meta").is_some_and(Value::is_object) {
+        params.insert("_meta".into(), serde_json::json!({}));
+    }
+    if let Some(meta) = params["_meta"].as_object_mut() {
+        meta.remove("sessionId");
+        meta.insert("mcpProtocolVersion".into(), serde_json::json!(version));
     }
 }
 
@@ -1846,6 +1915,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_http_protocol_header_rejects_invalid_values() {
+        use axum::body::Body;
+        use axum::http::{HeaderValue, Request};
+        use tower::ServiceExt;
+
+        let transport = Arc::new(TransportManager::new(None));
+        let app = transport.build_streamable_http_app(Arc::new(EchoHandler), None);
+        for header in [
+            HeaderValue::from_static("2099-01-01"),
+            HeaderValue::from_static(""),
+            HeaderValue::from_bytes(&[0xff]).unwrap(),
+        ] {
+            for method in ["POST", "GET", "DELETE"] {
+                let request = Request::builder()
+                    .method(method)
+                    .uri("/mcp")
+                    .header("content-type", "application/json")
+                    .header("mcp-protocol-version", header.clone())
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+                    ))
+                    .unwrap();
+                let response = app.clone().oneshot(request).await.unwrap();
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{method}");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn streamable_http_post_notification_returns_202() {
         use axum::body::Body;
         use axum::http::Request;
@@ -2269,17 +2367,36 @@ mod tests {
     }
 
     #[test]
-    fn stamp_session_id_leaves_a_message_without_object_params_untouched() {
-        // Nothing to stamp and nothing to smuggle: the handler reads
-        // `params._meta` by key, which neither shape can satisfy.
+    fn test_stamp_session_id_preserves_malformed_params_and_stamps_absent_params() {
         for mut message in [
-            serde_json::json!({ "method": "tools/list" }),
             serde_json::json!({ "method": "tools/list", "params": [1, 2] }),
+            serde_json::json!({ "method": "tools/list", "params": null }),
         ] {
             let before = message.clone();
             stamp_session_id(&mut message, "sess-1");
             assert_eq!(message, before);
         }
+        let mut message = serde_json::json!({"method":"tools/list"});
+        stamp_session_id(&mut message, "sess-1");
+        assert_eq!(message["params"]["_meta"]["sessionId"], "sess-1");
+    }
+
+    #[test]
+    fn test_protocol_metadata_is_transport_owned() {
+        let mut message = serde_json::json!({"method":"tools/call","params":{
+            "_meta":{"sessionId":"forged","mcpProtocolVersion":"2025-06-18","progressToken":"p"}}});
+        stamp_http_protocol(&mut message, "2025-03-26");
+        assert_eq!(
+            message["params"]["_meta"]["mcpProtocolVersion"],
+            "2025-03-26"
+        );
+        assert!(message["params"]["_meta"].get("sessionId").is_none());
+        stamp_session_id(&mut message, "real-session");
+        assert!(message["params"]["_meta"]
+            .get("mcpProtocolVersion")
+            .is_none());
+        assert_eq!(message["params"]["_meta"]["sessionId"], "real-session");
+        assert_eq!(message["params"]["_meta"]["progressToken"], "p");
     }
 
     #[tokio::test]
@@ -3150,6 +3267,7 @@ mod tests {
         let mut server = MCPServer::with_params("test", "stdio", "127.0.0.1", 0);
         server.list_tools_handler = Some(Arc::new(|| {
             vec![Tool {
+                output_schema: None,
                 name: "demo.gated".into(),
                 description: "needs approval".into(),
                 input_schema: serde_json::json!({"type": "object"}),

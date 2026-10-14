@@ -202,6 +202,7 @@ mod tests {
 
     fn make_test_tool(name: &str) -> Tool {
         Tool {
+            output_schema: None,
             name: name.to_string(),
             description: format!("Test tool {}", name),
             input_schema: json!({"type": "object", "properties": {}}),

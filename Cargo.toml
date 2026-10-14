@@ -1,6 +1,6 @@
 [package]
 name = "apcore-mcp"
-version = "0.22.3"
+version = "0.23.0"
 edition = "2021"
 description = "MCP bridge for apcore — expose apcore modules as MCP tools"
 license = "Apache-2.0"
@@ -22,12 +22,16 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 # Re-vetted against apcore 0.32.0 and apcore-toolkit 0.14.0.
-apcore = ">=0.32"
+apcore = ">=0.32.1"
 apcore-toolkit = ">=0.14"
 mcp-embedded-ui = "0.5"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["float_roundtrip"] }
+# MCP schema validation must reject external retrieval even when apcore enables it.
+jsonschema = { version = "0.28", default-features = false }
+# Inspect all schema references, including unused definitions, without retrieval.
+referencing = "0.28"
 schemars = "0.8"
 thiserror = "2"
 async-trait = "0.1"

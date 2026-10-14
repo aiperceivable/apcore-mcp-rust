@@ -2388,6 +2388,180 @@ mod tests {
         }
     }
 
+    struct ReferencedSensitiveModule {
+        draft_seven: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Module for ReferencedSensitiveModule {
+        fn input_schema(&self) -> Value {
+            json!({"type":"object"})
+        }
+        fn output_schema(&self) -> Value {
+            let definitions = if self.draft_seven {
+                "definitions"
+            } else {
+                "$defs"
+            };
+            let sensitive_ref = format!("#/{definitions}/Sensitive");
+            let child_ref = if self.draft_seven {
+                "child"
+            } else {
+                "child#scoped"
+            };
+            let mut child = json!({"$id":"child","$anchor":"scoped","type":"object",
+                "properties":{"value":{"$ref":sensitive_ref}}});
+            child[definitions] = json!({"Sensitive":{"type":"string","x-sensitive":true}});
+            let mut schema = json!({"type":"object","$id":"apcore://test/reference",
+                "properties":{"message":{"$ref":sensitive_ref},"payload":{"$ref":child_ref},
+                    "rows":{"type":"array","items":{"$ref":format!("#/{definitions}/Row")}},
+                    "public":{"type":"string"}}});
+            schema[definitions] = json!({"Sensitive":{"type":"string","x-sensitive":true},
+                "Child":child,"Row":{"type":"object","properties":{
+                    "message":{"$ref":sensitive_ref},"label":{"type":"string"}}}});
+            let prefix = json!([{"$ref":sensitive_ref},{"type":"string"}]);
+            schema["$schema"] = json!(if self.draft_seven {
+                "http://json-schema.org/draft-07/schema#"
+            } else {
+                "https://json-schema.org/draft/2020-12/schema"
+            });
+            schema["properties"]["positional"] = if self.draft_seven {
+                json!({"type":"array","items":prefix,"additionalItems":{"$ref":sensitive_ref}})
+            } else {
+                json!({"type":"array","prefixItems":prefix,"items":{"$ref":sensitive_ref}})
+            };
+            schema
+        }
+        fn description(&self) -> &str {
+            "Return referenced sensitive fields"
+        }
+        async fn execute(
+            &self,
+            _inputs: Value,
+            _context: &apcore::Context<Value>,
+        ) -> Result<Value, apcore::errors::ModuleError> {
+            Ok(
+                json!({"message":"reference-canary", "positional":["positional-reference-canary","visible","tail-reference-canary"], "payload":{"value":"scoped-reference-canary"}, "rows":[{"message":"nested-reference-canary","label":"visible"}],"public":"visible"}),
+            )
+        }
+    }
+
+    fn referenced_sensitive_http_app(draft_seven: bool) -> axum::Router {
+        let registry = Arc::new(Registry::new());
+        let module = ReferencedSensitiveModule { draft_seven };
+        let descriptor = ModuleDescriptor {
+            module_id: "demo.reference".into(),
+            name: None,
+            description: module.description().into(),
+            documentation: None,
+            input_schema: module.input_schema(),
+            output_schema: module.output_schema(),
+            version: "1.0.0".into(),
+            tags: vec![],
+            annotations: Some(ModuleAnnotations::default()),
+            examples: vec![],
+            metadata: std::collections::HashMap::new(),
+            display: None,
+            sunset_date: None,
+            dependencies: vec![],
+            enabled: true,
+        };
+        registry
+            .register("demo.reference", Box::new(module), descriptor)
+            .unwrap();
+        let executor = Arc::new(Executor::new(registry, Arc::new(Config::default())));
+        let mcp = APCoreMCP::builder()
+            .backend(BackendSource::Executor(executor))
+            .build()
+            .unwrap();
+        let (server, _, _, options, _, _) = mcp.build_server_components().unwrap();
+        let handler = ServerHandler::from_server(&server, options).unwrap();
+        Arc::new(TransportManager::new(None)).build_streamable_http_app(Arc::new(handler), None)
+    }
+
+    async fn referenced_sensitive_http_request(
+        app: &axum::Router,
+        version: &str,
+        method: &str,
+        params: Value,
+    ) -> Value {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .header("mcp-protocol-version", version)
+            .body(Body::from(
+                json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}).to_string(),
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_governed_mcp_redacts_referenced_sensitive_output() {
+        for draft_seven in [false, true] {
+            let app = referenced_sensitive_http_app(draft_seven);
+            for version in ["2024-11-05", "2025-03-26", "2025-06-18"] {
+                let initialize = referenced_sensitive_http_request(&app,version,"initialize",json!({
+                "protocolVersion":version,"capabilities":{},"clientInfo":{"name":"legacy-client","version":"1"}
+            })).await;
+                assert_eq!(initialize["result"]["protocolVersion"], version);
+                assert_eq!(
+                    initialize["result"]["serverInfo"]["version"],
+                    env!("CARGO_PKG_VERSION")
+                );
+                let listing =
+                    referenced_sensitive_http_request(&app, version, "tools/list", json!({})).await;
+                let tool = listing["result"]["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|tool| tool["name"] == "demo.reference")
+                    .unwrap();
+                assert_eq!(tool.get("outputSchema").is_some(), version == "2025-06-18");
+                let response = referenced_sensitive_http_request(
+                    &app,
+                    version,
+                    "tools/call",
+                    json!({
+                        "name":"demo.reference","arguments":{}
+                    }),
+                )
+                .await;
+                let result = &response["result"];
+                assert_eq!(result["isError"], false);
+                let text: Value =
+                    serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+                assert_eq!(text["message"], apcore::executor::REDACTED_VALUE);
+                assert_eq!(text["payload"]["value"], apcore::executor::REDACTED_VALUE);
+                assert_eq!(text["rows"][0]["message"], apcore::executor::REDACTED_VALUE);
+                assert_eq!(text["rows"][0]["label"], "visible");
+                assert_eq!(text["public"], "visible");
+                assert_eq!(
+                    text["positional"],
+                    json!([
+                        apcore::executor::REDACTED_VALUE,
+                        "visible",
+                        apcore::executor::REDACTED_VALUE
+                    ])
+                );
+                assert!(!response.to_string().contains("reference-canary"));
+                if version == "2025-06-18" {
+                    assert_eq!(result["structuredContent"], text);
+                } else {
+                    assert!(result.get("structuredContent").is_none());
+                }
+            }
+        }
+    }
+
     /// Create a test registry with the given modules.
     fn make_test_registry(modules: Vec<(&str, &str, Vec<String>)>) -> Registry {
         let registry = Registry::new();
@@ -3663,6 +3837,7 @@ mod tests {
 
     fn make_tool(name: &str) -> Tool {
         Tool {
+            output_schema: None,
             name: name.to_string(),
             description: format!("desc-{name}"),
             input_schema: json!({"type": "object"}),

@@ -3,6 +3,8 @@
 //! These are local Rust structs that mirror the MCP protocol specification.
 //! They can later be replaced by types from an official MCP SDK crate.
 
+mod json_precision;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -13,6 +15,8 @@ pub struct Tool {
     pub name: String,
     pub description: String,
     pub input_schema: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub annotations: Option<ToolAnnotations>,
     #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
@@ -65,21 +69,67 @@ impl TextContent {
     }
 }
 
+fn matches_output_schema(value: &Value, schema: &Value) -> bool {
+    if !super::schema_references::resolve_all_refs(schema) {
+        return false;
+    }
+    jsonschema::options()
+        .with_retriever(super::schema_references::LocalSchemaRetriever)
+        .should_validate_formats(false)
+        .build(schema)
+        .is_ok_and(|validator| validator.is_valid(value))
+}
+
 /// Result of a `call_tool` invocation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CallToolResult {
     pub content: Vec<TextContent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_content: Option<Value>,
     pub is_error: bool,
     #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
     pub meta: Option<Value>,
 }
 
 impl CallToolResult {
+    /// Add structured data from the already-redacted JSON text result.
+    /// A mismatch fails closed without exposing result values in diagnostics.
+    pub fn with_structured_content(mut self, schema: Option<&Value>) -> Self {
+        self.structured_content = None;
+        if self.is_error {
+            return self;
+        }
+        let value = self
+            .content
+            .first()
+            .filter(|item| item.content_type == "text")
+            .and_then(|item| {
+                let value = serde_json::from_str::<Value>(&item.text).ok()?;
+                json_precision::preserves_numeric_values(&item.text).then_some(value)
+            })
+            .filter(Value::is_object);
+        if let Some(schema) = schema {
+            let valid = value
+                .as_ref()
+                .is_some_and(|value| matches_output_schema(value, schema));
+            if !valid {
+                self.meta = None;
+                self.is_error = true;
+                self.content = vec![TextContent::new(
+                    "Output does not match the advertised output schema after redaction",
+                )];
+                return self;
+            }
+        }
+        self.structured_content = value;
+        self
+    }
     /// Create a minimal result from content + error flag (no `_meta`).
     pub fn new(content: Vec<TextContent>, is_error: bool) -> Self {
         Self {
             content,
+            structured_content: None,
             is_error,
             meta: None,
         }
@@ -164,8 +214,297 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn test_structured_content_preserves_text_and_checks_the_declared_schema() {
+        let text = r#"{"count":1}"#;
+        let result = CallToolResult::new(vec![TextContent::new(text)], false)
+            .with_structured_content(Some(&json!({"type":"object","properties":{"count":{"type":"integer"}},"required":["count"]})));
+        assert!(!result.is_error);
+        assert_eq!(result.structured_content, Some(json!({"count":1})));
+        assert_eq!(result.content[0].text, text);
+        let result = CallToolResult::new(vec![TextContent::new(text)], false)
+            .with_structured_content(Some(&json!({"type":"object","required":["missing"]})));
+        assert!(result.is_error);
+        assert!(result.structured_content.is_none());
+        assert!(!result.content[0].text.contains("count"));
+    }
+
+    #[test]
+    fn test_advertised_schema_requires_a_primary_json_object_result() {
+        let schema = json!({"type":"object"});
+        for content in [
+            vec![],
+            vec![TextContent::new("private formatted result")],
+            vec![TextContent::new("[1,2]")],
+        ] {
+            let result = CallToolResult::new(content, false).with_structured_content(Some(&schema));
+            assert!(result.is_error);
+            assert!(result.structured_content.is_none());
+            assert_eq!(result.content.len(), 1);
+            assert_eq!(
+                result.content[0].text,
+                "Output does not match the advertised output schema after redaction"
+            );
+        }
+    }
+
+    #[test]
+    fn test_structured_content_preserves_additional_trace_text() {
+        let content = vec![
+            TextContent::new(r#"{"count":1}"#),
+            TextContent::new("trace diagnostics"),
+        ];
+        let result = CallToolResult::new(content.clone(), false)
+            .with_structured_content(Some(&json!({"type":"object"})));
+        assert!(!result.is_error);
+        assert_eq!(result.structured_content, Some(json!({"count":1})));
+        assert_eq!(result.content.len(), content.len());
+        for (actual, expected) in result.content.iter().zip(&content) {
+            assert_eq!(actual.text, expected.text);
+            assert_eq!(actual.content_type, expected.content_type);
+        }
+    }
+
+    #[test]
+    fn test_output_schema_validates_raw_draft_and_local_references() {
+        let draft_seven = json!({"$schema":"http://json-schema.org/draft-07/schema#",
+            "type":"object", "properties":{"values":{"type":"array", "items":[{"type":"integer"}], "additionalItems":false}}});
+        assert!(matches_output_schema(&json!({"values":[1]}), &draft_seven));
+        assert!(!matches_output_schema(
+            &json!({"values":[1,2]}),
+            &draft_seven
+        ));
+        let definitions = json!({"type":"object", "$defs":{"count":{"type":"integer","minimum":2}},
+            "properties":{"count":{"$ref":"#/$defs/count"}}, "required":["count"]});
+        assert!(matches_output_schema(&json!({"count":2}), &definitions));
+        assert!(!matches_output_schema(&json!({"count":1}), &definitions));
+        let format =
+            json!({"type":"object","properties":{"contact":{"type":"string","format":"email"}}});
+        assert!(matches_output_schema(
+            &json!({"contact":"annotation only"}),
+            &format
+        ));
+    }
+
+    #[test]
+    fn test_output_schema_never_fetches_external_http_references() {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let requested = Arc::new(AtomicBool::new(false));
+        let observed = requested.clone();
+        let server = std::thread::spawn(move || {
+            for _ in 0..40 {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    observed.store(true, Ordering::SeqCst);
+                    stream
+                        .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+                        .unwrap();
+                    let mut buffer = [0; 1024];
+                    let _ = stream.read(&mut buffer);
+                    let body = r#"{"type":"integer"}"#;
+                    let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    let _ = stream.write_all(response.as_bytes());
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        });
+        let schema = json!({"type":"object","properties":{"count":{"$ref":format!("http://{address}/schema.json")}}});
+        let result = CallToolResult::new(vec![TextContent::new(r#"{"count":1}"#)], false)
+            .with_structured_content(Some(&schema));
+        server.join().unwrap();
+        assert!(result.is_error);
+        assert!(result.structured_content.is_none());
+        assert!(!requested.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_output_schema_never_reads_external_file_references() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), r#"{"type":"integer"}"#).unwrap();
+        let schema = json!({"type":"object","properties":{"count":{"$ref":format!("file://{}",file.path().display())}}});
+        assert!(!matches_output_schema(&json!({"count":1}), &schema));
+    }
+
+    #[test]
+    fn test_output_schema_mismatch_discards_only_success_result_metadata() {
+        let schema = json!({"type":"object","required":["missing"]});
+        let mut result = CallToolResult::new(vec![TextContent::new("{}")], false);
+        result.meta = Some(json!({"trace":"diagnostics"}));
+        let result = result.with_structured_content(Some(&schema));
+        assert!(result.is_error);
+        assert!(result.meta.is_none());
+        let mut error = CallToolResult::new(vec![TextContent::new("execution error")], true);
+        error.meta = Some(json!({"trace":"diagnostics"}));
+        assert_eq!(
+            error.with_structured_content(Some(&schema)).meta,
+            Some(json!({"trace":"diagnostics"}))
+        );
+    }
+
+    #[test]
+    fn test_output_schema_supports_only_common_dialects_and_canonical_aliases() {
+        for dialect in [
+            "http://json-schema.org/draft-03/schema#",
+            "http://json-schema.org/draft-04/schema#",
+            "http://json-schema.org/draft-06/schema#",
+        ] {
+            assert!(!matches_output_schema(
+                &json!({}),
+                &json!({"$schema":dialect,"type":"object"})
+            ));
+        }
+        for dialect in [
+            "http://json-schema.org/draft-07/schema",
+            "http://json-schema.org/draft-07/schema#",
+            "https://json-schema.org/draft/2019-09/schema",
+            "https://json-schema.org/draft/2019-09/schema#",
+            "https://json-schema.org/draft/2020-12/schema",
+            "https://json-schema.org/draft/2020-12/schema#",
+        ] {
+            let nested = dialect.trim_end_matches('#');
+            let schema = json!({"$schema":dialect,"type":"object","properties":{"child":{"$schema":nested,"type":"object"}}});
+            assert!(
+                matches_output_schema(&json!({"child":{}}), &schema),
+                "{dialect}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_output_schema_rejects_mixed_dialects_only_in_schema_positions() {
+        for dialect in [
+            "http://json-schema.org/draft-07/schema#",
+            "https://json-schema.org/draft/2019-09/schema",
+        ] {
+            let schema =
+                json!({"type":"object","$defs":{"unused":{"$id":"child", "$schema":dialect}}});
+            let result =
+                CallToolResult::new(vec![TextContent::new(r#"{"value":"canary"}"#)], false)
+                    .with_structured_content(Some(&schema));
+            assert!(result.is_error);
+            assert!(result.structured_content.is_none());
+            assert!(!serde_json::to_string(&result).unwrap().contains("canary"));
+        }
+        let schema = json!({"type":"object","$defs":{"unused":{"$schema":"https://json-schema.org/draft/2020-12/schema"}},
+            "default":{"$schema":"http://json-schema.org/draft-07/schema#"}});
+        assert!(matches_output_schema(&json!({"value":"visible"}), &schema));
+    }
+
+    #[test]
+    fn test_output_schema_rejects_unresolved_unused_local_references() {
+        for reference in ["#/$defs/Missing", "#missing"] {
+            let schema = json!({"type":"object","$defs":{"Unused":{"$ref":reference}}});
+            let result = CallToolResult::new(vec![TextContent::new("{}")], false)
+                .with_structured_content(Some(&schema));
+            assert!(result.is_error);
+            assert!(result.structured_content.is_none());
+        }
+    }
+
+    #[test]
+    fn test_output_schema_accepts_valid_unused_refs_and_literal_reference_data() {
+        let schema = json!({"type":"object","$defs":{
+            "Unused":{"$ref":"#/$defs/Existing"},"Existing":{"type":"string"}},
+            "properties":{"$ref":{"type":"string"},"public":{"type":"string"}},
+            "const":{"$ref":"literal","public":"visible"},
+            "default":{"$ref":"https://unavailable.invalid/data"},
+            "examples":[{"$ref":"#missing"}]});
+        let result = CallToolResult::new(
+            vec![TextContent::new(r#"{"$ref":"literal","public":"visible"}"#)],
+            false,
+        )
+        .with_structured_content(Some(&schema));
+        assert!(!result.is_error);
+        assert_eq!(
+            result.structured_content,
+            Some(json!({"$ref":"literal","public":"visible"}))
+        );
+    }
+
+    #[test]
+    fn test_structured_content_revalidation_clears_stale_payloads() {
+        let result = CallToolResult::new(vec![TextContent::new(r#"{"secret":"redacted"}"#)], false)
+            .with_structured_content(None)
+            .with_structured_content(Some(&json!({"type":"object","required":["missing"]})));
+        assert!(result.is_error);
+        assert!(result.structured_content.is_none());
+        assert!(!result.content[0].text.contains("secret"));
+    }
+
+    #[test]
+    fn test_structured_content_omits_errors_and_unstructured_values() {
+        for text in ["[1,2]", "42", "not JSON"] {
+            let result = CallToolResult::new(vec![TextContent::new(text)], false)
+                .with_structured_content(None);
+            assert!(result.structured_content.is_none());
+            assert_eq!(result.content[0].text, text);
+        }
+        let result = CallToolResult::new(vec![TextContent::new("{\"code\":\"DENIED\"}")], true)
+            .with_structured_content(None);
+        assert!(result.is_error);
+        assert!(result.structured_content.is_none());
+    }
+
+    #[test]
+    fn test_structured_content_rejects_numeric_value_loss_without_leaking_values() {
+        for text in [
+            r#"{"count":18446744073709551617}"#,
+            r#"{"count":0.10000000000000001}"#,
+            r#"{"count":1e-400}"#,
+        ] {
+            let original = CallToolResult::new(vec![TextContent::new(text)], false);
+            let text_only = original.clone().with_structured_content(None);
+            assert!(!text_only.is_error);
+            assert!(text_only.structured_content.is_none());
+            assert_eq!(text_only.content[0].text, text);
+            let invalid = original.with_structured_content(Some(&json!({"type":"object"})));
+            assert!(invalid.is_error);
+            assert!(invalid.structured_content.is_none());
+            assert!(!invalid.content[0].text.contains("count"));
+        }
+    }
+
+    #[test]
+    fn test_structured_content_preserves_exact_native_integer_and_decimal_forms() {
+        for text in [
+            r#"{"count":18446744073709551615}"#,
+            r#"{"count":0.1000000,"equivalent":10e-1}"#,
+        ] {
+            let result = CallToolResult::new(vec![TextContent::new(text)], false)
+                .with_structured_content(Some(&json!({"type":"object"})));
+            assert!(!result.is_error);
+            assert!(result.structured_content.is_some());
+            assert_eq!(result.content[0].text, text);
+        }
+    }
+
+    #[test]
+    fn test_structured_content_preserves_native_floating_point_results() {
+        for number in [
+            -4.0765893351549374e-163,
+            1.6176163832269587e274,
+            -1.7482232971272084e-9,
+            f64::MIN_POSITIVE,
+            f64::from_bits(1),
+        ] {
+            let original = json!({"value": number});
+            let text = serde_json::to_string(&original).unwrap();
+            let result = CallToolResult::new(vec![TextContent::new(&text)], false)
+                .with_structured_content(Some(&json!({"type":"object"})));
+            assert!(!result.is_error, "{text}");
+            assert_eq!(result.structured_content, Some(original));
+            assert_eq!(result.content[0].text, text);
+        }
+    }
+
+    #[test]
     fn test_tool_serializes_to_mcp_json() {
         let tool = Tool {
+            output_schema: None,
             name: "my_tool".to_string(),
             description: "A test tool".to_string(),
             input_schema: json!({"type": "object", "properties": {}}),
@@ -185,6 +524,7 @@ mod tests {
     #[test]
     fn test_tool_omits_none_fields() {
         let tool = Tool {
+            output_schema: None,
             name: "bare".to_string(),
             description: "Minimal".to_string(),
             input_schema: json!({}),
@@ -256,6 +596,7 @@ mod tests {
     #[test]
     fn test_call_tool_result_serialization() {
         let result = CallToolResult {
+            structured_content: None,
             content: vec![TextContent::new("result text")],
             is_error: false,
             meta: None,

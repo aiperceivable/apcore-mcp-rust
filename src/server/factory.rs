@@ -609,6 +609,9 @@ impl MCPServerFactory {
         };
 
         Ok(Tool {
+            output_schema: (descriptor.output_schema["type"] == "object"
+                && !AsyncTaskBridge::is_async_module_descriptor(descriptor))
+            .then(|| descriptor.output_schema.clone()),
             name: tool_name,
             description: enriched_description,
             input_schema,
@@ -794,10 +797,28 @@ impl MCPServerFactory {
         // back to the `AUTH_IDENTITY` task-local, which the middleware binds
         // around the whole request. So identity flows even when the transport
         // passes no `extra`, matching the peers' behaviour.
+        let output_schemas: HashMap<String, Value> = tools
+            .iter()
+            .filter_map(|tool| {
+                tool.output_schema
+                    .clone()
+                    .map(|schema| (tool.name.clone(), schema))
+            })
+            .collect();
+        let output_schemas = Arc::new(output_schemas);
         let router_clone = Arc::clone(&router);
         server.call_tool_handler = Some(Arc::new(move |name, arguments, extra| {
             let router = Arc::clone(&router_clone);
+            let output_schemas = Arc::clone(&output_schemas);
             Box::pin(async move {
+                let structured = extra
+                    .as_ref()
+                    .is_some_and(|extra| extra["mcpProtocolVersion"] == "2025-06-18")
+                    || extra
+                        .as_ref()
+                        .and_then(|extra| extra["sessionId"].as_str())
+                        .and_then(|id| router.session_registry().get(id))
+                        .is_some_and(|session| session.supports_structured_results());
                 let extra_ref = extra.as_ref();
                 let (content_items, is_error, trace_id) =
                     router.handle_call(&name, &arguments, extra_ref).await;
@@ -843,10 +864,16 @@ impl MCPServerFactory {
                 } else {
                     Some(Value::Object(meta_obj))
                 };
-                CallToolResult {
+                let result = CallToolResult {
+                    structured_content: None,
                     content: text_items,
                     is_error,
                     meta,
+                };
+                if structured {
+                    result.with_structured_content(output_schemas.get(&name))
+                } else {
+                    result
                 }
             })
         }));
@@ -1749,6 +1776,7 @@ mod tests {
         let mut server = factory.create_server("test", "1.0.0").unwrap();
         let tools = vec![
             Tool {
+                output_schema: None,
                 name: "tool.a".to_string(),
                 description: "A".to_string(),
                 input_schema: json!({}),
@@ -1756,6 +1784,7 @@ mod tests {
                 meta: None,
             },
             Tool {
+                output_schema: None,
                 name: "tool.b".to_string(),
                 description: "B".to_string(),
                 input_schema: json!({}),
@@ -2216,6 +2245,25 @@ mod tests {
             .build_tool(&desc, "desc", Some("custom-name"))
             .unwrap();
         assert_eq!(tool.name, "custom-name");
+    }
+
+    #[test]
+    fn test_build_tool_advertises_only_synchronous_object_output_schemas() {
+        let factory = make_factory();
+        let mut descriptor = make_descriptor("test.output", ModuleAnnotations::default());
+        descriptor.output_schema =
+            json!({"type":"object","properties":{"count":{"type":"integer"}}});
+        let tool = factory.build_tool(&descriptor, "Output", None).unwrap();
+        assert_eq!(tool.output_schema, Some(descriptor.output_schema.clone()));
+        descriptor.metadata.insert("async".into(), json!(true));
+        let tool = factory.build_tool(&descriptor, "Output", None).unwrap();
+        assert!(tool.output_schema.is_none());
+        descriptor.metadata.clear();
+        for schema in [json!({"type":"array"}), json!({})] {
+            descriptor.output_schema = schema;
+            let tool = factory.build_tool(&descriptor, "Output", None).unwrap();
+            assert!(tool.output_schema.is_none());
+        }
     }
 
     #[test]

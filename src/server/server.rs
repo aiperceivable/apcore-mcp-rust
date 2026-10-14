@@ -662,6 +662,46 @@ impl ServerHandler {
     /// Record the client's advertised capabilities against the session the
     /// `initialize` request arrived on.
     ///
+    fn valid_request_id(value: &Value) -> bool {
+        value.is_string() || value.is_i64() || value.is_u64()
+    }
+
+    fn request_error(message: &Value) -> Option<(i32, &'static str)> {
+        if !message.is_object()
+            || message["jsonrpc"] != "2.0"
+            || message
+                .get("id")
+                .is_some_and(|id| !Self::valid_request_id(id))
+        {
+            return Some((-32600, "Invalid Request: invalid JSON-RPC envelope"));
+        }
+        if message
+            .get("params")
+            .is_some_and(|params| !params.is_object())
+        {
+            return Some((-32602, "Invalid params: expected an object"));
+        }
+        None
+    }
+
+    fn negotiated_protocol(message: &Value) -> &'static str {
+        match message["params"]["protocolVersion"].as_str() {
+            Some("2024-11-05") => "2024-11-05",
+            Some("2025-03-26") => "2025-03-26",
+            _ => "2025-06-18",
+        }
+    }
+
+    fn supports_structured_results(&self, message: &Value) -> bool {
+        if message["params"]["_meta"]["mcpProtocolVersion"] == "2025-06-18" {
+            return true;
+        }
+        message["params"]["_meta"]["sessionId"]
+            .as_str()
+            .and_then(|id| self.session_registry.as_ref()?.get(id))
+            .is_some_and(|session| session.supports_structured_results())
+    }
+
     /// MCP declares client capabilities exactly once, in `initialize`, and a
     /// server must not send `elicitation/create` to a client that never
     /// advertised `elicitation`. The declaration is therefore remembered per
@@ -690,6 +730,7 @@ impl ServerHandler {
         let Some(session) = registry.get(session_id) else {
             return;
         };
+        session.set_structured_results(Self::negotiated_protocol(message) == "2025-06-18");
         session.set_client_capabilities(
             params
                 .get("capabilities")
@@ -707,6 +748,13 @@ impl crate::server::transport::McpHandler for ServerHandler {
 
     async fn handle_message(&self, message: Value) -> Option<Value> {
         let id = message.get("id").cloned();
+        if let Some((code, error)) = Self::request_error(&message) {
+            if id.is_none() && message["jsonrpc"] == "2.0" && message["method"].is_string() {
+                return None;
+            }
+            let response_id = id.filter(Self::valid_request_id).unwrap_or(Value::Null);
+            return Self::wrap_response(Some(response_id), Self::rpc_error(code, error));
+        }
 
         // Extract method — missing or non-string is an invalid request.
         let method =
@@ -744,23 +792,22 @@ impl crate::server::transport::McpHandler for ServerHandler {
                     "name": self.init_options.server_name,
                     "version": self.init_options.server_version
                 },
-                "protocolVersion": "2025-03-26"
+                "protocolVersion": Self::negotiated_protocol(&message)
                 }))
             }
             "tools/list" => {
                 let tools = (self.list_tools)();
+                let structured = self.supports_structured_results(&message);
                 let tools_json: Vec<Value> = tools
                     .iter()
-                    .map(|t| {
-                        let mut obj = serde_json::json!({
-                            "name": t.name,
-                            "description": t.description,
-                            "inputSchema": t.input_schema,
-                        });
-                        if let Some(ref ann) = t.annotations {
-                            obj["annotations"] = serde_json::to_value(ann).unwrap_or_default();
+                    .map(|tool| {
+                        let mut value = serde_json::to_value(tool).unwrap_or_default();
+                        if !structured {
+                            if let Some(object) = value.as_object_mut() {
+                                object.remove("outputSchema");
+                            }
                         }
-                        obj
+                        value
                     })
                     .collect();
                 RpcResult::Success(serde_json::json!({ "tools": tools_json }))
@@ -792,21 +839,11 @@ impl crate::server::transport::McpHandler for ServerHandler {
                     .cloned()
                     .unwrap_or(Value::Object(Default::default()));
                 let extra = params.get("_meta").cloned();
-                let call_result = (self.call_tool)(name, arguments, extra).await;
-                let content: Vec<Value> = call_result
-                    .content
-                    .iter()
-                    .map(|c| {
-                        serde_json::json!({
-                            "type": c.content_type,
-                            "text": c.text
-                        })
-                    })
-                    .collect();
-                RpcResult::Success(serde_json::json!({
-                    "content": content,
-                    "isError": call_result.is_error
-                }))
+                let mut call_result = (self.call_tool)(name, arguments, extra).await;
+                if !self.supports_structured_results(&message) {
+                    call_result.structured_content = None;
+                }
+                RpcResult::Success(serde_json::to_value(call_result).unwrap_or_default())
             }
             "resources/list" => {
                 if let Some(ref handler) = self.list_resources {
@@ -1331,6 +1368,7 @@ mod tests {
         let mut server = MCPServer::new(MCPServerConfig::default());
         server.list_tools_handler = Some(Arc::new(|| {
             vec![Tool {
+                output_schema: None,
                 name: "test-tool".to_string(),
                 description: "A test tool".to_string(),
                 input_schema: serde_json::json!({"type": "object"}),
@@ -1482,6 +1520,7 @@ mod tests {
         use std::pin::Pin;
         let list_tools: Arc<dyn Fn() -> Vec<Tool> + Send + Sync> = Arc::new(|| {
             vec![Tool {
+                output_schema: None,
                 name: "test.echo".into(),
                 description: "Echo test".into(),
                 input_schema: serde_json::json!({"type": "object"}),
@@ -1568,6 +1607,162 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("hello"));
+    }
+
+    #[tokio::test]
+    async fn test_custom_tool_results_preserve_metadata_and_legacy_text() {
+        use crate::server::transport::McpHandler;
+        let mut handler = make_test_handler();
+        handler.call_tool = Arc::new(|_, _, _| {
+            Box::pin(async {
+                let mut result =
+                    CallToolResult::new(vec![TextContent::new(r#"{"count":1}"#)], false)
+                        .with_structured_content(None);
+                result.meta = Some(serde_json::json!({"traceparent":"trace-token"}));
+                result
+            })
+        });
+        for version in ["2024-11-05", "2025-03-26", "2025-06-18"] {
+            let response = handler
+                .handle_message(serde_json::json!({
+                    "jsonrpc":"2.0", "id":1, "method":"tools/call",
+                    "params":{"name":"test.echo", "arguments":{},
+                        "_meta":{"mcpProtocolVersion":version}}
+                }))
+                .await
+                .unwrap();
+            let result = &response["result"];
+            assert_eq!(result["content"][0]["text"], r#"{"count":1}"#);
+            assert_eq!(result["_meta"]["traceparent"], "trace-token");
+            assert_eq!(
+                result.get("structuredContent").is_some(),
+                version == "2025-06-18"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_structured_negotiation_is_scoped_to_each_live_session() {
+        use crate::server::session::{McpSession, OutboundSink, SessionError, SessionRegistry};
+        use crate::server::transport::McpHandler;
+        struct NullSink;
+        #[async_trait::async_trait]
+        impl OutboundSink for NullSink {
+            async fn send(&self, _: Value) -> Result<(), SessionError> {
+                Ok(())
+            }
+        }
+        let registry = Arc::new(SessionRegistry::new());
+        let mut handler = make_test_handler();
+        handler.session_registry = Some(registry.clone());
+        for (id, version) in [("legacy", "2025-03-26"), ("modern", "2025-06-18")] {
+            registry.insert(Arc::new(McpSession::new(id, Arc::new(NullSink))));
+            handler
+                .handle_message(serde_json::json!({
+                    "jsonrpc":"2.0", "id":1, "method":"initialize", "params":{
+                        "protocolVersion":version, "capabilities":{}, "_meta":{"sessionId":id}}
+                }))
+                .await
+                .unwrap();
+        }
+        assert!(!handler.supports_structured_results(&serde_json::json!({
+            "params":{"_meta":{"sessionId":"legacy"}}
+        })));
+        assert!(handler.supports_structured_results(&serde_json::json!({
+            "params":{"_meta":{"sessionId":"modern"}}
+        })));
+        registry.remove("modern");
+        assert!(!handler.supports_structured_results(&serde_json::json!({
+            "params":{"_meta":{"sessionId":"modern"}}
+        })));
+    }
+
+    #[tokio::test]
+    async fn test_initialize_negotiates_supported_protocol_versions() {
+        use crate::server::transport::McpHandler;
+        let handler = make_test_handler();
+        for (requested, expected) in [
+            ("2024-11-05", "2024-11-05"),
+            ("2025-03-26", "2025-03-26"),
+            ("2025-06-18", "2025-06-18"),
+            ("2025-11-25", "2025-06-18"),
+            ("2099-01-01", "2025-06-18"),
+        ] {
+            let response = handler
+                .handle_message(serde_json::json!({
+                    "jsonrpc":"2.0", "id":1, "method":"initialize",
+                    "params":{"protocolVersion":requested,"capabilities":{}}
+                }))
+                .await
+                .unwrap();
+            assert_eq!(response["result"]["protocolVersion"], expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tool_output_schema_is_version_gated_and_metadata_preserved() {
+        use crate::server::transport::McpHandler;
+        let mut handler = make_test_handler();
+        let mut tool = (handler.list_tools)().remove(0);
+        tool.output_schema = Some(serde_json::json!({"type":"object"}));
+        tool.meta = Some(serde_json::json!({"custom":"metadata"}));
+        handler.list_tools = Arc::new(move || vec![tool.clone()]);
+        for version in ["2024-11-05", "2025-03-26", "2025-06-18"] {
+            let response = handler
+                .handle_message(serde_json::json!({
+                    "jsonrpc":"2.0", "id":1, "method":"tools/list",
+                    "params":{"_meta":{"mcpProtocolVersion":version}}
+                }))
+                .await
+                .unwrap();
+            let tool = &response["result"]["tools"][0];
+            assert_eq!(tool["_meta"]["custom"], "metadata");
+            assert_eq!(tool.get("outputSchema").is_some(), version == "2025-06-18");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_rejects_malformed_envelopes_and_object_params() {
+        use crate::server::transport::McpHandler;
+        let handler = make_test_handler();
+        for (request, code, expected_id) in [
+            (
+                serde_json::json!({"jsonrpc":"1.0","id":1,"method":"tools/list"}),
+                -32600,
+                serde_json::json!(1),
+            ),
+            (
+                serde_json::json!({"jsonrpc":"2.0","id":{},"method":"tools/list"}),
+                -32600,
+                Value::Null,
+            ),
+            (
+                serde_json::json!({"jsonrpc":"2.0","id":null,"method":"tools/list"}),
+                -32600,
+                Value::Null,
+            ),
+            (
+                serde_json::json!({"jsonrpc":"2.0","id":2,"method":"initialize","params":[]}),
+                -32602,
+                serde_json::json!(2),
+            ),
+            (
+                serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/list","params":[]}),
+                -32602,
+                serde_json::json!(3),
+            ),
+        ] {
+            let response = handler.handle_message(request).await.unwrap();
+            assert_eq!(response["error"]["code"], code);
+            assert_eq!(response["id"], expected_id);
+            assert!(response.get("result").is_none());
+        }
+        assert!(handler
+            .handle_message(serde_json::json!({
+                "jsonrpc":"2.0", "method":"notifications/initialized", "params":[]
+            }))
+            .await
+            .is_none());
     }
 
     #[tokio::test]

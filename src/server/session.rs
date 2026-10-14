@@ -118,6 +118,7 @@ pub struct McpSession {
     /// Absence is treated as "not supported": a client that never declared
     /// elicitation cannot be assumed to answer an elicitation request.
     client_capabilities: Mutex<Option<Value>>,
+    structured_results: Mutex<bool>,
     elicit_timeout: Duration,
 }
 
@@ -129,6 +130,7 @@ impl McpSession {
             sink,
             pending: Mutex::new(HashMap::new()),
             client_capabilities: Mutex::new(None),
+            structured_results: Mutex::new(false),
             elicit_timeout: DEFAULT_ELICIT_TIMEOUT,
         }
     }
@@ -147,6 +149,15 @@ impl McpSession {
     /// Record the `capabilities` object from the client's `initialize`.
     pub fn set_client_capabilities(&self, capabilities: Value) {
         *lock(&self.client_capabilities) = Some(capabilities);
+    }
+
+    /// Record support for structured results on this live connection.
+    pub fn set_structured_results(&self, supported: bool) {
+        *lock(&self.structured_results) = supported;
+    }
+
+    pub fn supports_structured_results(&self) -> bool {
+        *lock(&self.structured_results)
     }
 
     /// Whether the client advertised the `elicitation` capability.

@@ -20,3 +20,5 @@ pub mod types;
 pub use self::listener::RegistryListener;
 pub use self::server::{MCPServer, MCPServerConfig, RegistryOrExecutor, TransportKind};
 pub use self::session::{McpSession, OutboundSink, SessionError, SessionRegistry};
+
+mod schema_references;

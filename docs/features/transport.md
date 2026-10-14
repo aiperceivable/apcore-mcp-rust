@@ -41,6 +41,30 @@ the router needs for elicitation; see "Planned: migration to rmcp" below.
 - [ ] Disconnect deregisters the session and wakes anything awaiting an answer
 - [ ] Supports extra routes and middleware injection
 
+## Structured Protocol Negotiation (Unreleased)
+
+The server supports `2024-11-05`, `2025-03-26` and `2025-06-18`. An initialize
+request for one of these receives the same version. Newer or unknown requests
+receive `2025-06-18`, allowing the client to decide whether it supports that version.
+Stdio and SSE remember the negotiated version on each live session, with
+state removed on disconnect. Stateless HTTP uses the request's
+`MCP-Protocol-Version` header, defaults to `2025-03-26` when it is absent, and
+returns HTTP 400 for present malformed or unsupported versions on POST, GET,
+and DELETE. Python and TypeScript delegate version negotiation to their native
+MCP SDKs, which support additional revisions; the Rust supported set remains
+`2024-11-05`, `2025-03-26` and `2025-06-18`. A different supported fallback is valid when the
+requested revision is not implemented.
+
+Transport-injected protocol and session metadata cannot be supplied by the
+client. HTTP never accepts a caller-supplied session identity or acquires
+elicitation support from a forged metadata object.
+
+- [ ] Preserve the legacy response format on old connections and headerless HTTP requests
+- [ ] Negotiate structured results independently for each live stdio/SSE session
+- [ ] Reject unsupported or malformed HTTP protocol headers on all MCP endpoint methods
+- [ ] Reject malformed JSON-RPC request versions, identifiers and non-object params before dispatch
+- [ ] Ignore caller-supplied protocol/session metadata in favor of transport state
+
 ## Planned: migration to rmcp
 
 **Decision (2026-08-17): this crate will move its transport layer onto the

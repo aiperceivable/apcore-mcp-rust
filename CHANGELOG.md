@@ -8,6 +8,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-10-14
+
+Prepared locally; publish after apcore 0.32.1 is available and the dependency floor is raised to that release.
+
+### Added
+
+- Optional object `Tool.output_schema` and `CallToolResult.structured_content`.
+  Structured results retain their redacted serialized JSON text and validate
+  against the advertised output schema after redaction. Mismatches return a
+  payload-free tool error. Async task submissions do not advertise final schemas.
+- Negotiate MCP `2025-06-18`, retaining `2024-11-05` and `2025-03-26` for legacy clients.
+  Stdio/SSE remember capabilities per live session; stateless HTTP selects them
+  per `MCP-Protocol-Version` header and defaults to the legacy format when absent.
+
+### Fixed
+
+- Preserve result/tool metadata on the JSON-RPC wire.
+- Omit custom-handler structured results on the legacy wire and reject malformed
+  or unsupported HTTP protocol headers on POST, GET and DELETE instead of treating them as absent.
+- Reject malformed JSON-RPC envelopes and non-object request parameters before dispatch.
+- Trim async string hints before comparison, matching Python whitespace handling.
+- Validate exact advertised output schemas using their declared draft and a local-only
+  retriever, rejecting unresolved references even in unused schema branches without
+  network or file access. Embedded mixed-dialect schemas fail closed; opaque literal
+  data remains accepted. Format remains an annotation and schema failures discard
+  result metadata and stale payloads.
+- Stamp session identity on parameterless list requests; transport-owned
+  negotiation metadata cannot be forged by a client or enable HTTP elicitation.
+
+- Preserve exact JSON number values when constructing structured content; reject precision-losing values instead of returning a different payload.
+- Reject mixed or unsupported schema dialects during local-only reference validation.
+
+### Compatibility
+
+- New JSON fields are omitted for legacy clients. Existing text results,
+  transports, authentication and execution/approval governance are retained.
+- Rust code constructing `Tool` or `CallToolResult` with a struct literal must
+  initialize the new optional field to `None`; plan this API addition for the
+  0.23.0 minor SDK release rather than a patch release.
+
 ## [0.22.3] - 2026-10-09
 
 ### Changed
