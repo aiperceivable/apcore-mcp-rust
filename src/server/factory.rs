@@ -12,7 +12,6 @@ use apcore::module::ModuleAnnotations;
 use apcore::registry::{ModuleDescriptor, Registry};
 
 use crate::adapters::annotations::{AnnotationMapper, McpAnnotations};
-use crate::adapters::schema::SchemaConverter;
 use crate::server::async_task_bridge::AsyncTaskBridge;
 use crate::server::router::ExecutionRouter;
 use crate::server::server::{FactoryError, MCPServer, MCPServerConfig};
@@ -413,8 +412,6 @@ impl ToolAnnotationBuilder {
 /// Factory for constructing [`MCPServer`] instances from a registry and executor.
 pub struct MCPServerFactory {
     #[allow(dead_code)]
-    schema_converter: SchemaConverter,
-    #[allow(dead_code)]
     annotation_mapper: AnnotationMapper,
     /// When `true`, MCP `Tool.description` is rendered as canonical
     /// apcore-toolkit Markdown (title, description, parameters,
@@ -436,7 +433,6 @@ impl MCPServerFactory {
     /// Create a new factory with default components.
     pub fn new() -> Self {
         Self {
-            schema_converter: SchemaConverter,
             annotation_mapper: AnnotationMapper,
             rich_description: false,
         }
@@ -447,7 +443,6 @@ impl MCPServerFactory {
     /// rationale.
     pub fn with_rich_description(rich_description: bool) -> Self {
         Self {
-            schema_converter: SchemaConverter,
             annotation_mapper: AnnotationMapper,
             rich_description,
         }
@@ -518,7 +513,7 @@ impl MCPServerFactory {
     /// Mapping:
     /// - `name_override` (if provided) or `descriptor.name` -> `Tool.name`
     /// - `description` + AI intent metadata from `descriptor.metadata` -> `Tool.description`
-    /// - `SchemaConverter::convert_input_schema` -> `Tool.inputSchema`
+    /// - descriptor input schema -> independent MCP input schema copy
     /// - `AnnotationMapper::to_mcp_annotations` -> `Tool.annotations`
     /// - `requires_approval` / `streaming` flags -> `Tool._meta`
     pub fn build_tool(
@@ -530,20 +525,9 @@ impl MCPServerFactory {
         self.build_tool_with_registry(descriptor, description, name_override, None)
     }
 
-    /// `build_tool` variant that, in a future apcore release, will be able
-    /// to prefer `registry.export_schema_strict(name, true)` for the
-    /// input schema (Strict Schema Sourcing per `mcp-server-factory.md`).
-    ///
-    /// **Status (apcore 0.19.0):** the `Registry::export_schema_strict`
-    /// method has been added to `apcore-rust` HEAD but has not yet shipped
-    /// in a released version. While the dep stays at `apcore = "0.19"`,
-    /// this variant always falls through to the local `SchemaConverter`,
-    /// matching the per-SDK status documented in
-    /// `mcp-server-factory.md` "Strict Schema Sourcing" → Rust row.
-    ///
-    /// When apcore 0.20+ ships, the body of this method will switch to
-    /// `registry.export_schema_strict(&descriptor.module_id, true)` and
-    /// drop the local-only path. [A-D-012]
+    /// Build a tool while retaining the registry argument for compatibility.
+    /// MCP input schemas preserve the descriptor's runtime contract; the
+    /// registry's OpenAI strict export is deliberately not used.
     pub fn build_tool_with_registry(
         &self,
         descriptor: &ModuleDescriptor,
@@ -562,12 +546,47 @@ impl MCPServerFactory {
             ));
         }
 
-        // [A-D-012] [D11-011] Strict Schema Sourcing: pending apcore 0.20 release.
-        // TODO(apcore 0.20): Try registry.export_schema_strict() first (see
-        // Python/TS factory). Currently always falls through to local SchemaConverter.
-        // Python+TS try `registry.export_schema(strict=True)` first; Rust always
-        // uses the local SchemaConverter until the apcore 0.20 API ships.
-        let input_schema = SchemaConverter::convert_input_schema(&descriptor.input_schema)?;
+        // Preserve optionality, defaults, explicit nullability, references and
+        // free-form objects. Only the MCP-required object root is normalized.
+        let mut input_schema = descriptor.input_schema.clone();
+        if input_schema.is_null() || input_schema.as_object().is_some_and(|map| map.is_empty()) {
+            input_schema = serde_json::json!({"properties": {}});
+        }
+        let allows_object = match input_schema.get("type") {
+            None => true,
+            Some(Value::String(kind)) => kind == "object",
+            Some(Value::Array(types)) => {
+                types.iter().any(|kind| kind.as_str() == Some("object"))
+                    && types.iter().all(|kind| {
+                        kind.as_str().is_some_and(|kind| {
+                            matches!(
+                                kind,
+                                "object"
+                                    | "array"
+                                    | "string"
+                                    | "number"
+                                    | "integer"
+                                    | "boolean"
+                                    | "null"
+                            )
+                        })
+                    })
+                    && types
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<std::collections::HashSet<_>>()
+                        .len()
+                        == types.len()
+            }
+            _ => false,
+        };
+        if !allows_object {
+            return Err("MCP input schema must allow an object root".into());
+        }
+        input_schema
+            .as_object_mut()
+            .ok_or("MCP input schema must be an object")?
+            .insert("type".into(), Value::String("object".into()));
 
         // Map annotations
         let mcp_ann = AnnotationMapper::to_mcp_annotations(descriptor.annotations.as_ref());
@@ -723,8 +742,7 @@ impl MCPServerFactory {
                 None => description,
             };
 
-            // [A-D-012] Pass the registry through so the strict-schema
-            // sourcing path can prefer registry.export_schema_strict(true).
+            // Keep tool construction on the descriptor's runtime schema.
             match self.build_tool_with_registry(
                 &descriptor,
                 &description,
@@ -2569,21 +2587,37 @@ mod tests {
         ));
     }
 
-    // -- Issue D11-011: build_tool_with_registry uses local SchemaConverter ---
+    // -- MCP input contract: registry exports cannot narrow runtime schemas --
 
     #[test]
-    fn test_build_tool_with_registry_uses_local_schema_converter() {
-        // [D11-011] Verify build_tool_with_registry always uses local SchemaConverter
-        // (not registry.export_schema_strict). This is the documented known limitation
-        // until apcore 0.20 ships. The resulting schema must be a valid object schema.
+    fn test_build_tool_with_registry_preserves_runtime_schema() {
+        // The compatibility registry argument never enables OpenAI projection.
         let factory = make_factory();
         let desc = make_descriptor("test.module", ModuleAnnotations::default());
         let tool = factory
             .build_tool_with_registry(&desc, "test description", None, None)
             .unwrap();
-        // Schema must be valid object type (SchemaConverter result)
+        // The copied runtime schema remains an MCP object schema.
         assert_eq!(tool.input_schema["type"], "object");
         assert!(tool.input_schema.get("properties").is_some());
+    }
+
+    #[test]
+    fn test_mcp_rejects_malformed_input_schema_without_panicking() {
+        for schema in [
+            serde_json::json!([]),
+            serde_json::json!(["invalid"]),
+            serde_json::json!(true),
+            serde_json::json!(42),
+        ] {
+            let mut descriptor = make_descriptor("demo.echo", ModuleAnnotations::default());
+            descriptor.input_schema = schema;
+            let result = make_factory().build_tool(&descriptor, "Malformed schema", None);
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("MCP input schema must be an object"));
+        }
     }
 
     // -- Issue D11-012: call_tool extra identity is forwarded -----------------

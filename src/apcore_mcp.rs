@@ -4949,3 +4949,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "input_contract_tests.rs"]
+mod input_contract_tests;

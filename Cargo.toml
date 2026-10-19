@@ -1,6 +1,6 @@
 [package]
 name = "apcore-mcp"
-version = "0.23.0"
+version = "0.23.1"
 edition = "2021"
 description = "MCP bridge for apcore — expose apcore modules as MCP tools"
 license = "Apache-2.0"
@@ -22,7 +22,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 # Re-vetted against apcore 0.32.0 and apcore-toolkit 0.14.0.
-apcore = ">=0.32.1"
+apcore = ">=0.32.2"
 apcore-toolkit = ">=0.14"
 mcp-embedded-ui = "0.5"
 tokio = { version = "1", features = ["full"] }
