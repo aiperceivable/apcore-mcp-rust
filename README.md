@@ -60,7 +60,13 @@ cargo add apcore-mcp
 cargo install apcore-mcp
 ```
 
-Requires Rust 1.75+ and `apcore >= 0.32` + `apcore-toolkit >= 0.14`. 0.13 is the toolkit floor because the OpenAPI backend registers the module IDs its `OpenAPIScanner` emits, and only 0.13+ emits them in apcore's Canonical ID alphabet.
+Requires Rust 1.86+ and `apcore >= 0.32.2` + `apcore-toolkit >= 0.14`. The OpenAPI backend registers the module IDs emitted by `OpenAPIScanner`; toolkit 0.13 introduced the required Canonical ID normalization.
+
+Complete stdio shutdown draining of core invocations after timeout/cancellation
+requires `apcore >= 0.32.3`. The `0.32.2` compatibility fallback preserves stdout
+isolation and bridge-owned callback/sweep cleanup, but cannot join late core
+module execution. See [stdio stdout ownership](docs/features/transport.md#stdio-stdout-ownership)
+for the process and platform boundaries.
 
 ## Quick Start
 

@@ -6,6 +6,58 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.23.2] - 2026-10-25
+
+### Fixed
+
+- Reserve real stdio stdout for JSON-RPC throughout Config Bus/backend bootstrap,
+  server setup, request handling and shutdown. Route ordinary stdout, retained
+  stdout tracing subscribers and lifecycle diagnostics to stderr; CLI logging
+  also uses stderr. Nested serving layers share ownership, while independent
+  concurrent stdio transports fail explicitly.
+- Retain the transport claim through actual blocking writes and flushes. Once a
+  JSON-RPC frame starts writing, cancellation cannot truncate it or allow a later
+  session to interleave bytes while the original pipe remains backpressured.
+- Fail closed when buffered diagnostic output cannot be flushed or stdout cannot
+  be restored. Keep ownership reserved so a later session cannot flush retained
+  diagnostic bytes into its protocol stream.
+- Wait for bridge-owned disconnect/cancellation callbacks and approval-store sweep
+  cleanup before restoring stdout. Retain output ownership through late core
+  invocation cleanup when supported by apcore, including when the serving future
+  is dropped. Executor timeout responses remain prompt.
+- Preserve ordinary HTTP/SSE output and independent stdio availability during
+  successful live HTTP serving. CLI help and injected `run_stdio_with_io` streams
+  retain their existing output behavior.
+
+### Compatibility
+
+- Keep the published dependency floor at `apcore >= 0.32.2`. Complete draining of
+  actual core invocations after timeout/cancellation requires `apcore >= 0.32.3`;
+  the 0.32.2 fallback covers bridge-owned callbacks and sweep tasks but cannot
+  track or join late core module execution. The enhanced path is validated
+  against the local 0.32.3 core; that core release is not yet on crates.io at
+  preparation time.
+- Existing public APIs, server-version overrides and JSON-RPC payloads remain
+  compatible.
+- Unix isolation redirects descriptor 1; Windows isolation redirects the Win32
+  standard output handle. Separately cached native/CRT handles and caller-owned
+  detached work remain outside the serving lifetime boundary.
+
+### Tests
+
+- Add real subprocess checks for lifecycle/module/subscriber diagnostics, full
+  JSON frames across cancellation and pipe backpressure, diagnostic flush and
+  restoration failures, cooperative cleanup and bridge-owned background tasks.
+- Verify successful live HTTP/SSE responses, runtime stdout diagnostics and
+  independent stdio acquisition while the HTTP listener remains active.
+- Full suite against published apcore 0.32.2 and local apcore 0.32.3: 1156
+  passed, 0 failed and 1 pre-existing ignored doc test in each configuration.
+  Build and all-targets Clippy with warnings denied passed against the published
+  minimum; CLI initialization advertises package version 0.23.2 by default.
+- Runtime validation was performed on macOS. Windows handle-routing and
+  restoration tests are configured in CI but were not run locally.
+
+
 ## [0.23.1] - 2026-10-19
 
 ### Fixed — MCP object root validation

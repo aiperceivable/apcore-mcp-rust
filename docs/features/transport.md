@@ -79,9 +79,9 @@ future signals its owned request tokens and retains stdout ownership until
 their cleanup finishes. A module that ignores cooperative cancellation may
 therefore keep shutdown waiting; a reported timeout does not force termination.
 
-The complete async execution guarantee requires the accompanying unreleased
-apcore Rust execution-draining fix. Published apcore 0.32.2 does not expose
-`CancelToken::drain` or track spawned module lifetimes. This bridge continues
+The complete async execution guarantee requires apcore >= 0.32.3, which adds
+execution draining and tracks spawned module lifetimes. Published apcore 0.32.2
+does not expose `CancelToken::drain`. This bridge continues
 to compile against that declared minimum using a private compatibility
 fallback; synchronous output isolation and sweep/callback ownership work,
 but late module execution cannot be fully drained on the old core. Validation
