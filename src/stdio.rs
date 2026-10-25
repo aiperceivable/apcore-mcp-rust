@@ -794,6 +794,88 @@ mod tests {
         }
     }
 
+    #[test]
+    fn live_http_transports_keep_runtime_output_and_independent_stdio_ownership() {
+        const CHILD: &str = "APCORE_LIVE_HTTP_OUTPUT_TEST";
+        if let Ok(transport) = std::env::var(CHILD) {
+            struct Handler;
+            #[async_trait::async_trait]
+            impl crate::server::transport::McpHandler for Handler {
+                async fn handle_message(&self, _: serde_json::Value) -> Option<serde_json::Value> {
+                    None
+                }
+            }
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+                    let extra = axum::Router::new().route("/host-output", axum::routing::get(|| async {
+                        writeln!(io::stdout(), "live-http-runtime-ordinary").unwrap();
+                        "live-response"
+                    }));
+                    let manager = Arc::new(crate::TransportManager::new(None));
+                    let server = tokio::spawn(async move {
+                        if transport == "streamable-http" {
+                            manager.run_streamable_http(Arc::new(Handler), "127.0.0.1", port, Some(extra)).await
+                        } else {
+                            #[allow(deprecated)]
+                            manager.run_sse(Arc::new(Handler), "127.0.0.1", port, Some(extra)).await
+                        }
+                    });
+                    let mut client = loop {
+                        assert!(!server.is_finished(), "HTTP server exited before listening");
+                        if let Ok(client) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await { break client; }
+                        tokio::task::yield_now().await;
+                    };
+                    // A separate host task has no server task-local CURRENT.
+                    // The listener must leave process stdout unclaimed while live.
+                    tokio::spawn(async {
+                        scope(true, async {
+                            writeln!(io::stdout(), "independent-stdio-diagnostic").unwrap();
+                        }).await.unwrap();
+                    }).await.unwrap();
+                    assert!(!server.is_finished());
+                    client.write_all(b"GET /host-output HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").await.unwrap();
+                    let mut response = String::new();
+                    client.read_to_string(&mut response).await.unwrap();
+                    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+                    assert!(response.ends_with("live-response"), "{response}");
+                    server.abort();
+                    assert!(server.await.unwrap_err().is_cancelled());
+                    assert!(!OWNED.load(Ordering::Acquire));
+                }).await.expect("live HTTP transport test timed out");
+            });
+            return;
+        }
+        for transport in ["streamable-http", "sse"] {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "stdio::tests::live_http_transports_keep_runtime_output_and_independent_stdio_ownership", "--nocapture"])
+                .env(CHILD, transport).output().unwrap();
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert!(
+                output.status.success(),
+                "{transport}: stdout={stdout}; stderr={stderr}"
+            );
+            assert!(
+                stdout.contains("live-http-runtime-ordinary"),
+                "{transport}: {stdout}"
+            );
+            assert!(
+                !stderr.contains("live-http-runtime-ordinary"),
+                "{transport}: {stderr}"
+            );
+            assert!(
+                !stdout.contains("independent-stdio-diagnostic"),
+                "{transport}: {stdout}"
+            );
+            assert!(
+                stderr.contains("independent-stdio-diagnostic"),
+                "{transport}: {stderr}"
+            );
+        }
+    }
+
     /// Descriptor mutation belongs in a subprocess; the Rust test harness runs
     /// unrelated tests concurrently and owns its own stdout capture machinery.
     #[test]
