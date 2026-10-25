@@ -379,9 +379,17 @@ impl TransportManager {
     ///
     /// Reads line-delimited JSON-RPC from stdin and writes responses to stdout.
     pub async fn run_stdio(&self, handler: &dyn McpHandler) -> Result<(), TransportError> {
-        tracing::info!("Starting stdio transport");
-        self.run_stdio_with_io(tokio::io::stdin(), tokio::io::stdout(), handler)
+        crate::stdio::scope(true, async {
+            let (writer, _claim) = crate::stdio::protocol_writer()?;
+            tracing::info!("Starting stdio transport");
+            self.run_stdio_with_io(
+                tokio::io::stdin(),
+                tokio::fs::File::from_std(writer),
+                handler,
+            )
             .await
+        })
+        .await?
     }
 
     /// Testable core of `run_stdio` — reads from any `AsyncRead`, writes to any `AsyncWrite`.

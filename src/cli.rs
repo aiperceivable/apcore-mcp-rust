@@ -100,6 +100,7 @@ pub fn init_tracing(level: &LogLevel) {
 
     fmt()
         .with_env_filter(filter)
+        .with_writer(std::io::stderr)
         .with_target(true)
         .with_thread_ids(false)
         .with_file(false)
@@ -406,6 +407,12 @@ fn transport_to_str(t: &Transport) -> &'static str {
 pub async fn run() -> Result<(), CliError> {
     let args = CliArgs::parse();
 
+    crate::stdio::scope(args.transport == Transport::Stdio, run_with_args(args))
+        .await
+        .map_err(|error| CliError::StartupFailure(error.to_string()))?
+}
+
+async fn run_with_args(args: CliArgs) -> Result<(), CliError> {
     // Initialise tracing first so all subsequent log calls work.
     init_tracing(&args.log_level);
 

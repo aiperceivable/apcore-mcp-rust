@@ -41,6 +41,73 @@ the router needs for elicitation; see "Planned: migration to rmcp" below.
 - [ ] Disconnect deregisters the session and wakes anything awaiting an answer
 - [ ] Supports extra routes and middleware injection
 
+## Stdio stdout ownership
+
+The real stdio entry points reserve process stdout exclusively for MCP. They
+duplicate the original stdout for protocol writes and redirect ordinary stdout
+to stderr until startup, request handling, EOF draining and shutdown callbacks
+finish. This includes application `println!`, apcore's `StdoutSubscriber` and
+tracing subscribers configured by an embedding application to use stdout. The
+CLI also configures its own tracing subscriber to write to stderr on all
+transports. CLI help still uses stdout before serving begins. The existing
+`--version <VERSION>` option sets the advertised server version.
+
+The CLI acquires ownership before backend bootstrap. The free `serve` function
+acquires it before constructing the bridge; instance `serve*` methods acquire
+it before constructing server components. Output emitted by the caller before
+entering these functions, including building an instance itself, remains the
+caller's responsibility. `TransportManager::run_stdio` protects its transport
+lifetime. `run_stdio_with_io` and explicitly selected HTTP/SSE transports leave
+process streams unchanged. When the convenience function initially defaults
+to stdio, it also protects Config Bus discovery until the effective transport
+is known, then releases that temporary scope before starting HTTP/SSE.
+
+Nested serving layers reuse their scope. An unrelated concurrent stdio server
+or a second transport within the same scope returns an ownership error instead
+of interleaving protocol streams. Normal completion and errors restore stdout;
+RAII also restores it when the serving future is cancelled or unwinds. A normal
+restoration failure is returned as an I/O error. Drop cannot return errors, so
+it reports a failure on stderr and keeps ownership reserved if stdout could
+not be restored. An unrecoverable restoration failure retains the saved
+capture instead of closing a Windows handle that is still installed as stdout.
+
+Server-owned disconnect callbacks, async task cancellation and approval-store
+sweep tasks finish before normal stdout restoration. Request tokens retain
+late module execution after a timeout response; the response remains prompt,
+while server shutdown waits for actual cooperative cleanup. Dropping a serving
+future signals its owned request tokens and retains stdout ownership until
+their cleanup finishes. A module that ignores cooperative cancellation may
+therefore keep shutdown waiting; a reported timeout does not force termination.
+
+The complete async execution guarantee requires the accompanying unreleased
+apcore Rust execution-draining fix. Published apcore 0.32.2 does not expose
+`CancelToken::drain` or track spawned module lifetimes. This bridge continues
+to compile against that declared minimum using a private compatibility
+fallback; synchronous output isolation and sweep/callback ownership work,
+but late module execution cannot be fully drained on the old core. Validation
+of the enhanced guarantee uses a Cargo `patch.crates-io.apcore.path` override
+to the fixed core checkout, with no checkout-specific path in this manifest.
+
+On Unix this redirects descriptor 1, including native writes and inherited
+child stdout. On Windows it redirects the Win32 standard output handle used by
+Rust stdio, retaining an owned stderr duplicate and the borrowed original
+handle through restoration. It does not rewrite separate CRT descriptors or
+handles cached before entry. The Windows CI job is configured to exercise this
+path; it has not been run as part of local macOS validation.
+On either platform, code that explicitly retained a separate duplicate of the
+original protocol stream can bypass redirection. Detached tasks must finish
+before the serving lifetime ends; output after restoration follows ordinary
+stdout again. These are process ownership boundaries, not a sandbox for
+arbitrary native code.
+
+`cargo run --example stdio_noise` provides an adversarial fixture with
+`stdio_noise`, `stdio_error`, `stdio_wait` and `stdio_cooperative` tools. It exercises application prints, a
+stdout tracing subscriber, apcore's stdout subscriber, joined background work
+and startup/shutdown callbacks. `APCORE_STDIO_FIXTURE_MODE=cancel`, `timeout`
+or `sweep` exercises cancellation of the serving future, prompt timeout with
+late cooperative cleanup, or an owned approval sweep. Regression tests run global descriptor changes
+in subprocesses so concurrent Rust tests retain their own stdout behavior.
+
 ## Structured Protocol Negotiation (Unreleased)
 
 The server supports `2024-11-05`, `2025-03-26` and `2025-06-18`. An initialize

@@ -5,7 +5,7 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::Router;
 use serde_json::Value;
@@ -867,6 +867,15 @@ impl APCoreMCP {
 
     /// Start the MCP server with custom options on the caller's Tokio runtime.
     pub async fn serve_with_options_async(&self, opts: ServeOptions) -> Result<(), APCoreMCPError> {
+        crate::stdio::scope(
+            self.config.transport.eq_ignore_ascii_case("stdio"),
+            self.serve_with_options_inner(opts),
+        )
+        .await
+        .map_err(|error| APCoreMCPError::ServerError(error.to_string()))?
+    }
+
+    async fn serve_with_options_inner(&self, opts: ServeOptions) -> Result<(), APCoreMCPError> {
         // Validate explorer prefix if explorer is enabled
         if opts.explorer.explorer && !opts.explorer.explorer_prefix.starts_with('/') {
             return Err(APCoreMCPError::InvalidExplorerPrefix);
@@ -902,12 +911,20 @@ impl APCoreMCP {
             let exporter: Arc<dyn crate::server::transport::UsageExporter> = usage.clone();
             transport_manager.set_usage_exporter(Some(exporter));
         }
+        // Join SDK-owned disconnect/cancellation work before releasing stdout.
+        // Vec<JoinHandle> deliberately detaches on a cancelled serving future;
+        // each task then retains the stdout lease through its own cleanup.
+        let cancellation_tasks = Arc::new(Mutex::new(Vec::new()));
         if let Some(ref bridge) = async_bridge {
             let bridge_weak = Arc::downgrade(bridge);
+            let cancellation_tasks = cancellation_tasks.clone();
+            let output_lease = crate::stdio::cleanup_lease();
             transport_manager.set_cancel_handler(Some(Arc::new(move |session_id: &str| {
                 if let Some(b) = bridge_weak.upgrade() {
                     let session_id = session_id.to_string();
-                    tokio::spawn(async move {
+                    let output_lease = output_lease.clone();
+                    let task = tokio::spawn(async move {
+                        let _output_lease = output_lease;
                         let n = b.cancel_session_tasks(&session_id).await;
                         if n > 0 {
                             tracing::info!(
@@ -915,6 +932,9 @@ impl APCoreMCP {
                             );
                         }
                     });
+                    let mut tasks = cancellation_tasks.lock().unwrap_or_else(|poison| poison.into_inner());
+                    tasks.retain(|task: &tokio::task::JoinHandle<()>| !task.is_finished());
+                    tasks.push(task);
                 }
             })));
         }
@@ -927,12 +947,16 @@ impl APCoreMCP {
             .ok_or_else(|| APCoreMCPError::ServerError("no tool handlers registered".into()))?;
         if let Some(ref bridge) = async_bridge {
             let bridge_weak = Arc::downgrade(bridge);
+            let cancellation_tasks = cancellation_tasks.clone();
+            let output_lease = crate::stdio::cleanup_lease();
             server_handler = server_handler.with_cancel_handler(Arc::new(move |key: &str| {
                 if let Some(b) = bridge_weak.upgrade() {
                     // Cancel any task whose session_key matches, plus also
                     // try treating the key as a direct task_id.
                     let key = key.to_string();
-                    tokio::spawn(async move {
+                    let output_lease = output_lease.clone();
+                    let task = tokio::spawn(async move {
+                        let _output_lease = output_lease;
                         let n = b.cancel_session_tasks(&key).await;
                         if n == 0 {
                             // Best-effort direct-cancel fallback on client
@@ -941,6 +965,11 @@ impl APCoreMCP {
                             let _ = b.cancel(&key).await;
                         }
                     });
+                    let mut tasks = cancellation_tasks
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner());
+                    tasks.retain(|task: &tokio::task::JoinHandle<()>| !task.is_finished());
+                    tasks.push(task);
                 }
             }));
         }
@@ -969,11 +998,13 @@ impl APCoreMCP {
             on_startup();
         }
 
+        let mut approval_sweep = None;
         let result = async {
             use crate::server::transport::HttpAuthConfig;
             // [H-1] Start the approval store TTL sweep, if configured.
             if let Some(ref store) = self.approval_store {
-                if store.start_sweep().is_some() {
+                if let Some(task) = store.start_sweep() {
+                    approval_sweep = Some(crate::stdio::BackgroundTask::new(task));
                     tracing::info!("Approval store TTL sweep started");
                 }
             }
@@ -1028,11 +1059,34 @@ impl APCoreMCP {
         }
         .await;
 
+        if let Some(sweep) = approval_sweep {
+            sweep.stop().await;
+        }
+        let cleanup_tasks = std::mem::take(
+            &mut *cancellation_tasks
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()),
+        );
+        for task in cleanup_tasks {
+            if let Err(error) = task.await {
+                tracing::error!("async cancellation cleanup failed: {error}");
+            }
+        }
+        let shutdown_result = if let Some(ref bridge) = async_bridge {
+            bridge
+                .shutdown()
+                .await
+                .map_err(|error| APCoreMCPError::ServerError(error.to_string()))
+        } else {
+            Ok(())
+        };
+        crate::stdio::drain_registered().await;
+
         if let Some(ref on_shutdown) = opts.on_shutdown {
             on_shutdown();
         }
 
-        result
+        result.and(shutdown_result)
     }
 
     /// Asynchronously build the MCP server and return an axum [`Router`] for embedding.
@@ -2096,122 +2150,132 @@ pub fn serve(backend: impl Into<BackendSource>, config: ServeConfig) -> Result<(
     // "caller did not set this field" by comparing to the default value.
     // Callers who pass `ServeConfig { name: "x".into(), ..ServeConfig::default() }`
     // and set `APCORE_MCP_PORT=9000` in env will see port resolve to 9000.
-    let bus = config::get_scalar_config();
     let defaults = ServeConfig::default();
+    // The default transport can be overridden by discovery itself. Protect
+    // discovery conservatively until that decision is known; explicit HTTP/SSE
+    // callers never redirect stdout during discovery.
+    let bus = crate::stdio::scope_sync(
+        config.transport.eq_ignore_ascii_case("stdio"),
+        config::get_scalar_config,
+    )
+    .map_err(|error| APCoreMCPError::ServerError(error.to_string()))?;
     let transport = if config.transport != defaults.transport {
         config.transport.clone()
     } else {
         bus.transport.unwrap_or(config.transport.clone())
     };
-    let host = if config.host != defaults.host {
-        config.host.clone()
-    } else {
-        bus.host.unwrap_or(config.host.clone())
-    };
-    let port = if config.port != defaults.port {
-        config.port
-    } else {
-        bus.port.unwrap_or(config.port)
-    };
-    let name = if config.name != defaults.name {
-        config.name.clone()
-    } else {
-        bus.name.unwrap_or(config.name.clone())
-    };
-    let validate_inputs = if config.validate_inputs != defaults.validate_inputs {
-        config.validate_inputs
-    } else {
-        bus.validate_inputs.unwrap_or(config.validate_inputs)
-    };
-    let log_level = config.log_level.clone().or(bus.log_level);
+    crate::stdio::scope_sync(transport.eq_ignore_ascii_case("stdio"), || {
+        let host = if config.host != defaults.host {
+            config.host.clone()
+        } else {
+            bus.host.unwrap_or(config.host.clone())
+        };
+        let port = if config.port != defaults.port {
+            config.port
+        } else {
+            bus.port.unwrap_or(config.port)
+        };
+        let name = if config.name != defaults.name {
+            config.name.clone()
+        } else {
+            bus.name.unwrap_or(config.name.clone())
+        };
+        let validate_inputs = if config.validate_inputs != defaults.validate_inputs {
+            config.validate_inputs
+        } else {
+            bus.validate_inputs.unwrap_or(config.validate_inputs)
+        };
+        let log_level = config.log_level.clone().or(bus.log_level);
 
-    let mut builder = APCoreMCP::builder()
-        .backend(backend)
-        .name(&name)
-        .transport(&transport)
-        .host(&host)
-        .port(port)
-        .validate_inputs(validate_inputs);
+        let mut builder = APCoreMCP::builder()
+            .backend(backend)
+            .name(&name)
+            .transport(&transport)
+            .host(&host)
+            .port(port)
+            .validate_inputs(validate_inputs);
 
-    if let Some(version) = config.version.as_deref() {
-        builder = builder.version(version);
-    }
-    if let Some(tags) = config.tags {
-        builder = builder.tags(tags);
-    }
-    if let Some(prefix) = config.prefix.as_deref() {
-        builder = builder.prefix(prefix);
-    }
-    if let Some(level) = log_level.as_deref() {
-        builder = builder.log_level(level);
-    }
-    if let Some(strategy) = config.strategy.as_deref() {
-        builder = builder.strategy(strategy);
-    }
+        if let Some(version) = config.version.as_deref() {
+            builder = builder.version(version);
+        }
+        if let Some(tags) = config.tags {
+            builder = builder.tags(tags);
+        }
+        if let Some(prefix) = config.prefix.as_deref() {
+            builder = builder.prefix(prefix);
+        }
+        if let Some(level) = log_level.as_deref() {
+            builder = builder.log_level(level);
+        }
+        if let Some(strategy) = config.strategy.as_deref() {
+            builder = builder.strategy(strategy);
+        }
 
-    // Forward previously-ignored ServeConfig fields to the builder.
-    if let Some(auth) = config.authenticator {
-        builder = builder.authenticator_arc(auth);
-    }
-    // [D9-003] require_auth: caller's Some wins; bus fills None.
-    if let Some(rq) = config.require_auth.or(bus.require_auth) {
-        builder = builder.require_auth(rq);
-    }
-    if let Some(paths) = config.exempt_paths {
-        builder = builder.exempt_paths(paths.into_iter().collect());
-    }
-    if let Some(redact) = config.redact_output {
-        builder = builder.redact_output(redact);
-    }
-    // [D9-003] output_format is caller-only. Default is Json (handled by the
-    // builder). [A-013] It is deliberately NOT read from the Config Bus —
-    // Python and TypeScript publish no such key, see `config::mcp_defaults`.
-    if let Some(fmt) = config.output_format {
-        builder = builder.output_format(fmt);
-    }
-    // observability — extract bool from `true`/`false` or `{ "enabled": bool }`
-    // shapes and forward to APCoreMCPBuilder::observability(bool). Matches
-    // apcore-mcp-python serve(observability: bool) parity. [D1-001]
-    if let Some(obs) = config.observability.as_ref() {
-        let enabled = obs
-            .as_bool()
-            .or_else(|| obs.get("enabled").and_then(|v| v.as_bool()))
-            .unwrap_or(true);
-        builder = builder.observability(enabled);
-    }
+        // Forward previously-ignored ServeConfig fields to the builder.
+        if let Some(auth) = config.authenticator {
+            builder = builder.authenticator_arc(auth);
+        }
+        // [D9-003] require_auth: caller's Some wins; bus fills None.
+        if let Some(rq) = config.require_auth.or(bus.require_auth) {
+            builder = builder.require_auth(rq);
+        }
+        if let Some(paths) = config.exempt_paths {
+            builder = builder.exempt_paths(paths.into_iter().collect());
+        }
+        if let Some(redact) = config.redact_output {
+            builder = builder.redact_output(redact);
+        }
+        // [D9-003] output_format is caller-only. Default is Json (handled by the
+        // builder). [A-013] It is deliberately NOT read from the Config Bus —
+        // Python and TypeScript publish no such key, see `config::mcp_defaults`.
+        if let Some(fmt) = config.output_format {
+            builder = builder.output_format(fmt);
+        }
+        // observability — extract bool from `true`/`false` or `{ "enabled": bool }`
+        // shapes and forward to APCoreMCPBuilder::observability(bool). Matches
+        // apcore-mcp-python serve(observability: bool) parity. [D1-001]
+        if let Some(obs) = config.observability.as_ref() {
+            let enabled = obs
+                .as_bool()
+                .or_else(|| obs.get("enabled").and_then(|v| v.as_bool()))
+                .unwrap_or(true);
+            builder = builder.observability(enabled);
+        }
 
-    // [M-1] Forward newly-aligned ServeConfig fields to the builder.
-    if let Some(trace) = config.trace {
-        builder = builder.trace(trace);
-    }
-    if let Some(formatter) = config.output_formatter.clone() {
-        builder =
-            builder.output_formatter(crate::server::router::shared_to_output_formatter(formatter));
-    }
+        // [M-1] Forward newly-aligned ServeConfig fields to the builder.
+        if let Some(trace) = config.trace {
+            builder = builder.trace(trace);
+        }
+        if let Some(formatter) = config.output_formatter.clone() {
+            builder = builder
+                .output_formatter(crate::server::router::shared_to_output_formatter(formatter));
+        }
 
-    // [M-1] Build ServeOptions so explorer/branding flags configured on the
-    // convenience ServeConfig actually take effect (serve_with_options reads
-    // explorer from ServeOptions, not from the builder config).
-    let opts = ServeOptions {
-        explorer: ExplorerOptions {
-            explorer: config.explorer.unwrap_or(false),
-            explorer_prefix: config
-                .explorer_prefix
-                .clone()
-                .unwrap_or_else(|| "/explorer".to_string()),
-            explorer_title: config
-                .explorer_title
-                .clone()
-                .unwrap_or_else(|| "MCP Tool Explorer".to_string()),
-            explorer_project_name: config.explorer_project_name.clone(),
-            explorer_project_url: config.explorer_project_url.clone(),
-            allow_execute: config.allow_execute.unwrap_or(false),
-        },
-        ..Default::default()
-    };
+        // [M-1] Build ServeOptions so explorer/branding flags configured on the
+        // convenience ServeConfig actually take effect (serve_with_options reads
+        // explorer from ServeOptions, not from the builder config).
+        let opts = ServeOptions {
+            explorer: ExplorerOptions {
+                explorer: config.explorer.unwrap_or(false),
+                explorer_prefix: config
+                    .explorer_prefix
+                    .clone()
+                    .unwrap_or_else(|| "/explorer".to_string()),
+                explorer_title: config
+                    .explorer_title
+                    .clone()
+                    .unwrap_or_else(|| "MCP Tool Explorer".to_string()),
+                explorer_project_name: config.explorer_project_name.clone(),
+                explorer_project_url: config.explorer_project_url.clone(),
+                allow_execute: config.allow_execute.unwrap_or(false),
+            },
+            ..Default::default()
+        };
 
-    let mcp = builder.build()?;
-    mcp.serve_with_options(opts)
+        let mcp = builder.build()?;
+        mcp.serve_with_options(opts)
+    })
+    .map_err(|error| APCoreMCPError::ServerError(error.to_string()))?
 }
 
 /// Convenience: build and serve in one call (async).

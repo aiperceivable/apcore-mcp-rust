@@ -5,6 +5,50 @@
 
 use std::process::Command;
 
+#[test]
+fn stdio_lifecycle_diagnostics_never_use_stdout() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let directory = tempfile::tempdir().unwrap();
+    let mut child = Command::new(binary_path())
+        .args(["--extensions-dir", directory.path().to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(concat!(
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"stdio-test\",\"version\":\"1\"}}}\n",
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"does_not_exist\",\"arguments\":{}}}\n",
+        "not-json\n",
+    ).as_bytes()).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let mut response_ids = Vec::new();
+    for line in stdout.lines() {
+        let message: serde_json::Value = serde_json::from_str(line)
+            .unwrap_or_else(|error| panic!("stdout contains diagnostics: {line:?}: {error}"));
+        assert_eq!(message["jsonrpc"], "2.0");
+        if let Some(identifier) = message["id"].as_u64() {
+            response_ids.push(identifier);
+        }
+    }
+    response_ids.sort_unstable();
+    assert_eq!(response_ids, [1, 2, 3], "{stdout}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("Starting stdio transport"), "{stderr}");
+    assert!(stderr.contains("invalid JSON"), "{stderr}");
+    assert!(stderr.contains("EOF"), "{stderr}");
+}
+
 /// Path to the compiled binary (built by `cargo build`).
 fn binary_path() -> std::path::PathBuf {
     // cargo test sets the target directory; the binary lives alongside test binaries.
@@ -31,6 +75,7 @@ fn help_exits_zero() {
         output.status.code()
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.stderr.is_empty());
     assert!(
         stdout.contains("extensions-dir"),
         "help should mention --extensions-dir"

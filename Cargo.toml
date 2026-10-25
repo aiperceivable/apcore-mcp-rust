@@ -51,6 +51,13 @@ uuid = { version = "1", features = ["v4", "serde"] }
 tokio-stream = { version = "0.1", features = ["io-util"] }
 futures = "0.3"
 
+[target.'cfg(unix)'.dependencies]
+# Safe descriptor duplication/redirection; no raw descriptor ownership in the bridge.
+rustix = { version = "1", features = ["stdio"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console"] }
+
 [dev-dependencies]
 # `test-util` supplies the paused clock, so a timeout test asserts the
 # timeout rather than sleeping for it.

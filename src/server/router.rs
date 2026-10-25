@@ -450,12 +450,17 @@ const CANCEL_TOKENS_MAX: usize = 4096;
 struct CancelGuard {
     call_id: String,
     tokens: std::sync::Arc<std::sync::Mutex<HashMap<String, std::sync::Arc<CancelToken>>>>,
+    execution_token: CancelToken,
+    output_lease: Option<crate::stdio::CleanupLease>,
 }
 
 impl Drop for CancelGuard {
     fn drop(&mut self) {
         if let Ok(mut guard) = self.tokens.lock() {
             guard.remove(&self.call_id);
+        }
+        if let Some(lease) = &self.output_lease {
+            lease.retain_execution(self.execution_token.clone());
         }
     }
 }
@@ -690,6 +695,8 @@ impl ExecutionRouter {
             CancelGuard {
                 call_id: call_id.to_string(),
                 tokens: std::sync::Arc::clone(&self.cancel_tokens),
+                execution_token: cancel_token.clone(),
+                output_lease: crate::stdio::cleanup_lease(),
             },
             cancel_token,
         )

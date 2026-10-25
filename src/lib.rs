@@ -30,6 +30,7 @@ pub mod markdown;
 pub mod middleware_builder;
 pub mod openapi_backend;
 pub mod server;
+mod stdio;
 /// Crate version, kept in sync with Cargo.toml.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
