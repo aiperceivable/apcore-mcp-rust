@@ -65,11 +65,12 @@ impl Owner {
             .unwrap_or_else(|poison| poison.into_inner());
         if let Some(active) = capture.as_ref() {
             // Flush pending ordinary prints while stdout still targets stderr.
-            let flushed = io::stdout().lock().flush();
+            // A failed flush can retain diagnostic bytes: fail closed rather
+            // than let a later owner flush them into the protocol endpoint.
+            io::stdout().lock().flush()?;
             active.restore()?;
             capture.take();
             OWNED.store(false, Ordering::Release);
-            flushed?;
         }
         Ok(())
     }
@@ -275,6 +276,114 @@ pub(crate) fn protocol_writer() -> io::Result<(File, TransportClaim)> {
     Ok((writer, claim))
 }
 
+/// The blocking operation owns both the entire submitted frame and its
+/// transport claim. Dropping the async writer cannot detach physical stdout
+/// activity from the scope that owns it, or truncate a frame between chunks.
+pub(crate) struct ProtocolWriter {
+    file: Arc<Mutex<File>>,
+    claim: Arc<TransportClaim>,
+    pending: Option<(bool, tokio::task::JoinHandle<io::Result<usize>>)>,
+}
+
+impl ProtocolWriter {
+    pub(crate) fn new(file: File, claim: TransportClaim) -> Self {
+        Self {
+            file: Arc::new(Mutex::new(file)),
+            claim: Arc::new(claim),
+            pending: None,
+        }
+    }
+
+    fn start(&mut self, bytes: Option<Vec<u8>>) {
+        let file = self.file.clone();
+        let claim = self.claim.clone();
+        let flushing = bytes.is_none();
+        self.pending = Some((
+            flushing,
+            tokio::task::spawn_blocking(move || {
+                let _claim = claim;
+                let mut file = file.lock().unwrap_or_else(|poison| poison.into_inner());
+                match bytes {
+                    Some(bytes) => {
+                        file.write_all(&bytes)?;
+                        Ok(bytes.len())
+                    }
+                    None => {
+                        file.flush()?;
+                        Ok(0)
+                    }
+                }
+            }),
+        ));
+    }
+
+    fn poll_pending(
+        &mut self,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<usize>> {
+        use std::task::Poll;
+        let (_, task) = self.pending.as_mut().expect("pending protocol operation");
+        match std::pin::Pin::new(task).poll(context) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(result) => {
+                self.pending = None;
+                Poll::Ready(result.map_err(io::Error::other).and_then(|result| result))
+            }
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for ProtocolWriter {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+        bytes: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        use std::task::Poll;
+        loop {
+            if let Some((flushing, _)) = self.pending.as_ref() {
+                let flushing = *flushing;
+                match self.poll_pending(context) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                    Poll::Ready(Ok(written)) if !flushing => return Poll::Ready(Ok(written)),
+                    Poll::Ready(Ok(_)) => {}
+                }
+            }
+            if bytes.is_empty() {
+                return Poll::Ready(Ok(0));
+            }
+            self.start(Some(bytes.to_vec()));
+        }
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        use std::task::Poll;
+        loop {
+            if let Some((flushing, _)) = self.pending.as_ref() {
+                let flushing = *flushing;
+                match self.poll_pending(context) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                    Poll::Ready(Ok(_)) if flushing => return Poll::Ready(Ok(())),
+                    Poll::Ready(Ok(_)) => {}
+                }
+            }
+            self.start(None);
+        }
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        self.poll_flush(context)
+    }
+}
+
 #[cfg(unix)]
 mod platform {
     use super::*;
@@ -372,6 +481,318 @@ compile_error!("stdio stdout isolation requires Unix or Windows standard handles
 mod tests {
     use super::*;
     use std::process::Command;
+
+    #[test]
+    fn cancelled_backpressured_transport_keeps_frame_and_owner_until_write_finishes() {
+        use std::io::{BufRead, Read};
+        use std::process::Stdio;
+        use std::time::Duration;
+        const CHILD: &str = "APCORE_BACKPRESSURE_TEST";
+        if std::env::var_os(CHILD).is_some() {
+            struct LargeResponse(Arc<AtomicBool>);
+            #[async_trait::async_trait]
+            impl crate::server::transport::McpHandler for LargeResponse {
+                async fn handle_message(
+                    &self,
+                    message: serde_json::Value,
+                ) -> Option<serde_json::Value> {
+                    let response = serde_json::json!({"jsonrpc":"2.0", "id":message["id"], "result":"x".repeat(2 * 1024 * 1024)});
+                    self.0.store(true, Ordering::Release);
+                    Some(response)
+                }
+            }
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                let manager = crate::server::transport::TransportManager::new(None);
+                let response_ready = Arc::new(AtomicBool::new(false));
+                let handler = LargeResponse(response_ready.clone());
+                let mut serving = Box::pin(manager.run_stdio(&handler));
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    loop {
+                        assert!(futures::poll!(serving.as_mut()).is_pending());
+                        if response_ready.load(Ordering::Acquire) {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("response never reached its backed-up write");
+                drop(serving);
+                let rejected = scope(true, async {}).await.is_err();
+                // Parent deliberately does not drain stdout until this marker.
+                eprintln!("BACKPRESSURED_CANCELLED");
+                assert!(
+                    rejected,
+                    "cancelled transport released an active physical write"
+                );
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    while OWNED.load(Ordering::Acquire) {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("completed physical write retained ownership");
+                scope(true, async {
+                    let (mut writer, _claim) = protocol_writer().unwrap();
+                    writeln!(writer, "{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{}}}}").unwrap();
+                })
+                .await
+                .unwrap();
+            });
+            return;
+        }
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "stdio::tests::cancelled_backpressured_transport_keeps_frame_and_owner_until_write_finishes", "--nocapture"])
+            .env(CHILD, "1").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"}\n")
+            .unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let (marker_tx, marker_rx) = std::sync::mpsc::channel();
+        let stderr_thread = std::thread::spawn(move || {
+            let mut reader = io::BufReader::new(stderr);
+            let mut output = String::new();
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap() == 0 {
+                    break;
+                }
+                output.push_str(&line);
+                if line.contains("BACKPRESSURED_CANCELLED") {
+                    let _ = marker_tx.send(());
+                    reader.read_to_string(&mut output).unwrap();
+                    break;
+                }
+            }
+            output
+        });
+        if marker_rx.recv_timeout(Duration::from_secs(5)).is_err() {
+            let _ = child.kill();
+            panic!(
+                "child failed to reach backed-up write cancellation: {}",
+                stderr_thread.join().unwrap()
+            );
+        }
+        let mut stdout = String::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut stdout)
+            .unwrap();
+        let status = child.wait().unwrap();
+        let stderr = stderr_thread.join().unwrap();
+        assert!(status.success(), "child failed: {stderr}");
+        let frames: Vec<serde_json::Value> = stdout
+            .lines()
+            .filter(|line| line.starts_with('{'))
+            .map(|line| {
+                serde_json::from_str(line).expect("partial/interleaved frame after cancellation")
+            })
+            .collect();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0]["id"], 1);
+        assert_eq!(frames[0]["result"].as_str().unwrap().len(), 2 * 1024 * 1024);
+        assert_eq!(frames[1]["id"], 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_diagnostic_flush_poison_prevents_protocol_reuse() {
+        const CHILD: &str = "APCORE_FLUSH_FAILURE_TEST";
+        if std::env::var_os(CHILD).is_some() {
+            use std::os::unix::net::UnixStream;
+            let original_stdout =
+                File::from(rustix::io::fcntl_dupfd_cloexec(io::stdout(), 3).unwrap());
+            let original_stderr =
+                File::from(rustix::io::fcntl_dupfd_cloexec(io::stderr(), 3).unwrap());
+            let (diagnostic, receiver) = UnixStream::pair().unwrap();
+            drop(receiver);
+            rustix::stdio::dup2_stderr(&diagnostic).unwrap();
+            let failed = scope_sync(true, || {
+                io::stdout().write_all(b"BUFFERED-DIAGNOSTIC").unwrap();
+            })
+            .is_err();
+            let rejected = scope_sync(true, || ()).is_err();
+            // Repair only the subprocess test's descriptors. Flush retained
+            // bytes to stderr before allowing libtest to print its report.
+            rustix::stdio::dup2_stderr(&original_stderr).unwrap();
+            rustix::stdio::dup2_stdout(&original_stderr).unwrap();
+            io::stdout().flush().unwrap();
+            rustix::stdio::dup2_stdout(&original_stdout).unwrap();
+            assert!(failed);
+            assert!(rejected, "failed flush admitted another protocol owner");
+            return;
+        }
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "stdio::tests::failed_diagnostic_flush_poison_prevents_protocol_reuse",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("BUFFERED-DIAGNOSTIC"));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("BUFFERED-DIAGNOSTIC"));
+    }
+
+    #[test]
+    fn real_serving_entrypoint_isolates_noisy_module_and_lifecycle_callbacks() {
+        use std::process::Stdio;
+        const CHILD: &str = "APCORE_NOISY_LIFECYCLE_TEST";
+        if std::env::var_os(CHILD).is_some() {
+            struct NoisyModule;
+            #[async_trait::async_trait]
+            impl apcore::Module for NoisyModule {
+                fn input_schema(&self) -> serde_json::Value {
+                    serde_json::json!({"type":"object"})
+                }
+                fn output_schema(&self) -> serde_json::Value {
+                    serde_json::json!({"type":"object"})
+                }
+                fn description(&self) -> &str {
+                    "A successful noisy module"
+                }
+                async fn execute(
+                    &self,
+                    _: serde_json::Value,
+                    _: &apcore::Context<serde_json::Value>,
+                ) -> Result<serde_json::Value, apcore::ModuleError> {
+                    struct Cleanup;
+                    impl Drop for Cleanup {
+                        fn drop(&mut self) {
+                            writeln!(io::stdout(), "module-cleanup-diagnostic").unwrap();
+                        }
+                    }
+                    let _cleanup = Cleanup;
+                    writeln!(io::stdout(), "module-execution-diagnostic").unwrap();
+                    Ok(serde_json::json!({"ok":true}))
+                }
+            }
+            let registry = Arc::new(apcore::registry::registry::Registry::new());
+            registry
+                .register_module("noisy", Box::new(NoisyModule))
+                .unwrap();
+            // Existing subscribers may have retained stdout before serving.
+            tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_writer(io::stdout)
+                .init();
+            let mcp = crate::APCoreMCP::builder()
+                .backend(registry)
+                .build()
+                .unwrap();
+            tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(mcp.serve_with_options_async(crate::ServeOptions {
+                    on_startup: Some(Box::new(|| {
+                        writeln!(io::stdout(), "startup-callback-diagnostic").unwrap()
+                    })),
+                    on_shutdown: Some(Box::new(|| {
+                        writeln!(io::stdout(), "shutdown-callback-diagnostic").unwrap()
+                    })),
+                    ..Default::default()
+                }))
+                .unwrap();
+            return;
+        }
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "stdio::tests::real_serving_entrypoint_isolates_noisy_module_and_lifecycle_callbacks", "--nocapture"])
+            .env(CHILD, "1").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        child.stdin.take().unwrap().write_all(concat!(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"test\",\"version\":\"1\"}}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"noisy\",\"arguments\":{}}}\n",
+        ).as_bytes()).unwrap();
+        let output = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(output.status.success(), "stdout={stdout}; stderr={stderr}");
+        let frames: Vec<serde_json::Value> = stdout
+            .lines()
+            .filter(|line| line.starts_with('{'))
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(frames.len(), 3, "{stdout}");
+        let call = frames.iter().find(|frame| frame["id"] == 3).unwrap();
+        assert_ne!(call["result"]["isError"], true, "{call}");
+        assert!(call["result"].to_string().contains("ok"), "{call}");
+        for marker in [
+            "Starting MCP server",
+            "startup-callback-diagnostic",
+            "module-execution-diagnostic",
+            "module-cleanup-diagnostic",
+            "shutdown-callback-diagnostic",
+        ] {
+            assert!(stderr.contains(marker), "missing {marker}: {stderr}");
+            assert!(
+                !stdout.contains(marker),
+                "stdout diagnostic {marker}: {stdout}"
+            );
+        }
+    }
+
+    #[test]
+    fn http_serving_entrypoints_keep_host_stdout_and_leave_stdio_available() {
+        const CHILD: &str = "APCORE_HTTP_OUTPUT_TEST";
+        if let Ok(transport) = std::env::var(CHILD) {
+            let registry = Arc::new(apcore::registry::registry::Registry::new());
+            let mcp = crate::APCoreMCP::builder()
+                .backend(registry)
+                .transport(&transport)
+                // Exercise actual transport setup without requiring a listener.
+                .host("invalid-host")
+                .build()
+                .unwrap();
+            let result =
+                tokio::runtime::Runtime::new()
+                    .unwrap()
+                    .block_on(mcp.serve_with_options_async(crate::ServeOptions {
+                        on_startup: Some(Box::new(|| {
+                            writeln!(io::stdout(), "http-startup-ordinary").unwrap();
+                            scope_sync(true, || {
+                                writeln!(io::stdout(), "temporary-stdio-diagnostic").unwrap()
+                            })
+                            .unwrap();
+                        })),
+                        on_shutdown: Some(Box::new(|| {
+                            writeln!(io::stdout(), "http-shutdown-ordinary").unwrap()
+                        })),
+                        ..Default::default()
+                    }));
+            assert!(result.unwrap_err().to_string().contains("invalid host"));
+            assert!(!OWNED.load(Ordering::Acquire));
+            return;
+        }
+        for transport in ["streamable-http", "sse"] {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "stdio::tests::http_serving_entrypoints_keep_host_stdout_and_leave_stdio_available", "--nocapture"])
+                .env(CHILD, transport).output().unwrap();
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert!(output.status.success(), "{transport}: {stderr}");
+            assert!(
+                stdout.contains("http-startup-ordinary"),
+                "{transport}: {stdout}"
+            );
+            assert!(
+                stdout.contains("http-shutdown-ordinary"),
+                "{transport}: {stdout}"
+            );
+            assert!(!stdout.contains("temporary-stdio-diagnostic"));
+            assert!(stderr.contains("temporary-stdio-diagnostic"));
+        }
+    }
 
     /// Descriptor mutation belongs in a subprocess; the Rust test harness runs
     /// unrelated tests concurrently and owns its own stdout capture machinery.
