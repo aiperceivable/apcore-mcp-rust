@@ -11,6 +11,7 @@
 mod common;
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
 use apcore::Registry;
@@ -255,12 +256,25 @@ fn conformance_spec_resolution() {
             });
             resolved = resolve_spec_location(next, Some(&case.project_root));
         }
-        assert_eq!(
-            resolved.as_deref(),
-            Some(case.expected_resolved_spec.as_str()),
-            "case {}: resolved spec mismatch",
-            case.id
-        );
+        if case.expected_resolved_spec.starts_with("http://")
+            || case.expected_resolved_spec.starts_with("https://")
+        {
+            // URLs must remain verbatim, including separators and escaping.
+            assert_eq!(
+                resolved.as_deref(),
+                Some(case.expected_resolved_spec.as_str()),
+                "case {}: resolved spec mismatch",
+                case.id
+            );
+        } else {
+            // The fixture uses '/', while filesystem paths use native separators.
+            assert_eq!(
+                resolved.as_deref().map(Path::new),
+                Some(Path::new(&case.expected_resolved_spec)),
+                "case {}: resolved spec mismatch",
+                case.id
+            );
+        }
     }
 }
 
