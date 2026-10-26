@@ -60,7 +60,7 @@ cargo add apcore-mcp
 cargo install apcore-mcp
 ```
 
-Requires Rust 1.86+ and `apcore >= 0.32.2` + `apcore-toolkit >= 0.14`. The OpenAPI backend registers the module IDs emitted by `OpenAPIScanner`; toolkit 0.13 introduced the required Canonical ID normalization.
+Requires Rust 1.86+ and `apcore >= 0.32.3` + `apcore-toolkit >= 0.14.1`. The OpenAPI backend registers the module IDs emitted by `OpenAPIScanner`; toolkit 0.13 introduced the required Canonical ID normalization.
 
 Complete stdio shutdown draining of core invocations after timeout/cancellation
 requires `apcore >= 0.32.3`. The `0.32.2` compatibility fallback preserves stdout
@@ -655,6 +655,9 @@ apcore-mcp-rust (separate process / library call)
 ```
 
 ## Development
+
+Toolkit 0.14.1 is published, but the crates.io index did not return that version during local verification. Source builds currently use the sibling checkout `../apcore-toolkit-rust` with the `>=0.14.1` version requirement; clone that repository alongside this SDK. The local release commit matches the published 0.14.1 crate. Remove the temporary `path` dependency once Cargo can resolve the indexed release.
+
 
 ```sh
 git clone https://github.com/aiperceivable/apcore-mcp-rust.git
