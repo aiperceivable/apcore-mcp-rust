@@ -22,8 +22,8 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 # Re-vetted against apcore 0.32.3 and apcore-toolkit 0.14.1.
-apcore = ">=0.32.3"
-apcore-toolkit = ">=0.14.1"
+apcore = ">=0.33.0"
+apcore-toolkit = ">=0.14.2"
 mcp-embedded-ui = "0.5"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
@@ -38,7 +38,7 @@ async-trait = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive", "env"] }
-jsonwebtoken = "9"
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 axum = { version = "0.8", features = ["ws"] }
 tower = "0.5"
 hyper = { version = "1", features = ["full"] }
