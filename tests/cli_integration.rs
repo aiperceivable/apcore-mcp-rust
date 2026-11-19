@@ -5,13 +5,15 @@
 
 use std::process::Command;
 
+const CLI_BINARY: &str = env!("CARGO_BIN_EXE_apcore-mcp");
+
 #[test]
 fn stdio_lifecycle_diagnostics_never_use_stdout() {
     use std::io::Write;
     use std::process::Stdio;
 
     let directory = tempfile::tempdir().unwrap();
-    let mut child = Command::new(binary_path())
+    let mut child = Command::new(CLI_BINARY)
         .args(["--extensions-dir", directory.path().to_str().unwrap()])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -49,23 +51,9 @@ fn stdio_lifecycle_diagnostics_never_use_stdout() {
     assert!(stderr.contains("EOF"), "{stderr}");
 }
 
-/// Path to the compiled binary (built by `cargo build`).
-fn binary_path() -> std::path::PathBuf {
-    // cargo test sets the target directory; the binary lives alongside test binaries.
-    let mut path = std::env::current_exe()
-        .expect("current_exe")
-        .parent()
-        .expect("parent of test binary")
-        .parent()
-        .expect("parent of deps dir")
-        .to_path_buf();
-    path.push("apcore-mcp");
-    path
-}
-
 #[test]
 fn help_exits_zero() {
-    let output = Command::new(binary_path())
+    let output = Command::new(CLI_BINARY)
         .arg("--help")
         .output()
         .expect("failed to run binary");
@@ -93,7 +81,7 @@ fn missing_backend_source_exits_nonzero() {
     // Acceptance Criterion 1), so clap itself accepts zero args. The
     // backend-source rule moved into validate_args, which reports it as an
     // InvalidArgs error (exit 1), not a clap parse error (exit 2).
-    let output = Command::new(binary_path())
+    let output = Command::new(CLI_BINARY)
         .output()
         .expect("failed to run binary");
     assert!(
@@ -111,7 +99,7 @@ fn missing_backend_source_exits_nonzero() {
 
 #[test]
 fn nonexistent_extensions_dir_exits_one() {
-    let output = Command::new(binary_path())
+    let output = Command::new(CLI_BINARY)
         .args(["--extensions-dir", "/nonexistent/path/does/not/exist"])
         .output()
         .expect("failed to run binary");
@@ -129,7 +117,7 @@ fn nonexistent_extensions_dir_exits_one() {
 
 #[test]
 fn port_zero_exits_nonzero() {
-    let output = Command::new(binary_path())
+    let output = Command::new(CLI_BINARY)
         .args(["--extensions-dir", "/tmp", "--port", "0"])
         .output()
         .expect("failed to run binary");
@@ -145,7 +133,7 @@ fn port_zero_exits_nonzero() {
 fn name_too_long_exits_one() {
     let long_name = "x".repeat(256);
     let dir = tempfile::tempdir().unwrap();
-    let output = Command::new(binary_path())
+    let output = Command::new(CLI_BINARY)
         .args([
             "--extensions-dir",
             dir.path().to_str().unwrap(),
@@ -164,7 +152,7 @@ fn name_too_long_exits_one() {
 #[test]
 fn jwt_key_file_nonexistent_exits_one() {
     let dir = tempfile::tempdir().unwrap();
-    let output = Command::new(binary_path())
+    let output = Command::new(CLI_BINARY)
         .args([
             "--extensions-dir",
             dir.path().to_str().unwrap(),
@@ -197,7 +185,7 @@ fn stdio_transport_answers_tools_list() {
     use std::process::Stdio;
 
     let dir = tempfile::tempdir().unwrap();
-    let mut child = Command::new(binary_path())
+    let mut child = Command::new(CLI_BINARY)
         .args([
             "--extensions-dir",
             dir.path().to_str().unwrap(),
