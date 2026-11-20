@@ -3,7 +3,7 @@
 //! Composes apcore-toolkit's shipped pieces into a populated [`Registry`]:
 //!
 //! ```text
-//! load_spec -> OpenAPIScanner::scan -> HTTPProxyRegistryWriter::write -> Registry
+//! load_spec -> OpenAPIScanner::scan_with_effective_parameters -> HTTPProxyRegistryWriter::write -> Registry
 //! ```
 //!
 //! and hands it to the machinery apcore-mcp already has. No scanning logic, no
@@ -20,6 +20,7 @@ use apcore::Registry;
 use apcore_toolkit::openapi_scanner::{OpenAPIScanner, ScanOptions};
 use apcore_toolkit::output::http_proxy_writer::HTTPProxyRegistryWriter;
 use apcore_toolkit::types::ScannedModule;
+use apcore_toolkit::validate_effective_proxy_modules;
 use serde_json::Value;
 
 use crate::APCoreMCPError;
@@ -420,7 +421,7 @@ pub async fn openapi_backend(
     scan_options.include_deprecated = options.include_deprecated;
 
     let scanned = OpenAPIScanner::new()
-        .scan(document, &scan_options)
+        .scan_with_effective_parameters(document, &scan_options)
         .await
         .map_err(|e| APCoreMCPError::Config(format!("mcp.openapi: {e}")))?;
 
@@ -428,7 +429,7 @@ pub async fn openapi_backend(
     // Normalisation cannot repair a segment that begins with a digit
     // (`/v1/2fa` -> `v1.2fa.post`) or an empty ID from a hook; the scanner
     // still emits such a module, with a legality warning. The check runs
-    // HERE, on the ID `scan` returned — never inside `transform_module`, which
+    // HERE, on the ID the scanner returned — never inside `transform_module`, which
     // sees the ID before the toolkit's final normalisation (a `PetStore`
     // prefix is still to be normalised there) — and before the preflight and
     // the writer, so a skipped module never becomes a failed WriteResult. Its
@@ -487,6 +488,9 @@ pub async fn openapi_backend(
                     .to_string(),
             )
         })?;
+
+    validate_effective_proxy_modules(&modules)
+        .map_err(|error| APCoreMCPError::Config(error.to_string()))?;
 
     // --- Write -------------------------------------------------------------
     let writer =

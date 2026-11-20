@@ -49,7 +49,11 @@ async fn registers_the_ids_the_scanner_emits() {
     list["operationId"] = json!("listPets");
     let doc = document(json!({
         "/pets": {"get": list},
-        "/pets/{petId}": {"get": ok()},
+        "/pets/{petId}": {
+            "parameters": [{"in": "path", "name": "petId", "required": true,
+                            "schema": {"type": "string"}}],
+            "get": ok()
+        },
     }));
     let registry = openapi_backend(&doc, Arc::new(Registry::new()), quiet_options())
         .await

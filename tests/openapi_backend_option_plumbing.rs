@@ -24,7 +24,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use apcore::{Context, Registry};
 use apcore_mcp::openapi_backend::{
-    build_openapi_backend_from_config, openapi_backend_from_spec, OpenAPIBackendOptions,
+    build_openapi_backend_from_config, openapi_backend, openapi_backend_from_spec,
+    OpenAPIBackendOptions,
 };
 use serde_json::{json, Value};
 
@@ -345,4 +346,121 @@ async fn explicit_project_root_still_wins_over_config() {
 
     let registry = result.expect("an explicit project_root overrides Config");
     assert!(registry_ids(&registry).contains(&"list_pets".to_string()));
+}
+
+#[tokio::test]
+async fn test_effective_openapi_registration_preflights_and_forwards_selected_operations() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let document = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "Standalone OpenAPI parity", "version": "1.0.0"},
+        "components": {"parameters": {
+            "ItemId": {"in": "path", "name": "item_id", "required": true,
+                       "schema": {"type": "string"}},
+            "Tag": {"in": "query", "name": "tag",
+                    "schema": {"type": "array", "items": {"type": "string"}}}
+        }},
+        "paths": {
+            "/items/{item_id}": {
+                "parameters": [
+                    {"$ref": "#/components/parameters/ItemId"},
+                    {"$ref": "#/components/parameters/Tag"}
+                ],
+                "get": {"operationId": "list_items", "summary": "List items",
+                        "responses": {"200": {"description": "OK"}}}
+            },
+            "/updates": {
+                "parameters": [{"$ref": "#/components/parameters/Tag"}],
+                "post": {"operationId": "update_items", "summary": "Update items",
+                         "responses": {"200": {"description": "OK"}}}
+            }
+        }
+    });
+
+    let registry = Arc::new(Registry::new());
+    let result = openapi_backend(
+        &document,
+        Arc::clone(&registry),
+        OpenAPIBackendOptions {
+            base_url: Some("http://127.0.0.1:8765".to_string()),
+            ..OpenAPIBackendOptions::new()
+        },
+    )
+    .await;
+    let message = result
+        .expect_err("unforwardable selected operation")
+        .to_string();
+    assert!(
+        message.contains("update_items") && message.contains("tag"),
+        "{message}"
+    );
+    assert!(
+        registry_ids(&registry).is_empty(),
+        "preflight must precede any registration"
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let registry = openapi_backend(
+        &document,
+        registry,
+        OpenAPIBackendOptions {
+            base_url: Some(base_url),
+            include: Some("^list_items$".to_string()),
+            ..OpenAPIBackendOptions::new()
+        },
+    )
+    .await
+    .expect("excluding the hazardous operation permits registration");
+    assert_eq!(registry_ids(&registry), ["list_items"]);
+    let definition = registry
+        .get_definition("list_items")
+        .expect("lookup")
+        .expect("definition");
+    assert_eq!(definition.input_schema["required"], json!(["item_id"]));
+    assert_eq!(
+        definition.input_schema["properties"]["tag"]["type"],
+        "array"
+    );
+
+    let upstream = async {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut reader = BufReader::new(socket);
+        let mut request_line = String::new();
+        reader.read_line(&mut request_line).await.unwrap();
+        let mut header = String::new();
+        loop {
+            header.clear();
+            let bytes = reader.read_line(&mut header).await.unwrap();
+            if bytes == 0 || header == "\r\n" {
+                break;
+            }
+        }
+        reader
+            .get_mut()
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+            .await
+            .unwrap();
+        request_line
+    };
+    let module = registry
+        .get("list_items")
+        .unwrap()
+        .expect("registered proxy");
+    let context = Context::create(None, None, None, None, json!({}), None);
+    let execution = module.execute(
+        json!({"item_id": "red/blue", "tag": ["red", "blue"]}),
+        &context,
+    );
+    let (outcome, request_line) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::join!(execution, upstream)
+    })
+    .await
+    .expect("proxy completed");
+    outcome.expect("successful proxy response");
+    assert_eq!(
+        request_line,
+        "GET /items/red%2Fblue?tag=red&tag=blue HTTP/1.1\r\n"
+    );
 }
